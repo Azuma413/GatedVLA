@@ -135,6 +135,33 @@ def pose_to_egomotion_row(scene: ArrowSceneAPI, timestamp: int) -> dict[str, flo
     }
 
 
+def add_planar_curvature(egomotion_df: pd.DataFrame) -> pd.DataFrame:
+    """Approximate path curvature from ego pose yaw over traveled distance."""
+    if len(egomotion_df) < 3:
+        egomotion_df["curvature"] = 0.0
+        return egomotion_df
+
+    x = egomotion_df["x"].to_numpy(dtype=np.float64)
+    y = egomotion_df["y"].to_numpy(dtype=np.float64)
+    qx = egomotion_df["qx"].to_numpy(dtype=np.float64)
+    qy = egomotion_df["qy"].to_numpy(dtype=np.float64)
+    qz = egomotion_df["qz"].to_numpy(dtype=np.float64)
+    qw = egomotion_df["qw"].to_numpy(dtype=np.float64)
+
+    yaw = np.unwrap(np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)))
+    ds = np.hypot(np.diff(x), np.diff(y))
+    distance = np.concatenate([[0.0], np.cumsum(ds)])
+
+    if distance[-1] <= 1e-6 or len(np.unique(distance)) < 3:
+        curvature = np.zeros_like(distance)
+    else:
+        curvature = np.gradient(yaw, distance, edge_order=1)
+        curvature = np.nan_to_num(curvature, nan=0.0, posinf=0.0, neginf=0.0)
+
+    egomotion_df["curvature"] = curvature.astype(np.float32)
+    return egomotion_df
+
+
 def write_video_from_frames(
     scene: ArrowSceneAPI,
     camera_id: CameraID,
@@ -209,6 +236,7 @@ def export_clip(
         tmp_path = Path(tmp)
 
         ego_df = pd.DataFrame([pose_to_egomotion_row(scene, ts) for ts in timestamps])
+        ego_df = add_planar_curvature(ego_df)
         ego_tmp = tmp_path / f"{clip_id}.egomotion.parquet"
         ego_df.to_parquet(ego_tmp, index=False)
         ego_arc = f"{clip_id}.egomotion.parquet"

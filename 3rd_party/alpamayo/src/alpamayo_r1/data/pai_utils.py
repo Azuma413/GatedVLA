@@ -21,6 +21,7 @@ import io
 import pathlib
 import zipfile
 from typing import Any, Iterable
+from types import SimpleNamespace
 import pandas as pd
 import numpy as np
 
@@ -44,6 +45,13 @@ class _LocalFeatures:
 
     def __init__(self, features_df: pd.DataFrame) -> None:
         self.features_df = features_df
+        self.CAMERA = SimpleNamespace(
+            CAMERA_CROSS_LEFT_120FOV="camera_cross_left_120fov",
+            CAMERA_FRONT_WIDE_120FOV="camera_front_wide_120fov",
+            CAMERA_CROSS_RIGHT_120FOV="camera_cross_right_120fov",
+            CAMERA_FRONT_TELE_30FOV="camera_front_tele_30fov",
+        )
+        self.LABELS = SimpleNamespace(EGOMOTION="egomotion")
 
     def get_chunk_feature_filename(self, chunk: int, feature: str) -> str:
         row = self.features_df.loc[feature]
