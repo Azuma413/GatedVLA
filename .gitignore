@@ -183,8 +183,6 @@ token.pickle
 /*.png
 /*.sh
 /*.py
-data/**/*
-!data/**/*.xml
 outputs/checkpoints
 outputs/local_evaluation
 ar1_venv
