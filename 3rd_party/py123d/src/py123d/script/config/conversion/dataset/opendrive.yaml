@@ -1,0 +1,48 @@
+parser:
+  _target_: py123d.parser.opendrive.opendrive_parser.OpenDriveParser
+  _convert_: 'all'
+
+  xodr_paths:
+    - "Town01.xodr.gz"
+    - "Town02.xodr.gz"
+    - "Town03.xodr.gz"
+    - "Town04.xodr.gz"
+    - "Town05.xodr.gz"
+    - "Town06.xodr.gz"
+    - "Town07.xodr.gz"
+    - "Town10HD.xodr.gz"
+    - "Town11.xodr.gz"
+    - "Town12.xodr.gz"
+    - "Town13.xodr.gz"
+    - "Town15.xodr.gz"
+
+  location: null
+  interpolation_step_size: 1.0
+  connection_distance_threshold: 0.1
+  internal_only: true
+
+log_writer_config:
+  _target_: py123d.api.scene.arrow.utils.log_writer_config.LogWriterConfig
+  _convert_: 'all'
+
+  force_log_conversion: false
+  force_map_conversion: ${force_map_conversion}
+
+  infer_ego_dynamics: true
+  infer_box_dynamics: true
+
+log_writer:
+  _target_: py123d.api.scene.arrow.arrow_log_writer.ArrowLogWriter
+  _convert_: 'all'
+  log_writer_config: ${dataset.log_writer_config}
+  logs_root: ${dataset_paths.py123d_logs_root}
+  sensors_root: ${dataset_paths.py123d_sensors_root}
+  ipc_compression: null
+  ipc_compression_level: null
+
+map_writer:
+  _target_: py123d.api.map.arrow.arrow_map_writer.ArrowMapWriter
+  _convert_: 'all'
+  force_map_conversion: ${force_map_conversion}
+  maps_root: ${dataset_paths.py123d_maps_root}
+  logs_root: ${dataset_paths.py123d_logs_root}

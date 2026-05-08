@@ -1,0 +1,14 @@
+# Core
+carla==0.9.15
+numpy>=1.24,<2.0
+pyyaml>=6.0
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.40.0
+accelerate>=0.27.0
+Pillow>=10.0
+opencv-python>=4.8
+matplotlib>=3.8
+
+# Video encoding (ffmpeg must be installed separately)
+# sudo apt install ffmpeg  OR  brew install ffmpeg

@@ -1,0 +1,53 @@
+# python
+*.pyc
+**/__pycache__/
+.pytest_cache/*
+.pydevproject
+
+# IDE
+.vscode/*
+
+# Pip
+*.egg-info
+
+# Log files
+*.out
+*.err
+*.gz
+!src/py123d/parser/opendrive/carla_maps/*.xodr.gz
+
+*.pdf
+*.gpkg
+*.gif
+*.arrow
+*.pkl
+*.csv
+*.log
+*.mp4
+exp/
+.coverage
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+
+# internal
+benchmarks/*
+notebooks/*
+notes/*
+
+# Sphinx documentation
+docs/_build/
+docs/build/
+_build/
+.doctrees/
+
+
+# ruff
+.ruff_cache/*
+
+# Other
+CLAUDE.md
+.claude/*

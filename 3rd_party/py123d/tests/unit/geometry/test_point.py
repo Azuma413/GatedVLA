@@ -1,0 +1,297 @@
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+
+from py123d.geometry import Point2D, Point3D, Vector2D, Vector3D
+from py123d.geometry.geometry_index import Point2DIndex, Point3DIndex
+
+
+class TestPoint2D:
+    """Unit tests for Point2D class."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.x_coord = 3.5
+        self.y_coord = 4.2
+        self.point = Point2D(x=self.x_coord, y=self.y_coord)
+        self.test_array = np.zeros([2], dtype=np.float64)
+        self.test_array[Point2DIndex.X] = self.x_coord
+        self.test_array[Point2DIndex.Y] = self.y_coord
+
+    def test_init(self):
+        """Test Point2D initialization."""
+        point = Point2D(1.0, 2.0)
+        assert point.x == 1.0
+        assert point.y == 2.0
+
+    def test_from_array_valid(self):
+        """Test from_array class method with valid input."""
+        # Mock Point2DIndex enum values
+        point = Point2D.from_array(self.test_array)
+        assert point.x == self.x_coord
+        assert point.y == self.y_coord
+
+    def test_from_array_invalid_dimensions(self):
+        """Test from_array with invalid array dimensions."""
+        # 2D array should raise assertion error
+        array_2d = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point2D.from_array(array_2d)
+
+        # 3D array should raise assertion error
+        array_3d = np.array([[[1.0]]], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point2D.from_array(array_3d)
+
+    def test_from_array_invalid_shape(self):
+        """Test from_array with invalid array shape."""
+
+        array_wrong_length = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point2D.from_array(array_wrong_length)
+
+        # Empty array
+        empty_array = np.array([], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point2D.from_array(empty_array)
+
+    def test_array_property(self):
+        """Test the array property."""
+        expected_array = np.array([self.x_coord, self.y_coord], dtype=np.float64)
+        np.testing.assert_array_equal(self.point.array, expected_array)
+        assert self.point.array.dtype == np.float64
+        assert self.point.array.shape == (2,)
+
+    def test_array_like(self):
+        """Test the __array__ behavior."""
+        expected_array = np.array([self.x_coord, self.y_coord], dtype=np.float32)
+        output_array = np.array(self.point, dtype=np.float32)
+        np.testing.assert_array_equal(output_array, expected_array)
+        assert output_array.dtype == np.float32
+        assert output_array.shape == (2,)
+
+    def test_shapely_point_property(self):
+        """Test the shapely_point property."""
+        with patch("shapely.geometry.Point") as mock_point:
+            mock_point_instance = MagicMock()
+            mock_point.return_value = mock_point_instance
+
+            result = self.point.shapely_point
+
+            mock_point.assert_called_once_with(self.x_coord, self.y_coord)
+            assert result == mock_point_instance
+
+    def test_iter(self):
+        """Test the __iter__ method."""
+        coords = list(self.point)
+        assert coords == [self.x_coord, self.y_coord]
+
+        # Test that it's actually iterable
+        x, y = self.point
+        assert x == self.x_coord
+        assert y == self.y_coord
+
+    def test_add_vector(self):
+        """Test Point2D + Vector2D = Point2D (translate a point)."""
+        point = Point2D(1.0, 2.0)
+        vector = Vector2D(3.0, 4.0)
+        result = point + vector
+        assert isinstance(result, Point2D)
+        assert result.x == 4.0
+        assert result.y == 6.0
+
+    def test_sub_point(self):
+        """Test Point2D - Point2D = Vector2D (displacement between points)."""
+        p1 = Point2D(5.0, 7.0)
+        p2 = Point2D(1.0, 3.0)
+        result = p1 - p2
+        assert isinstance(result, Vector2D)
+        assert result.x == 4.0
+        assert result.y == 4.0
+
+    def test_sub_vector(self):
+        """Test Point2D - Vector2D = Point2D (translate backwards)."""
+        point = Point2D(5.0, 7.0)
+        vector = Vector2D(1.0, 3.0)
+        result = point - vector
+        assert isinstance(result, Point2D)
+        assert result.x == 4.0
+        assert result.y == 4.0
+
+    def test_add_non_vector_returns_not_implemented(self):
+        """Test that Point2D + Point2D raises TypeError."""
+        p1 = Point2D(1.0, 2.0)
+        p2 = Point2D(3.0, 4.0)
+        with pytest.raises(TypeError):
+            _ = p1 + p2
+
+    def test_sub_non_point_or_vector_returns_not_implemented(self):
+        """Test that Point2D - int raises TypeError."""
+        p = Point2D(1.0, 2.0)
+        with pytest.raises(TypeError):
+            _ = p - 5
+
+    def test_point_2d_property(self):
+        """Test that point_2d returns self."""
+        p = Point2D(1.0, 2.0)
+        assert p.point_2d is p
+
+    def test_repr(self):
+        """Test __repr__ returns a string containing the class name."""
+        p = Point2D(1.0, 2.0)
+        r = repr(p)
+        assert "Point2D" in r
+
+
+class TestPoint3D:
+    """Unit tests for Point3D class."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.x_coord = 3.5
+        self.y_coord = 4.2
+        self.z_coord = 5.1
+        self.point = Point3D(self.x_coord, self.y_coord, self.z_coord)
+        self.test_array = np.zeros((3,), dtype=np.float64)
+        self.test_array[Point3DIndex.X] = self.x_coord
+        self.test_array[Point3DIndex.Y] = self.y_coord
+        self.test_array[Point3DIndex.Z] = self.z_coord
+
+    def test_init(self):
+        """Test Point3D initialization."""
+        point = Point3D(1.0, 2.0, 3.0)
+        assert point.x == 1.0
+        assert point.y == 2.0
+        assert point.z == 3.0
+
+    def test_from_array_valid(self):
+        """Test from_array class method with valid input."""
+        # Mock Point3DIndex enum values
+        point = Point3D.from_array(self.test_array)
+        assert point.x == self.x_coord
+        assert point.y == self.y_coord
+        assert point.z == self.z_coord
+
+    def test_from_array_invalid_dimensions(self):
+        """Test from_array with invalid array dimensions."""
+        # 2D array should raise assertion error
+        array_2d = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point3D.from_array(array_2d)
+
+        # 3D array should raise assertion error
+        array_3d = np.array([[[1.0]]], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point3D.from_array(array_3d)
+
+    def test_from_array_invalid_shape(self):
+        """Test from_array with invalid array shape."""
+
+        array_wrong_length = np.array([1.0, 2.0], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point3D.from_array(array_wrong_length)
+
+        # Empty array
+        empty_array = np.array([], dtype=np.float64)
+        with pytest.raises(AssertionError):
+            Point3D.from_array(empty_array)
+
+    def test_array_property(self):
+        """Test the array property."""
+        expected_array = np.array([self.x_coord, self.y_coord, self.z_coord], dtype=np.float64)
+        np.testing.assert_array_equal(self.point.array, expected_array)
+        assert self.point.array.dtype == np.float64
+        assert self.point.array.shape == (3,)
+
+    def test_array_like(self):
+        """Test the __array__ behavior."""
+        expected_array = np.array([self.x_coord, self.y_coord, self.z_coord], dtype=np.float32)
+        output_array = np.array(self.point, dtype=np.float32)
+        np.testing.assert_array_equal(output_array, expected_array)
+        assert output_array.dtype == np.float32
+        assert output_array.shape == (3,)
+
+    def test_shapely_point_property(self):
+        """Test the shapely_point property."""
+        with patch("shapely.geometry.Point") as mock_point:
+            mock_point_instance = MagicMock()
+            mock_point.return_value = mock_point_instance
+
+            result = self.point.shapely_point
+
+            mock_point.assert_called_once_with(self.x_coord, self.y_coord, self.z_coord)
+            assert result == mock_point_instance
+
+    def test_iter(self):
+        """Test the __iter__ method."""
+        coords = list(self.point)
+        assert coords == [self.x_coord, self.y_coord, self.z_coord]
+
+        # Test that it's actually iterable
+        x, y, z = self.point
+        assert x == self.x_coord
+        assert y == self.y_coord
+        assert z == self.z_coord
+
+    def test_point_2d_projection(self):
+        """Test the 2D projection of Point3D."""
+        point = Point3D(1.0, 2.0, 3.0)
+        p2d = point.point_2d
+        assert isinstance(p2d, Point2D)
+        assert p2d.x == 1.0
+        assert p2d.y == 2.0
+
+    def test_add_vector(self):
+        """Test Point3D + Vector3D = Point3D (translate a point)."""
+        point = Point3D(1.0, 2.0, 3.0)
+        vector = Vector3D(4.0, 5.0, 6.0)
+        result = point + vector
+        assert isinstance(result, Point3D)
+        assert result.x == 5.0
+        assert result.y == 7.0
+        assert result.z == 9.0
+
+    def test_sub_point(self):
+        """Test Point3D - Point3D = Vector3D (displacement between points)."""
+        p1 = Point3D(5.0, 7.0, 9.0)
+        p2 = Point3D(1.0, 2.0, 3.0)
+        result = p1 - p2
+        assert isinstance(result, Vector3D)
+        assert result.x == 4.0
+        assert result.y == 5.0
+        assert result.z == 6.0
+
+    def test_sub_vector(self):
+        """Test Point3D - Vector3D = Point3D (translate backwards)."""
+        point = Point3D(5.0, 7.0, 9.0)
+        vector = Vector3D(1.0, 2.0, 3.0)
+        result = point - vector
+        assert isinstance(result, Point3D)
+        assert result.x == 4.0
+        assert result.y == 5.0
+        assert result.z == 6.0
+
+    def test_add_non_vector_returns_not_implemented(self):
+        """Test that Point3D + Point3D raises TypeError."""
+        p1 = Point3D(1.0, 2.0, 3.0)
+        p2 = Point3D(4.0, 5.0, 6.0)
+        with pytest.raises(TypeError):
+            _ = p1 + p2
+
+    def test_sub_non_point_or_vector_returns_not_implemented(self):
+        """Test that Point3D - int raises TypeError."""
+        p = Point3D(1.0, 2.0, 3.0)
+        with pytest.raises(TypeError):
+            _ = p - 5
+
+    def test_point_3d_property(self):
+        """Test that point_3d returns self."""
+        p = Point3D(1.0, 2.0, 3.0)
+        assert p.point_3d is p
+
+    def test_repr(self):
+        """Test __repr__ returns a string containing the class name."""
+        p = Point3D(1.0, 2.0, 3.0)
+        r = repr(p)
+        assert "Point3D" in r

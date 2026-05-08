@@ -1,0 +1,8 @@
+Special Euclidean Groups
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. autoclass:: py123d.geometry.PoseSE2
+   :autoclasstoc:
+
+.. autoclass:: py123d.geometry.PoseSE3
+   :autoclasstoc:
