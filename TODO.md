@@ -1,7 +1,7 @@
 # 1. データ収集
 alpamayo-carla-bridge (3rd_party/alpamayo-carla-bridge) を確認し、alpamayo (3rd_party/alpamayo) の入力形式でCarlaデータを収集する。
 データ収集パイプラインはLEADに準拠し、サーバ上で並列実行する。 
-123D (3rd_party/py123d) はalpamayoが採用しているPhysical AI AV形式と、LEAD形式を共通の123D形式に変換する機能を持っているが、123D形式からPA AV形式に変換する実装はない。
+123D (3rd_party/py123d) はalpamayoが採用しているPhysical AI AV (PA AV) 形式と、LEAD形式を共通の123D形式に変換する機能を持っているが、123D形式からPA AV形式に変換する実装はない。
 一方で、LEADには123D形式で書き出す機能がある。
 つまり、LEAD側で123D形式でデータ収集し、その後、py123dに123D形式からPA AV形式にexportする機能を実装するのが良い。
 alpamayoのSFTにCoCラベルは必須ではないが、性能を出すためには必要かもしれない。

@@ -33,6 +33,38 @@ logger = logging.RankedLogger(__name__, rank_zero_only=True)
 logger.setLevel("INFO")
 
 
+class _LocalFeatures:
+    """Small adapter for locally exported PAI-style feature metadata.
+
+    The official Physical AI AV ``Features`` helper is used when possible.  LEAD's
+    123D exporter writes a compact ``features.csv`` with explicit
+    ``filename_template`` and ``clip_files_in_zip`` columns; this adapter exposes
+    the two methods this local interface needs.
+    """
+
+    def __init__(self, features_df: pd.DataFrame) -> None:
+        self.features_df = features_df
+
+    def get_chunk_feature_filename(self, chunk: int, feature: str) -> str:
+        row = self.features_df.loc[feature]
+        template = row.get("filename_template", row.get("chunk_filename_template", None))
+        if template is None or pd.isna(template):
+            raise KeyError(
+                f"Feature {feature!r} does not define filename_template/chunk_filename_template"
+            )
+        return str(template).format(chunk=int(chunk))
+
+    def get_clip_files_in_zip(self, clip_id: str, feature: str) -> dict[str, str]:
+        value = self.features_df.loc[feature].get("clip_files_in_zip", {})
+        if isinstance(value, str):
+            value = json.loads(value)
+        if isinstance(value, dict) and clip_id in value:
+            return value[clip_id]
+        if isinstance(value, dict):
+            return value
+        raise KeyError(f"No zip member metadata for {clip_id=} {feature=}")
+
+
 class PhysicalAIAVDatasetLocalInterface:
     def __init__(
         self,
@@ -77,7 +109,10 @@ class PhysicalAIAVDatasetLocalInterface:
         features_df["clip_files_in_zip"] = features_df["clip_files_in_zip"].map(
             json.loads, na_action="ignore"
         )
-        self.features = Features(features_df)
+        if "filename_template" in features_df.columns or "chunk_filename_template" in features_df.columns:
+            self.features = _LocalFeatures(features_df)
+        else:
+            self.features = Features(features_df)
 
         self.clip_index = pd.read_parquet(os.path.join(self.local_dir, clip_index_metadata))
 
@@ -143,6 +178,8 @@ class PhysicalAIAVDatasetLocalInterface:
         return np.asarray(t0, dtype=np.int64)
 
     def get_clip_feature(self, clip_id: str, feature: str, maybe_stream: bool = False) -> Any:
+        if feature not in self.features.features_df.index and "/" in feature:
+            feature = feature.rsplit("/", maxsplit=1)[-1]
         if feature not in self.features.features_df.index:
             logger.warning(
                 "Feature %r is not in features_df (available: %s). Returning None.",

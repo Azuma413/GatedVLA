@@ -27,7 +27,7 @@ rm -rf data/expert_debug/results
 python3 scripts/reset_carla_world.py
 
 # Start the evaluation
-export LEAD_EXPERT_CONFIG="target_dataset=6 py123d_data_format=true use_radars=false lidar_stack_size=2 save_only_non_ground_lidar=false save_lidar_only_inside_bev=false"
+export LEAD_EXPERT_CONFIG="target_dataset=7 py123d_data_format=true use_radars=false lidar_stack_size=2 save_only_non_ground_lidar=false save_lidar_only_inside_bev=false"
 python -u 3rd_party/leaderboard_autopilot/leaderboard/leaderboard_evaluator_local.py \
     --port=2000 \
     --traffic-manager-port=8000 \
@@ -36,7 +36,7 @@ python -u 3rd_party/leaderboard_autopilot/leaderboard/leaderboard_evaluator_loca
     --repetitions=1 \
     --track=MAP \
     --checkpoint=${CHECKPOINT_ENDPOINT} \
-    --agent=lead/expert/expert.py \
+    --agent=lead/expert/expert_py123d.py \
     --agent-config=$ROUTES \
     --debug=0 \
     --resume=1 \

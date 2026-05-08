@@ -128,6 +128,7 @@ class BaseConfig:
             TargetDataset.CARLA_LEADERBOARD2_3CAMERAS: 3,
             TargetDataset.CARLA_LEADERBOARD2_1CAMERA: 1,
             TargetDataset.CARLA_PY123D_6CAMERAS: 6,
+            TargetDataset.CARLA_ALPAMAYO_4CAMERAS: 4,
             TargetDataset.NAVSIM_4CAMERAS: 4,
             TargetDataset.WAYMO_E2E_2025_3CAMERAS: 3,
         }[self.target_dataset]
@@ -281,6 +282,43 @@ class BaseConfig:
                     "height": 450,
                     "cropped_height": 450,
                     "fov": 90,
+                },
+            }
+        elif self.target_dataset == TargetDataset.CARLA_ALPAMAYO_4CAMERAS:
+            # Four-camera rig matching Alpamayo/Physical AI AV feature names:
+            # cross-left, front-wide, cross-right, and front-tele.
+            return {
+                1: {
+                    "pos": [1.5, -0.3, 1.6],
+                    "rot": [0.0, 0.0, -30.0],
+                    "width": 800,
+                    "height": 600,
+                    "cropped_height": 600,
+                    "fov": 120,
+                },
+                2: {
+                    "pos": [1.5, 0.0, 1.6],
+                    "rot": [0.0, 0.0, 0.0],
+                    "width": 800,
+                    "height": 600,
+                    "cropped_height": 600,
+                    "fov": 120,
+                },
+                3: {
+                    "pos": [1.5, 0.3, 1.6],
+                    "rot": [0.0, 0.0, 30.0],
+                    "width": 800,
+                    "height": 600,
+                    "cropped_height": 600,
+                    "fov": 120,
+                },
+                4: {
+                    "pos": [1.5, 0.0, 1.6],
+                    "rot": [0.0, 0.0, 0.0],
+                    "width": 800,
+                    "height": 600,
+                    "cropped_height": 600,
+                    "fov": 30,
                 },
             }
         elif self.target_dataset == TargetDataset.NAVSIM_4CAMERAS:

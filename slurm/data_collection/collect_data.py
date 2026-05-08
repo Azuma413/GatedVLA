@@ -4,6 +4,7 @@ import json
 import os
 import random
 import subprocess
+import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -40,7 +41,7 @@ def make_bash(
     py123d_env_vars = ""
     if py123d_format:
         py123d_env_vars = f'''export PY123D_DATA_ROOT="{data_save_root}/"
-export LEAD_EXPERT_CONFIG="target_dataset=6 py123d_data_format=true use_radars=false lidar_stack_size=2 save_only_non_ground_lidar=false save_lidar_only_inside_bev=false"'''
+export LEAD_EXPERT_CONFIG="target_dataset=7 py123d_data_format=true use_radars=false lidar_stack_size=2 save_only_non_ground_lidar=false save_lidar_only_inside_bev=false"'''
 
     template = f"""#!/bin/bash
 #SBATCH --job-name={jobname}_{route_file_number}
@@ -285,6 +286,17 @@ def arg_parse() -> argparse.Namespace:
         action="store_true",
         help="Enable Py123D data format for unified dataset compatibility",
     )
+    parser.add_argument(
+        "--export-pai",
+        action="store_true",
+        help="After --py123d collection finishes, export 123D logs to Alpamayo/PAI local format.",
+    )
+    parser.add_argument(
+        "--pai-output-dir",
+        type=str,
+        default=None,
+        help="Output directory for --export-pai. Defaults to <root_folder>/carla_alpamayo_pai.",
+    )
     return parser.parse_args()
 
 
@@ -303,7 +315,7 @@ if __name__ == "__main__":
     # Configure based on data format
     if args.py123d:
         agent = f"{code_root}/lead/expert/expert_py123d.py"
-        dataset_name = "carla_leaderboard2_py123d"
+        dataset_name = "carla_alpamayo_4c_py123d"
     else:
         agent = f"{code_root}/lead/expert/expert.py"
         dataset_name = "carla_leaderboard2_6cameras"
@@ -564,3 +576,25 @@ if __name__ == "__main__":
 
         if num_running_jobs == 0:
             training_finished = True
+
+    if args.export_pai:
+        if not args.py123d:
+            raise ValueError("--export-pai requires --py123d")
+        pai_output_dir = args.pai_output_dir or os.path.join(
+            root_folder,
+            "carla_alpamayo_pai",
+        )
+        export_cmd = [
+            sys.executable,
+            "scripts/export_py123d_to_pai.py",
+            "--logs-root",
+            data_save_directory,
+            "--output-dir",
+            pai_output_dir,
+            "--split",
+            "train",
+            "--overwrite",
+        ]
+        print("Exporting collected 123D logs to Alpamayo/PAI format:")
+        print(" ".join(export_cmd))
+        subprocess.check_call(export_cmd)

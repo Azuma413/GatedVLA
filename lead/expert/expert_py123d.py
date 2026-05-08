@@ -73,6 +73,20 @@ CAMERA_ID_MAPPING = {
     6: CameraID.PCAM_B0,
 }
 
+ALPAMAYO_CAMERA_ID_MAPPING = {
+    1: CameraID.FTCAM_L0,
+    2: CameraID.FTCAM_F0,
+    3: CameraID.FTCAM_R0,
+    4: CameraID.FTCAM_TELE_F0,
+}
+
+ALPAMAYO_CAMERA_NAMES = {
+    CameraID.FTCAM_L0: "camera_cross_left_120fov",
+    CameraID.FTCAM_F0: "camera_front_wide_120fov",
+    CameraID.FTCAM_R0: "camera_cross_right_120fov",
+    CameraID.FTCAM_TELE_F0: "camera_front_tele_30fov",
+}
+
 # Max ego-to-waypoint distance (m) for logging a TL detection.
 TRAFFIC_LIGHT_LOG_RADIUS_M: float = 80.0
 
@@ -92,6 +106,11 @@ class ExpertPy123D(Expert):
     This class extends Expert to add Py123D Arrow format saving
     without changing LEAD's core data processing or driving logic.
     """
+
+    def _get_camera_id_mapping(self) -> dict[int, CameraID]:
+        if self.config_expert.target_dataset == constants.TargetDataset.CARLA_ALPAMAYO_4CAMERAS:
+            return ALPAMAYO_CAMERA_ID_MAPPING
+        return CAMERA_ID_MAPPING
 
     @beartype
     def setup(
@@ -299,7 +318,7 @@ class ExpertPy123D(Expert):
         """
 
         camera_metadatas = {}
-        for cam_key, camera_id in CAMERA_ID_MAPPING.items():
+        for cam_key, camera_id in self._get_camera_id_mapping().items():
             # Calculate intrinsics from CARLA camera parameters
             width = self.config_expert.camera_calibration[cam_key]["width"]
             height = self.config_expert.camera_calibration[cam_key]["height"]
@@ -326,7 +345,7 @@ class ExpertPy123D(Expert):
                 ego_metadata=self._ego_metadata,
             )
             camera_metadatas[camera_id] = PinholeCameraMetadata(
-                camera_name=str(camera_id),
+                camera_name=ALPAMAYO_CAMERA_NAMES.get(camera_id, str(camera_id)),
                 camera_id=camera_id,
                 intrinsics=intrinsics,
                 distortion=None,
@@ -700,7 +719,7 @@ class ExpertPy123D(Expert):
             List of Camera objects with RGB images.
         """
         cameras = []
-        for cam_key, camera_id in CAMERA_ID_MAPPING.items():
+        for cam_key, camera_id in self._get_camera_id_mapping().items():
             # Get RGB image from LEAD (CARLA provides BGRA, convert to RGB)
             bgra_image = (
                 input_data[f"rgb_{cam_key}"][1]

@@ -23,7 +23,10 @@ The `--py123d` flag enables collection in Py123D format, which provides a unifie
 
 When using `--py123d`:
 - Expert agent automatically switches to `expert_py123d.py`
-- Dataset name becomes `carla_leaderboard2_py123d`
+- Dataset name becomes `carla_alpamayo_4c_py123d`
+- The collected camera rig matches Alpamayo/Physical AI AV inputs:
+  `camera_cross_left_120fov`, `camera_front_wide_120fov`,
+  `camera_cross_right_120fov`, and `camera_front_tele_30fov`
 
 Two additional config files control the collection process:
 
@@ -41,6 +44,9 @@ python3 slurm/data_collection/collect_data.py
 # Py123D format for cross-dataset compatibility
 python3 slurm/data_collection/collect_data.py --py123d
 
+# Py123D collection followed by Alpamayo/PAI export
+python3 slurm/data_collection/collect_data.py --py123d --export-pai
+
 # Optional: specify custom route and data folders
 python3 slurm/data_collection/collect_data.py \
   --route_folder data/custom_routes \
@@ -52,6 +58,20 @@ python3 slurm/data_collection/collect_data.py \
   --route_folder data/custom_routes \
   --root_folder /scratch/datasets/
 ```
+
+The Alpamayo export can also be run manually after collection:
+
+```bash
+python scripts/export_py123d_to_pai.py \
+  --logs-root data/carla_alpamayo_4c_py123d \
+  --output-dir data/carla_alpamayo_pai \
+  --overwrite
+```
+
+This writes a local Physical AI AV-style dataset containing `clip_index.parquet`,
+`features.csv`, `metadata/feature_presence.parquet`, camera MP4 zip chunks, and
+egomotion zip chunks. Chain-of-Causation labels are intentionally not generated
+by this exporter.
 
 The script creates a structured output directory:
 

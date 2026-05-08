@@ -21,6 +21,7 @@ class TargetDataset(IntEnum):
     NAVSIM_4CAMERAS = auto()
     WAYMO_E2E_2025_3CAMERAS = auto()
     CARLA_PY123D_6CAMERAS = auto()
+    CARLA_ALPAMAYO_4CAMERAS = auto()
 
 
 class SourceDataset(IntEnum):

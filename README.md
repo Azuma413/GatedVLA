@@ -739,7 +739,7 @@ The bridge between the two codebases is `CarlaTransfuserAgent` ([navsimv1.1](3rd
 LEAD integrates 123D as its data collection format for CARLA. With CARLA running, collect data in 123D format via **Python**:
 
 ```bash
-export LEAD_EXPERT_CONFIG="target_dataset=6 \
+export LEAD_EXPERT_CONFIG="target_dataset=7 \
   py123d_data_format=true \
   use_radars=false \
   lidar_stack_size=2 \
@@ -758,14 +758,17 @@ Or via **bash**:
 bash scripts/eval_expert_123d.sh
 ```
 
-Output in 123D format is saved to `data/carla_leaderboard2_py123d/`. Each route produces a directory under `logs/carla_train/` with one Arrow file per modality:
+Output in 123D format is saved to `data/carla_alpamayo_4c_py123d/`. Each route produces a directory under `logs/carla_train/` with one Arrow file per modality:
 
 <div align="center">
 
 | File                               | Content                                                                           |
 | :--------------------------------- | :-------------------------------------------------------------------------------- |
 | `ego_state_se3.arrow`              | Ego vehicle pose and motion state                                                 |
-| `camera.pcam_{f,b,l,r}{0,1}.arrow` | Camera images (front, back, left, right)                                          |
+| `camera.ftcam_l0.arrow`             | Alpamayo camera image: `camera_cross_left_120fov`                                 |
+| `camera.ftcam_f0.arrow`             | Alpamayo camera image: `camera_front_wide_120fov`                                 |
+| `camera.ftcam_r0.arrow`             | Alpamayo camera image: `camera_cross_right_120fov`                                |
+| `camera.ftcam_tele_f0.arrow`        | Alpamayo camera image: `camera_front_tele_30fov`                                  |
 | `lidar.lidar_top.arrow`            | Top LiDAR point clouds                                                            |
 | `box_detections_se3.arrow`         | 3D bounding box annotations                                                       |
 | `traffic_light_detections.arrow`   | Traffic light states                                                              |
@@ -781,6 +784,25 @@ To visualize collected scenes in 3D with [Viser](https://viser.studio/):
 ```bash
 python scripts/123d_viser.py
 ```
+
+To export collected 123D logs into the local Physical AI AV-style layout used by
+Alpamayo SFT:
+
+```bash
+python scripts/export_py123d_to_pai.py \
+  --logs-root data/carla_alpamayo_4c_py123d \
+  --output-dir data/carla_alpamayo_pai \
+  --overwrite
+```
+
+On SLURM, collection and export can be chained:
+
+```bash
+python3 slurm/data_collection/collect_data.py --py123d --export-pai
+```
+
+The exporter writes `clip_index.parquet`, `features.csv`, `metadata/feature_presence.parquet`,
+camera MP4 zip chunks, and egomotion zip chunks. It does not generate CoC labels.
 
 > [!TIP]
 > This feature is experimental. Change `PY123D_DATA_ROOT` in `scripts/main.sh` to set the output directory.
