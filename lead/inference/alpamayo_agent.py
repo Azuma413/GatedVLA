@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 from collections import deque
+from copy import deepcopy
 
 import carla
 import cv2
@@ -24,7 +25,6 @@ from lead.inference.alpamayo_inference import AlpamayoInference
 from lead.inference.closed_loop_inference import ClosedLoopInference
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.infraction_recorder import InfractionRecorder
-from lead.inference.sensor_agent import ForceMovePostProcessor, StopSignPostProcessor
 from lead.inference.video_recorder import VideoRecorder
 from lead.training.config_training import TrainingConfig
 
@@ -351,6 +351,7 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             self.control = carla.VehicleControl(0.0, 0.0, 1.0)
 
         self.check_infractions()
+        self._save_video_frames(input_data)
 
         if self.config_closed_loop.is_bench2drive and hasattr(self, "get_metric_info"):
             self.metric_info[self.step] = self.get_metric_info()
@@ -362,10 +363,89 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 json.dump(self.metric_info, outfile, indent=4)
         return self.control
 
+    def _save_video_frames(self, input_data: dict) -> None:
+        if not hasattr(self, "video_recorder"):
+            return
+        if self.config_closed_loop.save_path is None:
+            return
+        if self.step % self.config_closed_loop.produce_frame_frequency != 0:
+            return
+
+        input_image = input_data["rgb"].copy()
+        if self.config_closed_loop.produce_input_image:
+            self.video_recorder.save_input_image(input_image)
+        if self.config_closed_loop.produce_input_video:
+            self.video_recorder.save_input_video_frame(input_image)
+
     def destroy(self, results=None):
         LOG.info(results)
         if hasattr(self, "video_recorder"):
             self.video_recorder.cleanup_and_compress()
+
+
+class StopSignPostProcessor:
+    """Placeholder hook matching SensorAgent's stop-sign postprocessor API."""
+
+    def __init__(self, config: TrainingConfig, config_test_time: ClosedLoopConfig, bb_buffer: deque):
+        self.config = config
+        self.config_test_time = config_test_time
+        self.bb_buffer = bb_buffer
+
+    def adjust(self, ego_speed: float, current_throttle: float, current_brake: float):
+        return current_throttle, current_brake
+
+
+class ForceMovePostProcessor:
+    """Forces the agent to creep after a long standstill, using LEAD's safety box."""
+
+    def __init__(
+        self,
+        config: TrainingConfig,
+        config_test_time: ClosedLoopConfig,
+        lidar_queue: deque,
+    ):
+        self.config = config
+        self.config_test_time = config_test_time
+        self.stuck_detector = 0
+        self.force_move = 0
+        self.lidar_buffer = lidar_queue
+
+    def adjust(
+        self,
+        ego_speed: float,
+        current_throttle: float,
+        current_brake: float,
+    ) -> tuple[float, float]:
+        if not self.config_test_time.sensor_agent_creeping:
+            return current_throttle, current_brake
+        if ego_speed < 0.1:
+            self.stuck_detector += 1
+        else:
+            self.stuck_detector = 0
+
+        if self.stuck_detector > self.config_test_time.sensor_agent_stuck_threshold:
+            self.force_move = self.config_test_time.sensor_agent_stuck_move_duration
+
+        if self.force_move <= 0:
+            return current_throttle, current_brake
+
+        emergency_stop = False
+        if len(self.lidar_buffer) > 0:
+            safety_box = deepcopy(self.lidar_buffer[-1])
+            safety_box = safety_box[safety_box[..., 2] > self.config.safety_box_z_min]
+            safety_box = safety_box[safety_box[..., 2] < self.config.safety_box_z_max]
+            safety_box = safety_box[safety_box[..., 1] > self.config.safety_box_y_min]
+            safety_box = safety_box[safety_box[..., 1] < self.config.safety_box_y_max]
+            safety_box = safety_box[safety_box[..., 0] > self.config.safety_box_x_min]
+            safety_box = safety_box[safety_box[..., 0] < self.config.safety_box_x_max]
+            emergency_stop = len(safety_box) > 0
+
+        if emergency_stop:
+            self.force_move = self.config_test_time.sensor_agent_stuck_move_duration
+            return 0.0, 1.0
+
+        self.force_move -= 1
+        return max(self.config_test_time.sensor_agent_stuck_throttle, current_throttle), 0.0
 
 
 if __name__ == "__main__":

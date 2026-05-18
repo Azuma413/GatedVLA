@@ -182,3 +182,31 @@ uv run torchrun --nproc_per_node 3 -m finetune.sft.train_hf \
   trainer.num_train_epochs=1 \
   trainer.dataloader_num_workers=0
 ```
+
+
+## 5. AlpamayoをBench2Drive評価し入力動画を保存
+
+CARLAをport 2000で起動した状態で、以下のように実行します。`produce_input_video=true` を指定すると、4カメラを横に連結した入力動画が `--output-dir` 以下に `{route_id}_input.mp4` として保存されます。
+
+```bash
+LEAD_PROJECT_ROOT=/data1/hiratsuka/SourceCode/VLA4AD_Research \
+LEAD_CLOSED_LOOP_CONFIG='produce_input_video=true produce_frame_frequency=1' \
+ALPAMAYO_INFERENCE_INTERVAL=10 \
+uv run python -m lead \
+  --checkpoint outputs/alpamayo_sft_smoke/stage2/checkpoint-1 \
+  --routes data/benchmark_routes/bench2drive/23687.xml \
+  --bench2drive \
+  --alpamayo \
+  --port 2000 \
+  --traffic-manager-port 8000 \
+  --timeout 120 \
+  --output-dir outputs/alpamayo_b2d_video
+```
+
+出力例:
+
+```text
+outputs/alpamayo_b2d_video/23687_input.mp4
+outputs/alpamayo_b2d_video/metric_info.json
+outputs/alpamayo_b2d_video/infractions.json
+```
