@@ -1,0 +1,156 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+%labels
+    Author VLA4AD_Research
+    Description "LEAD data collection/evaluation plus Alpamayo SFT runtime"
+
+%files
+    pyproject.toml /opt/build/lead/pyproject.toml
+    uv.lock /opt/build/lead/uv.lock
+    3rd_party/alpamayo/pyproject.toml /opt/build/alpamayo/pyproject.toml
+    3rd_party/alpamayo/uv.lock /opt/build/alpamayo/uv.lock
+
+%environment
+    export LEAD_PROJECT_ROOT=${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}
+    export PY123D_DATA_ROOT=${PY123D_DATA_ROOT:-${LEAD_PROJECT_ROOT}/data/carla_alpamayo_4c_py123d}
+    export CARLA_ROOT=${CARLA_ROOT:-${LEAD_PROJECT_ROOT}/3rd_party/CARLA_0915}
+    export NVIDIA_DRIVER_CAPABILITIES=all
+    export UV_LINK_MODE=copy
+    export PATH=/opt/venvs/lead/bin:/usr/local/bin:$PATH
+    export PYTHONPATH=${LEAD_PROJECT_ROOT}:${LEAD_PROJECT_ROOT}/3rd_party/alpamayo:${LEAD_PROJECT_ROOT}/3rd_party/alpamayo/src:${LEAD_PROJECT_ROOT}/3rd_party/leaderboard:${LEAD_PROJECT_ROOT}/3rd_party/scenario_runner:${LEAD_PROJECT_ROOT}/3rd_party/Bench2Drive/leaderboard:${LEAD_PROJECT_ROOT}/3rd_party/Bench2Drive/scenario_runner:${PYTHONPATH:-}
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export UV_LINK_MODE=copy
+    export UV_PYTHON_INSTALL_DIR=/opt/uv/python
+    export PATH=/root/.local/bin:/opt/venvs/lead/bin:$PATH
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        ffmpeg \
+        git \
+        git-lfs \
+        libegl1 \
+        libffi-dev \
+        libgl1 \
+        libglib2.0-0 \
+        libglvnd0 \
+        libglx0 \
+        libgomp1 \
+        libsm6 \
+        libssl-dev \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        ninja-build \
+        openssh-client \
+        parallel \
+        pciutils \
+        pkg-config \
+        procps \
+        python3 \
+        python3-pip \
+        rsync \
+        tree \
+        unzip \
+        wget \
+        zip \
+        zlib1g-dev
+    rm -rf /var/lib/apt/lists/*
+
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv
+    uv python install 3.10 3.12
+
+    uv venv --python 3.10 /opt/venvs/lead
+    . /opt/venvs/lead/bin/activate
+    cd /opt/build/lead
+    uv sync --frozen --no-install-project --no-dev --active
+    deactivate
+
+    uv venv --python 3.12 /opt/venvs/alpamayo
+    . /opt/venvs/alpamayo/bin/activate
+    cd /opt/build/alpamayo
+    MAX_JOBS="${MAX_JOBS:-8}" uv sync --frozen --no-install-project --no-dev --active
+
+    cat >/usr/local/bin/lead-python <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}"
+exec /opt/venvs/lead/bin/python "$@"
+EOF
+
+    cat >/usr/local/bin/lead-uv <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}"
+VIRTUAL_ENV=/opt/venvs/lead exec /usr/local/bin/uv "$@"
+EOF
+
+    cat >/usr/local/bin/alpamayo-python <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}/3rd_party/alpamayo"
+exec /opt/venvs/alpamayo/bin/python "$@"
+EOF
+
+    cat >/usr/local/bin/alpamayo-uv <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}/3rd_party/alpamayo"
+VIRTUAL_ENV=/opt/venvs/alpamayo exec /usr/local/bin/uv "$@"
+EOF
+
+    cat >/usr/local/bin/alpamayo-torchrun <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}/3rd_party/alpamayo"
+exec /opt/venvs/alpamayo/bin/torchrun "$@"
+EOF
+
+    cat >/usr/local/bin/lead-shell <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}"
+exec /bin/bash "$@"
+EOF
+
+    chmod +x \
+        /usr/local/bin/lead-python \
+        /usr/local/bin/lead-uv \
+        /usr/local/bin/alpamayo-python \
+        /usr/local/bin/alpamayo-uv \
+        /usr/local/bin/alpamayo-torchrun \
+        /usr/local/bin/lead-shell
+
+%runscript
+    exec /usr/local/bin/lead-shell "$@"
+
+%help
+    LEAD + Alpamayo runtime image.
+
+    Build:
+      singularity build lead.sif lead.def
+
+    Recommended run from the repository root:
+      singularity shell --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif
+
+    LEAD data collection / export / closed-loop evaluation use Python 3.10:
+      singularity exec --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif \
+        lead-python -m lead --expert --py123d --routes data/data_routes/lead/noScenarios/route_000391.xml
+
+      singularity exec --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif \
+        lead-python scripts/export_py123d_to_pai.py --logs-root data/carla_alpamayo_4c_py123d --output-dir data/carla_alpamayo_pai --overwrite
+
+    Alpamayo SFT uses Python 3.12:
+      singularity exec --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif \
+        alpamayo-torchrun --nproc_per_node 8 -m finetune.sft.train_hf ...
+
+    The image expects the repository to be bind-mounted at /workspace/VLA4AD_Research
+    unless SINGULARITYENV_LEAD_PROJECT_ROOT is set to another path.

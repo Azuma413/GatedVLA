@@ -1,0 +1,89 @@
+Bootstrap: docker
+From: nvidia/cudagl:11.4.2-devel-ubuntu20.04
+
+%labels
+    Author VLA4AD_Research
+    Description "CARLA 0.9.15 runtime for LEAD data collection and evaluation"
+
+%files
+    3rd_party/CARLA_0915 /opt/carla
+
+%environment
+    export CARLA_ROOT=/opt/carla
+    export SDL_VIDEODRIVER=offscreen
+    export NVIDIA_DRIVER_CAPABILITIES=all
+    export __GLX_VENDOR_LIBRARY_NAME=nvidia
+    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+    export PATH=/opt/carla:$PATH
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libasound2 \
+        libfontconfig1 \
+        libfreetype6 \
+        libglu1-mesa \
+        libgtk-3-0 \
+        libnss3 \
+        libpulse0 \
+        libsdl2-2.0-0 \
+        libsm6 \
+        libvulkan1 \
+        libx11-6 \
+        libxau6 \
+        libxcb1 \
+        libxcursor1 \
+        libxdmcp6 \
+        libxext6 \
+        libxi6 \
+        libxinerama1 \
+        libxkbcommon0 \
+        libxrandr2 \
+        libxrender1 \
+        libxt6 \
+        mesa-utils \
+        procps \
+        python3 \
+        python3-pip \
+        unzip \
+        vulkan-utils \
+        xdg-user-dirs \
+        xdg-utils
+    rm -rf /var/lib/apt/lists/*
+
+    chmod +x /opt/carla/CarlaUE4.sh || true
+    if [ -x /opt/carla/ImportAssets.sh ] && [ -f /opt/carla/Import/AdditionalMaps_0.9.15.tar.gz ]; then
+        (cd /opt/carla && ./ImportAssets.sh) || true
+    fi
+
+    cat >/usr/local/bin/start-carla <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT="${CARLA_RPC_PORT:-2000}"
+exec "${CARLA_ROOT:-/opt/carla}/CarlaUE4.sh" \
+  -RenderOffScreen \
+  -nosound \
+  "-carla-rpc-port=${PORT}" \
+  "$@"
+EOF
+    chmod +x /usr/local/bin/start-carla
+
+%runscript
+    exec /usr/local/bin/start-carla "$@"
+
+%help
+    CARLA 0.9.15 runtime image.
+
+    Build:
+      singularity build carla.sif carla.def
+
+    Run:
+      singularity run --nv carla.sif
+
+    Optional port override:
+      SINGULARITYENV_CARLA_RPC_PORT=2002 singularity run --nv carla.sif
