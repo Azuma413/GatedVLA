@@ -147,7 +147,7 @@ uv run torchrun --nproc_per_node 8 -m finetune.sft.train_hf \
 データとcheckpointが揃っている状態で、まず1 stepだけ通すと設定とデータローダの疎通を確認できます。
 
 ```bash
-uv run torchrun --nproc_per_node 1 -m finetune.sft.train_hf \
+uv run torchrun --nproc_per_node 3 -m finetune.sft.train_hf \
   --config-path pkg://finetune/sft/configs \
   --config-name sft_stage1 \
   data.train_dataset.local_dir=../../data/carla_alpamayo_pai \
@@ -166,7 +166,7 @@ uv run torchrun --nproc_per_node 1 -m finetune.sft.train_hf \
 Stage 2も1 stepだけ確認する場合:
 
 ```bash
-uv run torchrun --nproc_per_node 1 -m finetune.sft.train_hf \
+uv run torchrun --nproc_per_node 3 -m finetune.sft.train_hf \
   --config-path pkg://finetune/sft/configs \
   --config-name sft_stage2 \
   data.train_dataset.local_dir=../../data/carla_alpamayo_pai \

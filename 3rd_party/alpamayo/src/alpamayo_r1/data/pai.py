@@ -15,6 +15,7 @@
 
 from typing import Any
 
+import pandas as pd
 import torch
 from alpamayo_r1.data.pai_utils import PhysicalAIAVDatasetLocalInterface
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
@@ -86,6 +87,30 @@ class PAIDataset(Dataset):
         if vla_preprocess_args is not None:
             self.vla_preprocess_func = instantiate(vla_preprocess_args, model_config=model_config)
 
+    def _get_navigation_command_text(self, clip_id: str, t0_us: int) -> str | None:
+        if "navigation_command" not in self.avdi.features.features_df.index:
+            return None
+        if (
+            "navigation_command" in self.avdi.sensor_presence.columns
+            and not bool(self.avdi.sensor_presence.at[clip_id, "navigation_command"])
+        ):
+            return None
+
+        feature = self.avdi.get_clip_feature(clip_id, "navigation_command")
+        if feature is None:
+            return None
+        if isinstance(feature, dict):
+            command_df = feature.get("navigation_command")
+        else:
+            command_df = feature
+        if not isinstance(command_df, pd.DataFrame) or command_df.empty:
+            return None
+        if "timestamp_us" not in command_df.columns or "command_text" not in command_df.columns:
+            return None
+
+        nearest_idx = (command_df["timestamp_us"].astype("int64") - int(t0_us)).abs().idxmin()
+        return str(command_df.loc[nearest_idx, "command_text"])
+
     def __len__(self) -> int:
         """Return the number of clips in the dataset."""
         return len(self.clip_ids)
@@ -111,6 +136,9 @@ class PAIDataset(Dataset):
             num_future_steps=self.num_future_steps,
             time_step=self.time_step,
         )
+        navigation_command_text = self._get_navigation_command_text(clip_id, int(t0_us))
+        if navigation_command_text is not None:
+            sample_data["navigation_command_text"] = navigation_command_text
 
         # squeeze ego motion shape
         for key in sample_data.keys():

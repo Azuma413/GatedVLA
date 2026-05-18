@@ -44,6 +44,7 @@ class ModeConfig:
         routes: str,
         use_py123d: bool = False,
         is_plant: bool = False,
+        is_alpamayo: bool = False,
     ) -> tuple[LeaderboardType, str, str, str | None, str]:
         """Get mode configuration based on CLI arguments.
 
@@ -56,6 +57,7 @@ class ModeConfig:
             routes: Routes file path
             use_py123d: Whether to use expert_py123d.py instead of expert.py
             is_plant: Whether PlanT agent mode is selected
+            is_alpamayo: Whether Alpamayo sensor-agent mode is selected
 
         Returns:
             Tuple of (leaderboard_type, agent, agent_config, checkpoint_dir, track)
@@ -97,6 +99,15 @@ class ModeConfig:
                 checkpoint,
                 checkpoint,
                 "MAP",
+            )
+
+        if is_alpamayo:
+            return (
+                _resolve_leaderboard_type(),
+                "lead/inference/alpamayo_agent.py",
+                checkpoint,
+                checkpoint,
+                "SENSORS",
             )
 
         return (
@@ -396,6 +407,7 @@ class LeaderboardWrapper:
                 routes=str(self.routes),
                 use_py123d=self.args.py123d if hasattr(self.args, "py123d") else False,
                 is_plant=getattr(self.args, "plant", False),
+                is_alpamayo=getattr(self.args, "alpamayo", False),
             )
         )
         self.leaderboard_type = leaderboard_type
@@ -610,6 +622,11 @@ Examples:
         "--plant",
         action="store_true",
         help="Use lead/plant/plant_agent.py with MAP track (requires --checkpoint)",
+    )
+    parser.add_argument(
+        "--alpamayo",
+        action="store_true",
+        help="Use lead/inference/alpamayo_agent.py with SENSORS track (requires --checkpoint)",
     )
 
     # Py123D option for expert mode

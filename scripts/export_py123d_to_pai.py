@@ -3,7 +3,8 @@
 
 This converter is intentionally focused on Alpamayo SFT inputs:
 camera videos, frame timestamps, egomotion, clip_index, feature_presence, and
-features.csv. Chain-of-Causation labels are not generated here.
+features.csv. If present beside each Arrow log, navigation_command.parquet is
+exported as a PAI label for text-conditioned Alpamayo SFT.
 """
 
 from __future__ import annotations
@@ -39,6 +40,16 @@ REQUIRED_CAMERA_MAPPING = {
     CameraID.FTCAM_TELE_F0: "camera_front_tele_30fov",
 }
 
+COMMAND_TEXT_BY_VALUE = {
+    0: "Unknown",
+    1: "Turn left",
+    2: "Turn right",
+    3: "Go straight",
+    4: "Follow the lane",
+    5: "Change lane left",
+    6: "Change lane right",
+}
+
 
 @dataclass(frozen=True)
 class ClipExport:
@@ -51,6 +62,7 @@ class ClipExport:
     present_features: set[str]
     camera_zip_members: dict[str, dict[str, str]]
     egomotion_zip_members: dict[str, str]
+    navigation_command_zip_members: dict[str, str]
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,6 +216,47 @@ def add_file_to_zip(zip_path: Path, source_path: Path, arcname: str) -> None:
         zf.write(source_path, arcname)
 
 
+def find_navigation_command_sidecar(log_dir: Path) -> Path | None:
+    candidates = [
+        log_dir / "navigation_command.parquet",
+        log_dir.with_suffix(".navigation_command.parquet"),
+        log_dir.parent / f"{log_dir.name}.navigation_command.parquet",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def normalize_navigation_command_df(command_df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {}
+    if "timestamp" in command_df.columns and "timestamp_us" not in command_df.columns:
+        rename_map["timestamp"] = "timestamp_us"
+    command_df = command_df.rename(columns=rename_map).copy()
+
+    if "timestamp_us" not in command_df.columns:
+        raise ValueError("navigation command parquet must contain timestamp_us or timestamp")
+    if "command_near" not in command_df.columns:
+        raise ValueError("navigation command parquet must contain command_near")
+
+    if "command_far" not in command_df.columns:
+        command_df["command_far"] = command_df["command_near"]
+    if "next_command" not in command_df.columns:
+        command_df["next_command"] = command_df["command_far"]
+    if "command_text" not in command_df.columns:
+        command_df["command_text"] = command_df["command_near"].map(
+            lambda value: COMMAND_TEXT_BY_VALUE.get(int(value), "Unknown")
+        )
+
+    columns = ["timestamp_us", "command_near", "command_far", "next_command", "command_text"]
+    command_df = command_df[columns].sort_values("timestamp_us")
+    command_df["timestamp_us"] = command_df["timestamp_us"].astype(np.int64)
+    for column in ["command_near", "command_far", "next_command"]:
+        command_df[column] = command_df[column].astype(np.int64)
+    command_df["command_text"] = command_df["command_text"].astype(str)
+    return command_df
+
+
 def export_clip(
     log_dir: Path,
     output_dir: Path,
@@ -231,6 +284,7 @@ def export_clip(
     present_features: set[str] = set()
     camera_zip_members: dict[str, dict[str, str]] = {}
     egomotion_zip_members: dict[str, str] = {}
+    navigation_command_zip_members: dict[str, str] = {}
 
     with tempfile.TemporaryDirectory(prefix="py123d_to_pai_") as tmp:
         tmp_path = Path(tmp)
@@ -244,6 +298,24 @@ def export_clip(
         add_file_to_zip(ego_zip, ego_tmp, ego_arc)
         present_features.add("egomotion")
         egomotion_zip_members["egomotion"] = ego_arc
+
+        command_sidecar = find_navigation_command_sidecar(log_dir)
+        if command_sidecar is None:
+            LOG.warning("Clip %s has no navigation_command.parquet sidecar", clip_id)
+        else:
+            command_df = normalize_navigation_command_df(pd.read_parquet(command_sidecar))
+            command_tmp = tmp_path / f"{clip_id}.navigation_command.parquet"
+            command_df.to_parquet(command_tmp, index=False)
+            command_arc = f"{clip_id}.navigation_command.parquet"
+            command_zip = (
+                output_dir
+                / "labels"
+                / "navigation_command"
+                / f"navigation_command.chunk_{chunk:04d}.zip"
+            )
+            add_file_to_zip(command_zip, command_tmp, command_arc)
+            present_features.add("navigation_command")
+            navigation_command_zip_members["navigation_command"] = command_arc
 
         available_cameras = scene.get_camera_metadatas()
         missing_cameras = [
@@ -285,6 +357,7 @@ def export_clip(
         present_features=present_features,
         camera_zip_members=camera_zip_members,
         egomotion_zip_members=egomotion_zip_members,
+        navigation_command_zip_members=navigation_command_zip_members,
     )
 
 
@@ -305,17 +378,26 @@ def write_metadata(output_dir: Path, clips: Iterable[ClipExport]) -> None:
     ).set_index("clip_id")
     clip_index.to_parquet(output_dir / "clip_index.parquet")
 
-    features = ["egomotion", *PAI_CAMERA_ORDER]
+    features = ["egomotion", "navigation_command", *PAI_CAMERA_ORDER]
     feature_rows = []
     for feature in features:
         if feature == "egomotion":
             filename_template = "labels/egomotion/egomotion.chunk_{chunk:04d}.zip"
+        elif feature == "navigation_command":
+            filename_template = (
+                "labels/navigation_command/navigation_command.chunk_{chunk:04d}.zip"
+            )
         else:
             filename_template = f"camera/{feature}/{feature}.chunk_{{chunk:04d}}.zip"
         clip_files_in_zip = {}
         for clip in clips:
             if feature == "egomotion" and "egomotion" in clip.present_features:
                 clip_files_in_zip[clip.clip_id] = clip.egomotion_zip_members
+            elif (
+                feature == "navigation_command"
+                and "navigation_command" in clip.present_features
+            ):
+                clip_files_in_zip[clip.clip_id] = clip.navigation_command_zip_members
             elif feature in clip.camera_zip_members:
                 clip_files_in_zip[clip.clip_id] = clip.camera_zip_members[feature]
         feature_rows.append(

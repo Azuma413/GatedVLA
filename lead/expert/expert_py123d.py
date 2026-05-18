@@ -13,6 +13,7 @@ from pathlib import Path
 
 import carla
 import numpy as np
+import pandas as pd
 import shapely.geometry as geom
 from beartype import beartype
 from py123d.api.map.arrow.arrow_map_api import ArrowMapAPI, get_lru_cached_map_api
@@ -87,6 +88,16 @@ ALPAMAYO_CAMERA_NAMES = {
     CameraID.FTCAM_TELE_F0: "camera_front_tele_30fov",
 }
 
+COMMAND_TEXT_BY_VALUE = {
+    int(constants.CarlaNavigationCommand.UNKNOWN): "Unknown",
+    int(constants.CarlaNavigationCommand.LEFT): "Turn left",
+    int(constants.CarlaNavigationCommand.RIGHT): "Turn right",
+    int(constants.CarlaNavigationCommand.STRAIGHT): "Go straight",
+    int(constants.CarlaNavigationCommand.LANEFOLLOW): "Follow the lane",
+    int(constants.CarlaNavigationCommand.CHANGELANELEFT): "Change lane left",
+    int(constants.CarlaNavigationCommand.CHANGELANERIGHT): "Change lane right",
+}
+
 # Max ego-to-waypoint distance (m) for logging a TL detection.
 TRAFFIC_LIGHT_LOG_RADIUS_M: float = 80.0
 
@@ -132,6 +143,7 @@ class ExpertPy123D(Expert):
 
         # Call parent setup - LEAD processes everything normally
         super().setup(path_to_conf_file, route_index, traffic_manager)
+        self._navigation_command_rows: list[dict[str, int | str]] = []
 
         LOG.info("Initializing Py123D writers...")
 
@@ -416,6 +428,7 @@ class ExpertPy123D(Expert):
         ):
             modalities_sync = self._convert_to_py123d(input_data, timestamp)
             self._py123d_log_writer.write_sync(modalities_sync)
+            self._record_navigation_command(timestamp)
             if self.step % self.config_expert.py123d_log_interval == 0:
                 LOG.info(
                     f"Saved Py123D data at step {self.step} (timestamp={timestamp:.2f}s)",
@@ -429,6 +442,38 @@ class ExpertPy123D(Expert):
             )
 
         return control
+
+    def _record_navigation_command(self, timestamp: float) -> None:
+        """Record route-following commands next to the Py123D Arrow log."""
+        commands = [int(item[1]) for item in self._command_planner.route]
+        if not commands:
+            return
+
+        command_near = commands[0]
+        command_far = commands[1] if len(commands) > 1 else command_near
+        self._navigation_command_rows.append(
+            {
+                "timestamp_us": int(Timestamp.from_s(timestamp).time_us),
+                "command_near": command_near,
+                "command_far": command_far,
+                "next_command": command_far,
+                "command_text": COMMAND_TEXT_BY_VALUE.get(command_near, "Unknown"),
+            }
+        )
+
+    def _write_navigation_command_sidecar(self) -> None:
+        if not getattr(self, "_navigation_command_rows", None):
+            return
+
+        output_dir = (
+            self._py123d_logs_root
+            / f"{self.config_expert.py123d_dataset}_{self.config_expert.py123d_split}"
+            / self._log_name
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "navigation_command.parquet"
+        pd.DataFrame(self._navigation_command_rows).to_parquet(output_path, index=False)
+        LOG.info("Saved navigation command sidecar to %s", output_path)
 
     @beartype
     def _convert_to_py123d(self, input_data: dict, timestamp: float) -> ModalitiesSync:
@@ -929,6 +974,7 @@ class ExpertPy123D(Expert):
             f"Final log location: {self._py123d_logs_root.absolute()}/{self._log_name}",
         )
         LOG.info(f"Final map location: {self._py123d_maps_root.absolute()}")
+        self._write_navigation_command_sidecar()
         self._py123d_log_writer.close()
         super().destroy(results)
         LOG.info("Cleanup complete - data saved to Py123D format")

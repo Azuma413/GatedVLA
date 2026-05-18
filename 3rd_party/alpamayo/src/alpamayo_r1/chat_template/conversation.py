@@ -62,7 +62,10 @@ def construct_system_prompt() -> list[dict[str, str]]:
 
 
 def construct_user_prompt(
-    components_order: list[str], components_prompt: list[str], generation_mode: bool
+    components_order: list[str],
+    components_prompt: list[str],
+    generation_mode: bool,
+    data: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     """Construct the input prompt for the VLA  model.
 
@@ -70,6 +73,7 @@ def construct_user_prompt(
         components_order (list[str]): The order of the components.
         components_prompt (list[str]): The prompt of the components.
         generation_mode (bool): Whether to use the generation mode.
+        data (dict[str, Any] | None): Optional sample data with text conditioning fields.
 
     Returns:
         prompt (list): The list of message dictionaries for the VLA model.
@@ -91,6 +95,9 @@ def construct_user_prompt(
             prompt_components.append(template[component])
 
     prompt = ", then ".join(prompt_components) + "."
+    navigation_command_text = None if data is None else data.get("navigation_command_text")
+    if navigation_command_text:
+        prompt = f"Navigation command: {navigation_command_text}. {prompt[0].upper()}{prompt[1:]}"
     return [{"type": "text", "text": prompt}]
 
 
@@ -279,6 +286,7 @@ def build_conversation(
                         components_order=components_order,
                         components_prompt=components_prompt,
                         generation_mode=generation_mode,
+                        data=data,
                     )
                 )
             case "image":
