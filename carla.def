@@ -1,89 +1,96 @@
 Bootstrap: docker
-From: nvidia/cudagl:11.4.2-devel-ubuntu20.04
+From: carlasim/carla:0.9.15
 
 %labels
     Author VLA4AD_Research
-    Description "CARLA 0.9.15 runtime for LEAD data collection and evaluation"
-
-%files
-    3rd_party/CARLA_0915 /opt/carla
+    Description "CARLA 0.9.15 server runtime for Polaris/Apptainer"
 
 %environment
     export CARLA_ROOT=/opt/carla
-    export SDL_VIDEODRIVER=offscreen
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
     export NVIDIA_DRIVER_CAPABILITIES=all
+    export SDL_AUDIODRIVER=dummy
+    export SDL_VIDEODRIVER=offscreen
     export __GLX_VENDOR_LIBRARY_NAME=nvidia
-    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
-    export PATH=/opt/carla:$PATH
+    export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/xdg-runtime}
+    export PATH=/opt/bin:$PATH
+    export PYTHONPATH=/opt/carla/PythonAPI/carla:/opt/carla/PythonAPI/carla/agents:${PYTHONPATH:-}
 
 %post
     set -eux
-    export DEBIAN_FRONTEND=noninteractive
 
-    apt-get update
-    apt-get install -y --no-install-recommends \
-        ca-certificates \
-        libasound2 \
-        libfontconfig1 \
-        libfreetype6 \
-        libglu1-mesa \
-        libgtk-3-0 \
-        libnss3 \
-        libpulse0 \
-        libsdl2-2.0-0 \
-        libsm6 \
-        libvulkan1 \
-        libx11-6 \
-        libxau6 \
-        libxcb1 \
-        libxcursor1 \
-        libxdmcp6 \
-        libxext6 \
-        libxi6 \
-        libxinerama1 \
-        libxkbcommon0 \
-        libxrandr2 \
-        libxrender1 \
-        libxt6 \
-        mesa-utils \
-        procps \
-        python3 \
-        python3-pip \
-        unzip \
-        vulkan-utils \
-        xdg-user-dirs \
-        xdg-utils
-    rm -rf /var/lib/apt/lists/*
-
+    FOUND_SH=""
+    if [ -x /opt/carla/CarlaUE4.sh ]; then
+        FOUND_SH=/opt/carla/CarlaUE4.sh
+    elif [ -x /home/carla/CarlaUE4.sh ]; then
+        FOUND_SH=/home/carla/CarlaUE4.sh
+    else
+        FOUND_SH="$(find /opt /home -maxdepth 6 -type f -name CarlaUE4.sh 2>/dev/null | head -n 1 || true)"
+    fi
+    test -n "${FOUND_SH}"
+    CARLA_DIR="$(dirname "${FOUND_SH}")"
+    ln -sfnT "${CARLA_DIR}" /opt/carla
     chmod +x /opt/carla/CarlaUE4.sh || true
-    if [ -x /opt/carla/ImportAssets.sh ] && [ -f /opt/carla/Import/AdditionalMaps_0.9.15.tar.gz ]; then
-        (cd /opt/carla && ./ImportAssets.sh) || true
+    sed -i '/chmod .*CarlaUE4-Linux-Shipping/d' /opt/carla/CarlaUE4.sh || true
+
+    mkdir -p /opt/bin /tmp/xdg-runtime /opt/carla/CarlaUE4/Saved/Logs
+    chmod -R a+rwX /tmp/xdg-runtime /opt/carla/CarlaUE4/Saved || true
+
+    if ! command -v xdg-user-dir >/dev/null 2>&1; then
+        cat >/opt/bin/xdg-user-dir <<'EOF'
+#!/usr/bin/env bash
+echo /tmp
+EOF
+        chmod +x /opt/bin/xdg-user-dir
     fi
 
-    cat >/usr/local/bin/start-carla <<'EOF'
+    cat >/opt/bin/carla-server <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${CARLA_RPC_PORT:-2000}"
-exec "${CARLA_ROOT:-/opt/carla}/CarlaUE4.sh" \
-  -RenderOffScreen \
-  -nosound \
-  "-carla-rpc-port=${PORT}" \
-  "$@"
+PORT="${CARLA_PORT:-2000}"
+STREAMING_PORT="${CARLA_STREAMING_PORT:-$((PORT + 1))}"
+QUALITY="${CARLA_QUALITY:-Low}"
+LOG_DIR="${CARLA_LOG_DIR:-/tmp/carla-logs}"
+mkdir -p "${XDG_RUNTIME_DIR:-/tmp/xdg-runtime}" "${LOG_DIR}"
+
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-offscreen}"
+export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
+export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-all}"
+
+cd "${CARLA_ROOT:-/opt/carla}"
+exec ./CarlaUE4.sh \
+    -RenderOffScreen \
+    -nosound \
+    -quality-level="${QUALITY}" \
+    -carla-rpc-port="${PORT}" \
+    -carla-streaming-port="${STREAMING_PORT}" \
+    -unattended \
+    -NoSplash \
+    -log \
+    -stdout \
+    -FullStdOutLogOutput \
+    "$@"
 EOF
-    chmod +x /usr/local/bin/start-carla
+    chmod +x /opt/bin/carla-server
 
 %runscript
-    exec /usr/local/bin/start-carla "$@"
+    exec /opt/bin/carla-server "$@"
+
+%test
+    test -x /opt/bin/carla-server
+    test -x /opt/carla/CarlaUE4.sh
 
 %help
-    CARLA 0.9.15 runtime image.
+    CARLA 0.9.15 runtime for Polaris.
 
-    Build:
-      singularity build carla.sif carla.def
+    Build on a Polaris compute node:
+      apptainer build --fakeroot carla.sif carla.def
 
     Run:
-      singularity run --nv carla.sif
+      apptainer run --nv --writable-tmpfs carla.sif
 
-    Optional port override:
-      SINGULARITYENV_CARLA_RPC_PORT=2002 singularity run --nv carla.sif
+    Port override:
+      CARLA_PORT=2002 apptainer run --nv --writable-tmpfs carla.sif

@@ -1,0 +1,19 @@
+#!/bin/sh
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=0:30:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -o logs/polaris_carla_render_diagnostics.out
+
+set -eu
+
+REPO_DIR=${REPO_DIR:-/eagle/RobustViT/hiratsuka/VLA4AD_Research}
+
+ml use /soft/modulefiles
+ml spack-pe-base
+ml apptainer
+
+cd "${REPO_DIR}"
+exec bash scripts/polaris/carla_render_diagnostics.sh

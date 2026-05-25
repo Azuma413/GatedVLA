@@ -163,6 +163,10 @@ cython_debug/
 /.idea/lead_cleanup.iml
 wandb
 slurm-*.out
+.apptainer/
+.carla_pythonapi/
+containers/
+logs/
 .ruff_cache
 .mypy_cache
 3rd_party/navsim_workspace/dataset
@@ -195,3 +199,4 @@ outputs
 3rd_party/plant2
 uv.lock
 data/carla_*
+data/polaris_smoke/

@@ -3,22 +3,21 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 %labels
     Author VLA4AD_Research
-    Description "LEAD data collection/evaluation plus Alpamayo SFT runtime"
+    Description "LEAD Python 3.10 runtime for CARLA data collection on Polaris"
 
 %files
     pyproject.toml /opt/build/lead/pyproject.toml
-    uv.lock /opt/build/lead/uv.lock
-    3rd_party/alpamayo/pyproject.toml /opt/build/alpamayo/pyproject.toml
-    3rd_party/alpamayo/uv.lock /opt/build/alpamayo/uv.lock
 
 %environment
     export LEAD_PROJECT_ROOT=${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}
     export PY123D_DATA_ROOT=${PY123D_DATA_ROOT:-${LEAD_PROJECT_ROOT}/data/carla_alpamayo_4c_py123d}
     export CARLA_ROOT=${CARLA_ROOT:-${LEAD_PROJECT_ROOT}/3rd_party/CARLA_0915}
     export NVIDIA_DRIVER_CAPABILITIES=all
+    export PYTHONNOUSERSITE=1
     export UV_LINK_MODE=copy
-    export PATH=/opt/venvs/lead/bin:/usr/local/bin:$PATH
-    export PYTHONPATH=${LEAD_PROJECT_ROOT}:${LEAD_PROJECT_ROOT}/3rd_party/alpamayo:${LEAD_PROJECT_ROOT}/3rd_party/alpamayo/src:${LEAD_PROJECT_ROOT}/3rd_party/leaderboard:${LEAD_PROJECT_ROOT}/3rd_party/scenario_runner:${LEAD_PROJECT_ROOT}/3rd_party/Bench2Drive/leaderboard:${LEAD_PROJECT_ROOT}/3rd_party/Bench2Drive/scenario_runner:${PYTHONPATH:-}
+    export VIRTUAL_ENV=/opt/venvs/lead
+    export PATH=/opt/venvs/lead/bin:/usr/local/bin:${LEAD_PROJECT_ROOT}/scripts:$PATH
+    export PYTHONPATH=${LEAD_PROJECT_ROOT}:${LEAD_PROJECT_ROOT}/3rd_party/leaderboard_autopilot:${LEAD_PROJECT_ROOT}/3rd_party/scenario_runner_autopilot:${LEAD_PROJECT_ROOT}/3rd_party/leaderboard:${LEAD_PROJECT_ROOT}/3rd_party/scenario_runner:${LEAD_PROJECT_ROOT}/3rd_party/Bench2Drive/leaderboard:${LEAD_PROJECT_ROOT}/3rd_party/Bench2Drive/scenario_runner:${PYTHONPATH:-}
 
 %post
     set -eux
@@ -48,6 +47,7 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
         libx11-6 \
         libxext6 \
         libxrender1 \
+        net-tools \
         ninja-build \
         openssh-client \
         parallel \
@@ -66,18 +66,22 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
     curl -LsSf https://astral.sh/uv/install.sh | sh
     install -m 0755 /root/.local/bin/uv /usr/local/bin/uv
-    uv python install 3.10 3.12
+    uv python install 3.10
 
     uv venv --python 3.10 /opt/venvs/lead
     . /opt/venvs/lead/bin/activate
     cd /opt/build/lead
-    uv sync --frozen --no-install-project --no-dev --active
-    deactivate
-
-    uv venv --python 3.12 /opt/venvs/alpamayo
-    . /opt/venvs/alpamayo/bin/activate
-    cd /opt/build/alpamayo
-    MAX_JOBS="${MAX_JOBS:-8}" uv sync --frozen --no-install-project --no-dev --active
+    uv sync --no-install-project --no-dev --active
+    uv pip uninstall -y opencv-python || true
+    uv pip install opencv-python-headless==4.10.0.84 --force-reinstall --no-deps
+    python - <<'PY'
+import carla
+import torch
+print("carla", getattr(carla, "__version__", "unknown"))
+print("torch", torch.__version__)
+PY
+    rm -rf /root/.cache/uv
+    chmod -R a+rwX /opt/venvs/lead /opt/build/lead
 
     cat >/usr/local/bin/lead-python <<'EOF'
 #!/usr/bin/env bash
@@ -93,27 +97,6 @@ cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}"
 VIRTUAL_ENV=/opt/venvs/lead exec /usr/local/bin/uv "$@"
 EOF
 
-    cat >/usr/local/bin/alpamayo-python <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}/3rd_party/alpamayo"
-exec /opt/venvs/alpamayo/bin/python "$@"
-EOF
-
-    cat >/usr/local/bin/alpamayo-uv <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}/3rd_party/alpamayo"
-VIRTUAL_ENV=/opt/venvs/alpamayo exec /usr/local/bin/uv "$@"
-EOF
-
-    cat >/usr/local/bin/alpamayo-torchrun <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}/3rd_party/alpamayo"
-exec /opt/venvs/alpamayo/bin/torchrun "$@"
-EOF
-
     cat >/usr/local/bin/lead-shell <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -121,36 +104,25 @@ cd "${LEAD_PROJECT_ROOT:-/workspace/VLA4AD_Research}"
 exec /bin/bash "$@"
 EOF
 
-    chmod +x \
-        /usr/local/bin/lead-python \
-        /usr/local/bin/lead-uv \
-        /usr/local/bin/alpamayo-python \
-        /usr/local/bin/alpamayo-uv \
-        /usr/local/bin/alpamayo-torchrun \
-        /usr/local/bin/lead-shell
+    chmod +x /usr/local/bin/lead-python /usr/local/bin/lead-uv /usr/local/bin/lead-shell
 
 %runscript
     exec /usr/local/bin/lead-shell "$@"
 
+%test
+    /opt/venvs/lead/bin/python - <<'PY'
+import carla
+import py123d
+import torch
+print("LEAD data-collection runtime OK")
+PY
+
 %help
-    LEAD + Alpamayo runtime image.
+    LEAD data-collection runtime image.
 
-    Build:
-      singularity build lead.sif lead.def
+    Build on a Polaris compute node:
+      apptainer build --fakeroot lead.sif lead.def
 
-    Recommended run from the repository root:
-      singularity shell --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif
-
-    LEAD data collection / export / closed-loop evaluation use Python 3.10:
-      singularity exec --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif \
+    Run from the repository root:
+      apptainer exec --nv --writable-tmpfs -B "$PWD:/workspace/VLA4AD_Research" lead.sif \
         lead-python -m lead --expert --py123d --routes data/data_routes/lead/noScenarios/route_000391.xml
-
-      singularity exec --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif \
-        lead-python scripts/export_py123d_to_pai.py --logs-root data/carla_alpamayo_4c_py123d --output-dir data/carla_alpamayo_pai --overwrite
-
-    Alpamayo SFT uses Python 3.12:
-      singularity exec --nv -B "$PWD:/workspace/VLA4AD_Research" lead.sif \
-        alpamayo-torchrun --nproc_per_node 8 -m finetune.sft.train_hf ...
-
-    The image expects the repository to be bind-mounted at /workspace/VLA4AD_Research
-    unless SINGULARITYENV_LEAD_PROJECT_ROOT is set to another path.
