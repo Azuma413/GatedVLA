@@ -1,9 +1,17 @@
 Bootstrap: docker
 From: carlasim/carla:0.9.15
+Stage: carla
+
+Bootstrap: docker
+From: ubuntu:22.04
+Stage: final
 
 %labels
     Author VLA4AD_Research
-    Description "CARLA 0.9.15 server runtime for Polaris/Apptainer"
+    Description "CARLA 0.9.15 server runtime for Polaris/Apptainer with Ubuntu 22.04 Vulkan fallback"
+
+%files from carla
+    /home/carla /opt/carla
 
 %environment
     export CARLA_ROOT=/opt/carla
@@ -19,6 +27,28 @@ From: carlasim/carla:0.9.15
 
 %post
     set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libegl1 \
+        libgl1 \
+        libglib2.0-0 \
+        libglvnd0 \
+        libglx0 \
+        libgomp1 \
+        libopenal1 \
+        libsm6 \
+        libstdc++6 \
+        libvulkan1 \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        mesa-vulkan-drivers \
+        vulkan-tools \
+        xdg-user-dirs
+    rm -rf /var/lib/apt/lists/*
 
     FOUND_SH=""
     if [ -x /opt/carla/CarlaUE4.sh ]; then
@@ -30,7 +60,9 @@ From: carlasim/carla:0.9.15
     fi
     test -n "${FOUND_SH}"
     CARLA_DIR="$(dirname "${FOUND_SH}")"
-    ln -sfnT "${CARLA_DIR}" /opt/carla
+    if [ "${CARLA_DIR}" != /opt/carla ]; then
+        ln -sfnT "${CARLA_DIR}" /opt/carla
+    fi
     chmod +x /opt/carla/CarlaUE4.sh || true
     sed -i '/chmod .*CarlaUE4-Linux-Shipping/d' /opt/carla/CarlaUE4.sh || true
 

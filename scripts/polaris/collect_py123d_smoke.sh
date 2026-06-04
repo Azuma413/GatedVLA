@@ -9,7 +9,9 @@ ROUTE=${ROUTE:-data/data_routes/lead/noScenarios/route_000391.xml}
 OUTPUT_ROOT=${OUTPUT_ROOT:-data/polaris_smoke}
 CARLA_READY_TIMEOUT=${CARLA_READY_TIMEOUT:-300}
 CARLA_PYTHONAPI_HOST=${CARLA_PYTHONAPI_HOST:-${REPO_DIR}/.carla_pythonapi}
-CARLA_SERVER_MODE=${CARLA_SERVER_MODE:-render}
+CARLA_SERVER_MODE=${CARLA_SERVER_MODE:-host-vulkan}
+
+source "${REPO_DIR}/scripts/polaris/carla_apptainer_common.sh"
 
 cd "${REPO_DIR}"
 mkdir -p logs "${OUTPUT_ROOT}/carla_alpamayo_4c_py123d" "${OUTPUT_ROOT}/results/noScenarios" "${OUTPUT_ROOT}/data/noScenarios"
@@ -28,19 +30,10 @@ fi
 if [ ! -f "${CARLA_PYTHONAPI_HOST}/agents/navigation/global_route_planner.py" ]; then
     echo "Extracting CARLA PythonAPI agents to ${CARLA_PYTHONAPI_HOST}"
     mkdir -p "${CARLA_PYTHONAPI_HOST}"
-    apptainer exec "${CARLA_SIF}" bash -lc \
+    apptainer exec "${CARLA_SIF}" bash -c \
         'cd /opt/carla/PythonAPI/carla && tar -cf - agents' \
         | tar -C "${CARLA_PYTHONAPI_HOST}" -xf -
 fi
-
-pick_port() {
-    python3 - <<'PY'
-import socket
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.bind(("", 0))
-    print(s.getsockname()[1])
-PY
-}
 
 CARLA_PORT=${CARLA_PORT:-$(pick_port)}
 CARLA_STREAMING_PORT=${CARLA_STREAMING_PORT:-$(pick_port)}
@@ -52,6 +45,35 @@ CARLA_LOG="${REPO_DIR}/logs/carla_smoke_${PBS_JOBID:-manual}.log"
 CARLA_EXIT_LOG="${REPO_DIR}/logs/carla_smoke_${PBS_JOBID:-manual}.exit.log"
 CARLA_SAVED_LOG_DIR="${REPO_DIR}/logs/carla_saved_${PBS_JOBID:-manual}"
 mkdir -p "${CARLA_SAVED_LOG_DIR}"
+prepare_host_graphics_overlay
+
+CARLA_BIND_ARGS=(-B "${CARLA_SAVED_LOG_DIR}:/opt/carla/CarlaUE4/Saved/Logs")
+CARLA_ENV_ARGS=(
+    --env "CARLA_PORT=${CARLA_PORT}"
+    --env "CARLA_STREAMING_PORT=${CARLA_STREAMING_PORT}"
+    --env CARLA_LOG_DIR=/tmp/carla-logs
+    --env NVIDIA_DRIVER_CAPABILITIES=all
+    --env DISPLAY=
+)
+case "${CARLA_SERVER_MODE}" in
+    host|host-vulkan|host-render)
+        mapfile -t CARLA_GRAPHICS_BIND_ARGS < <(carla_graphics_bind_args)
+        mapfile -t CARLA_GRAPHICS_ENV_ARGS < <(carla_graphics_env_args)
+        CARLA_BIND_ARGS+=("${CARLA_GRAPHICS_BIND_ARGS[@]}")
+        CARLA_ENV_ARGS+=("${CARLA_GRAPHICS_ENV_ARGS[@]}")
+        ;;
+    software|software-vulkan)
+        mapfile -t CARLA_SOFTWARE_ENV_ARGS < <(carla_software_env_args)
+        CARLA_ENV_ARGS+=("${CARLA_SOFTWARE_ENV_ARGS[@]}")
+        ;;
+    render|vulkan|nullrhi)
+        ;;
+    *)
+        echo "Unknown CARLA_SERVER_MODE=${CARLA_SERVER_MODE}" >&2
+        echo "Expected one of: host-vulkan, host-render, host, software-vulkan, software, vulkan, render, nullrhi" >&2
+        exit 2
+        ;;
+esac
 
 echo "REPO_DIR=${REPO_DIR}"
 echo "CARLA_SIF=${CARLA_SIF}"
@@ -60,6 +82,7 @@ echo "ROUTE=${ROUTE}"
 echo "CARLA_PORT=${CARLA_PORT}"
 echo "CARLA_STREAMING_PORT=${CARLA_STREAMING_PORT}"
 echo "TM_PORT=${TM_PORT}"
+echo "CARLA_SERVER_MODE=${CARLA_SERVER_MODE}"
 
 cleanup() {
     if [ -n "${CARLA_PID:-}" ] && kill -0 "${CARLA_PID}" 2>/dev/null; then
@@ -69,14 +92,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CARLA_PORT="${CARLA_PORT}" \
-CARLA_STREAMING_PORT="${CARLA_STREAMING_PORT}" \
-CARLA_LOG_DIR=/tmp/carla-logs \
-NVIDIA_DRIVER_CAPABILITIES=all \
 apptainer exec --nv --writable-tmpfs \
-    -B "${CARLA_SAVED_LOG_DIR}:/opt/carla/CarlaUE4/Saved/Logs" \
-    "${CARLA_SIF}" bash -lc '
-    if [ "'"${CARLA_SERVER_MODE}"'" = "nullrhi" ]; then
+    "${CARLA_BIND_ARGS[@]}" \
+    "${CARLA_ENV_ARGS[@]}" \
+    "${CARLA_SIF}" bash -c '
+    case "'"${CARLA_SERVER_MODE}"'" in
+    nullrhi)
         exec /opt/carla/CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping \
             CarlaUE4 \
             -nullrhi \
@@ -88,8 +109,17 @@ apptainer exec --nv --writable-tmpfs \
             -log \
             -stdout \
             -FullStdOutLogOutput
-    fi
-    exec /opt/bin/carla-server
+        ;;
+    host-vulkan|vulkan)
+        exec /opt/bin/carla-server -vulkan
+        ;;
+    software|software-vulkan)
+        exec /opt/bin/carla-server -vulkan
+        ;;
+    host|host-render|render)
+        exec /opt/bin/carla-server
+        ;;
+    esac
 ' >"${CARLA_LOG}" 2>&1 &
 CARLA_PID=$!
 
@@ -106,17 +136,7 @@ while [ "${SECONDS_WAITED}" -lt "${CARLA_READY_TIMEOUT}" ]; do
         find "${CARLA_SAVED_LOG_DIR}" -type f -maxdepth 1 -print -exec tail -120 {} \; >&2 || true
         exit 3
     fi
-    if apptainer exec --nv --writable-tmpfs \
-        -B "${REPO_DIR}:/workspace/VLA4AD_Research" \
-        --env LEAD_PROJECT_ROOT=/workspace/VLA4AD_Research \
-        "${LEAD_SIF}" \
-        lead-python - <<PY
-import carla
-client = carla.Client("127.0.0.1", ${CARLA_PORT})
-client.set_timeout(5.0)
-world = client.get_world()
-print("Connected to", world.get_map().name)
-PY
+    if run_carla_rgb_probe "${LEAD_SIF}" "${CARLA_PORT}" "${REPO_DIR}"
     then
         CARLA_READY=1
         break
