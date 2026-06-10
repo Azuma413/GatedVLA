@@ -5,7 +5,7 @@ REPO_DIR=${REPO_DIR:-/eagle/RobustViT/hiratsuka/VLA4AD_Research}
 IMAGE_DIR=${IMAGE_DIR:-${REPO_DIR}/containers}
 CARLA_SIF=${CARLA_SIF:-${IMAGE_DIR}/carla.sif}
 LEAD_SIF=${LEAD_SIF:-${IMAGE_DIR}/lead.sif}
-ROUTE=${ROUTE:-data/data_routes/lead/noScenarios/route_000391.xml}
+ROUTE=${ROUTE:-data/data_routes/lead/noScenarios/route_town10hd_smoke.xml}
 OUTPUT_ROOT=${OUTPUT_ROOT:-data/polaris_smoke}
 CARLA_READY_TIMEOUT=${CARLA_READY_TIMEOUT:-300}
 CARLA_PYTHONAPI_HOST=${CARLA_PYTHONAPI_HOST:-${REPO_DIR}/.carla_pythonapi}
@@ -39,22 +39,43 @@ CARLA_PORT=${CARLA_PORT:-$(pick_port)}
 CARLA_STREAMING_PORT=${CARLA_STREAMING_PORT:-$(pick_port)}
 TM_PORT=${TM_PORT:-$(pick_port)}
 ROUTE_NUMBER=$(basename "${ROUTE}" .xml)
+ROUTE_TOWN=$(
+    apptainer exec \
+        -B "${REPO_DIR}:/workspace/VLA4AD_Research" \
+        "${LEAD_SIF}" \
+        lead-python - "${ROUTE}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+route_path = sys.argv[1]
+root = ET.parse(route_path).getroot()
+route = root.find("route")
+if route is None or "town" not in route.attrib:
+    raise SystemExit(f"Could not read route town from {route_path}")
+print(route.attrib["town"])
+PY
+)
 CHECKPOINT_ENDPOINT="${OUTPUT_ROOT}/results/noScenarios/${ROUTE_NUMBER}_result.json"
 SAVE_PATH="${OUTPUT_ROOT}/data/noScenarios"
 CARLA_LOG="${REPO_DIR}/logs/carla_smoke_${PBS_JOBID:-manual}.log"
 CARLA_EXIT_LOG="${REPO_DIR}/logs/carla_smoke_${PBS_JOBID:-manual}.exit.log"
-CARLA_SAVED_LOG_DIR="${REPO_DIR}/logs/carla_saved_${PBS_JOBID:-manual}"
-mkdir -p "${CARLA_SAVED_LOG_DIR}"
+CARLA_SAVED_DIR="${REPO_DIR}/logs/carla_saved_${PBS_JOBID:-manual}"
+mkdir -p "${CARLA_SAVED_DIR}"
 prepare_host_graphics_overlay
 
-CARLA_BIND_ARGS=(-B "${CARLA_SAVED_LOG_DIR}:/opt/carla/CarlaUE4/Saved/Logs")
-CARLA_ENV_ARGS=(
-    --env "CARLA_PORT=${CARLA_PORT}"
-    --env "CARLA_STREAMING_PORT=${CARLA_STREAMING_PORT}"
-    --env CARLA_LOG_DIR=/tmp/carla-logs
-    --env NVIDIA_DRIVER_CAPABILITIES=all
-    --env DISPLAY=
+CARLA_BIND_ARGS=(
+    --bind "${CARLA_SAVED_DIR}:/opt/carla/CarlaUE4/Saved"
+    --bind "${CARLA_SAVED_DIR}:/home/carla/CarlaUE4/Saved"
 )
+CARLA_ENV_ARGS=(
+    --env "CARLA_RPC_PORT=${CARLA_PORT}"
+    --env "CARLA_PORT=${CARLA_PORT}"
+    --env CARLA_LOG_DIR=/opt/carla/CarlaUE4/Saved/Logs
+    --env NVIDIA_DRIVER_CAPABILITIES=all
+)
+if [ -n "${CARLA_GRAPHICS_ADAPTER:-}" ]; then
+    CARLA_ENV_ARGS+=(--env "CARLA_GRAPHICS_ADAPTER=${CARLA_GRAPHICS_ADAPTER}")
+fi
 case "${CARLA_SERVER_MODE}" in
     host|host-vulkan|host-render)
         mapfile -t CARLA_GRAPHICS_BIND_ARGS < <(carla_graphics_bind_args)
@@ -83,6 +104,7 @@ echo "CARLA_PORT=${CARLA_PORT}"
 echo "CARLA_STREAMING_PORT=${CARLA_STREAMING_PORT}"
 echo "TM_PORT=${TM_PORT}"
 echo "CARLA_SERVER_MODE=${CARLA_SERVER_MODE}"
+echo "ROUTE_TOWN=${ROUTE_TOWN}"
 
 cleanup() {
     if [ -n "${CARLA_PID:-}" ] && kill -0 "${CARLA_PID}" 2>/dev/null; then
@@ -93,6 +115,7 @@ cleanup() {
 trap cleanup EXIT
 
 apptainer exec --nv --writable-tmpfs \
+    --contain \
     "${CARLA_BIND_ARGS[@]}" \
     "${CARLA_ENV_ARGS[@]}" \
     "${CARLA_SIF}" bash -c '
@@ -103,7 +126,6 @@ apptainer exec --nv --writable-tmpfs \
             -nullrhi \
             -nosound \
             -carla-rpc-port="${CARLA_PORT}" \
-            -carla-streaming-port="${CARLA_STREAMING_PORT}" \
             -unattended \
             -NoSplash \
             -log \
@@ -111,13 +133,13 @@ apptainer exec --nv --writable-tmpfs \
             -FullStdOutLogOutput
         ;;
     host-vulkan|vulkan)
-        exec /opt/bin/carla-server -vulkan
+        exec /opt/bin/carla-server "'"${ROUTE_TOWN}"'" -vulkan
         ;;
     software|software-vulkan)
-        exec /opt/bin/carla-server -vulkan
+        exec /opt/bin/carla-server "'"${ROUTE_TOWN}"'" -vulkan
         ;;
     host|host-render|render)
-        exec /opt/bin/carla-server
+        exec /opt/bin/carla-server "'"${ROUTE_TOWN}"'"
         ;;
     esac
 ' >"${CARLA_LOG}" 2>&1 &
@@ -133,7 +155,7 @@ while [ "${SECONDS_WAITED}" -lt "${CARLA_READY_TIMEOUT}" ]; do
         wait "${CARLA_PID}" >"${CARLA_EXIT_LOG}" 2>&1 || echo "CARLA exit status=$?" >&2
         tail -200 "${CARLA_LOG}" >&2 || true
         tail -50 "${CARLA_EXIT_LOG}" >&2 || true
-        find "${CARLA_SAVED_LOG_DIR}" -type f -maxdepth 1 -print -exec tail -120 {} \; >&2 || true
+        find "${CARLA_SAVED_DIR}" -type f -maxdepth 3 -print -exec tail -120 {} \; >&2 || true
         exit 3
     fi
     if run_carla_rgb_probe "${LEAD_SIF}" "${CARLA_PORT}" "${REPO_DIR}"
@@ -149,7 +171,7 @@ done
 if [ "${CARLA_READY}" -ne 1 ]; then
     echo "CARLA did not become ready within ${CARLA_READY_TIMEOUT}s" >&2
     tail -200 "${CARLA_LOG}" >&2 || true
-    find "${CARLA_SAVED_LOG_DIR}" -type f -maxdepth 1 -print -exec tail -120 {} \; >&2 || true
+    find "${CARLA_SAVED_DIR}" -type f -maxdepth 3 -print -exec tail -120 {} \; >&2 || true
     exit 4
 fi
 
@@ -157,7 +179,7 @@ apptainer exec --nv --writable-tmpfs \
     -B "${REPO_DIR}:/workspace/VLA4AD_Research" \
     --env LEAD_PROJECT_ROOT=/workspace/VLA4AD_Research \
     --env PY123D_DATA_ROOT=/workspace/VLA4AD_Research/${OUTPUT_ROOT}/carla_alpamayo_4c_py123d \
-    --env LEAD_EXPERT_CONFIG="target_dataset=7 py123d_data_format=true use_radars=false lidar_stack_size=2 save_only_non_ground_lidar=false save_lidar_only_inside_bev=false" \
+    --env LEAD_EXPERT_CONFIG="target_dataset=7 py123d_data_format=true py123d_rgb_only_smoke=true perturbate_sensors=false use_radars=false lidar_stack_size=2 save_only_non_ground_lidar=false save_lidar_only_inside_bev=false" \
     --env SCENARIO_RUNNER_ROOT=/workspace/VLA4AD_Research/3rd_party/scenario_runner_autopilot \
     --env LEADERBOARD_ROOT=/workspace/VLA4AD_Research/3rd_party/leaderboard_autopilot \
     --env PYTHONPATH=/workspace/VLA4AD_Research:/workspace/VLA4AD_Research/.carla_pythonapi:/workspace/VLA4AD_Research/3rd_party/leaderboard_autopilot:/workspace/VLA4AD_Research/3rd_party/scenario_runner_autopilot \

@@ -270,7 +270,7 @@ class ExpertBase(BaseAgent, autonomous_agent_local.AutonomousAgent):
 
     @property
     def town(self):
-        return self.carla_world.get_map().name.split("/")[-1]
+        return self.carla_world.get_map().name.split("/")[-1].removesuffix("_Opt")
 
     @cached_property
     def rep(self):

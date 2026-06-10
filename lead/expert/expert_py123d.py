@@ -205,7 +205,9 @@ class ExpertPy123D(Expert):
         LOG.info("Initializing Py123D map and log...")
 
         # Get location name
-        self._location = self.carla_world.get_map().name.split("/")[-1].lower()
+        self._location = (
+            self.carla_world.get_map().name.split("/")[-1].removesuffix("_Opt").lower()
+        )
         self._log_name = f"{self.town}_Rep{self.rep}_{self.route_index}"
 
         LOG.info(f"Location: {self._location}")
@@ -970,12 +972,19 @@ class ExpertPy123D(Expert):
             results: Optional results to pass to parent destroy.
         """
         LOG.info("Closing Py123D writers...")
-        LOG.info(
-            f"Final log location: {self._py123d_logs_root.absolute()}/{self._log_name}",
-        )
-        LOG.info(f"Final map location: {self._py123d_maps_root.absolute()}")
-        self._write_navigation_command_sidecar()
-        self._py123d_log_writer.close()
+        if hasattr(self, "_py123d_logs_root") and hasattr(self, "_log_name"):
+            LOG.info(
+                f"Final log location: {self._py123d_logs_root.absolute()}/{self._log_name}",
+            )
+        if hasattr(self, "_py123d_maps_root"):
+            LOG.info(f"Final map location: {self._py123d_maps_root.absolute()}")
+        if hasattr(self, "_navigation_command_rows"):
+            self._write_navigation_command_sidecar()
+        if hasattr(self, "_py123d_log_writer"):
+            try:
+                self._py123d_log_writer.close()
+            except AssertionError as exc:
+                LOG.warning("Skipping Py123D log writer close after failed init: %s", exc)
         super().destroy(results)
         LOG.info("Cleanup complete - data saved to Py123D format")
         if results is not None and self.save_path is not None:

@@ -53,17 +53,21 @@ run_mode() {
     port=$(pick_port)
     streaming_port=$(pick_port)
     env_args=(
+        --env "CARLA_RPC_PORT=${port}"
         --env "CARLA_PORT=${port}"
         --env "CARLA_STREAMING_PORT=${streaming_port}"
+        --env CARLA_LOG_DIR=/opt/carla/CarlaUE4/Saved/Logs
         --env NVIDIA_DRIVER_CAPABILITIES=all
-        --env DISPLAY=
     )
     log_dir="${REPO_DIR}/logs/carla_render_${name}_${PBS_JOBID:-manual}"
     log_file="${REPO_DIR}/logs/carla_render_${name}_${PBS_JOBID:-manual}.log"
     rm -rf "${log_dir}"
     mkdir -p "${log_dir}"
 
-    bind_args=(-B "${log_dir}:/opt/carla/CarlaUE4/Saved/Logs")
+    bind_args=(
+        --bind "${log_dir}:/opt/carla/CarlaUE4/Saved"
+        --bind "${log_dir}:/home/carla/CarlaUE4/Saved"
+    )
     if [[ "${name}" == host_graphics_* ]]; then
         mapfile -t graphics_bind_args < <(carla_graphics_bind_args)
         mapfile -t graphics_env_args < <(carla_graphics_env_args)
@@ -80,6 +84,7 @@ run_mode() {
     echo "port=${port} streaming_port=${streaming_port}"
     timeout --signal=TERM 120s \
     apptainer exec --nv --writable-tmpfs \
+        --contain \
         "${bind_args[@]}" \
         "${env_args[@]}" \
         "${CARLA_SIF}" \

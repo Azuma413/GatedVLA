@@ -9,9 +9,7 @@ HOST_NVIDIA_JSON_DIR=${HOST_NVIDIA_JSON_DIR:-${REPO_DIR}/.apptainer/nvidia-json}
 prepare_host_graphics_overlay() {
     mkdir -p \
         "${HOST_NVIDIA_LIB_DIR}" \
-        "${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d" \
-        "${HOST_NVIDIA_JSON_DIR}/vulkan/implicit_layer.d" \
-        "${HOST_NVIDIA_JSON_DIR}/glvnd/egl_vendor.d"
+        "${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d"
 
     find "${HOST_NVIDIA_LIB_DIR}" -type l -delete
     for lib in /usr/lib64/libcuda.so* /usr/lib64/libGLX_nvidia.so* /usr/lib64/libEGL_nvidia.so* /usr/lib64/libnvidia*.so*; do
@@ -20,9 +18,9 @@ prepare_host_graphics_overlay() {
     done
 
     if [ -f /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json ]; then
-        cp /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json "${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d/nvidia_icd.x86_64.json"
+        cp /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json "${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d/nvidia_icd.json"
     else
-        cat >"${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d/nvidia_icd.x86_64.json" <<'JSON'
+        cat >"${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d/nvidia_icd.json" <<'JSON'
 {
     "file_format_version" : "1.0.1",
     "ICD": {
@@ -32,37 +30,22 @@ prepare_host_graphics_overlay() {
 }
 JSON
     fi
-
-    if [ -f /usr/share/vulkan/implicit_layer.d/nvidia_layers.json ]; then
-        cp /usr/share/vulkan/implicit_layer.d/nvidia_layers.json "${HOST_NVIDIA_JSON_DIR}/vulkan/implicit_layer.d/nvidia_layers.json"
-    fi
-
-    cat >"${HOST_NVIDIA_JSON_DIR}/glvnd/egl_vendor.d/10_nvidia.json" <<'JSON'
-{
-    "file_format_version" : "1.0.0",
-    "ICD" : {
-        "library_path" : "libEGL_nvidia.so.0"
-    }
-}
-JSON
 }
 
 carla_graphics_bind_args() {
     printf '%s\n' \
-        -B /usr/lib64:/host/usr/lib64:ro \
-        -B "${HOST_NVIDIA_LIB_DIR}:/nvidia-libs:ro" \
-        -B "${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d:/nvidia-json/vulkan/icd.d:ro" \
-        -B "${HOST_NVIDIA_JSON_DIR}/vulkan/implicit_layer.d:/nvidia-json/vulkan/implicit_layer.d:ro" \
-        -B "${HOST_NVIDIA_JSON_DIR}/glvnd/egl_vendor.d:/nvidia-json/glvnd/egl_vendor.d:ro"
+        --bind /usr/lib64/libGLX_nvidia.so.0:/usr/lib64/libGLX_nvidia.so.0 \
+        --bind /usr/lib64/libEGL_nvidia.so.0:/usr/lib64/libEGL_nvidia.so.0 \
+        --bind /usr/lib64/libnvidia-glcore.so.570.124.06:/usr/lib64/libnvidia-glcore.so.570.124.06 \
+        --bind "${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d/nvidia_icd.json:/etc/vulkan/icd.d/nvidia_icd.json"
 }
 
 carla_graphics_env_args() {
     printf '%s\n' \
-        --env LD_LIBRARY_PATH=/nvidia-libs:/usr/local/lib:/usr/lib/x86_64-linux-gnu \
-        --env VK_ICD_FILENAMES=/nvidia-json/vulkan/icd.d/nvidia_icd.x86_64.json \
-        --env VK_LAYER_PATH=/nvidia-json/vulkan/implicit_layer.d \
-        --env __EGL_VENDOR_LIBRARY_FILENAMES=/nvidia-json/glvnd/egl_vendor.d/10_nvidia.json \
-        --env __GLX_VENDOR_LIBRARY_NAME=nvidia \
+        --env VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json \
+        --env CARLA_RENDERER=vulkan \
+        --env CARLA_STDOUT_LOG=1 \
+        --env CARLA_LOG_DIR=/opt/carla/CarlaUE4/Saved/Logs \
         --env NVIDIA_DRIVER_CAPABILITIES=all
 }
 
@@ -95,7 +78,6 @@ run_carla_rgb_probe() {
         lead-python - "${port}" <<'PY'
 import queue
 import sys
-import copy
 import carla
 
 port = int(sys.argv[1])
@@ -105,7 +87,9 @@ world = client.get_world()
 print("world", world.get_map().name)
 
 settings = world.get_settings()
-old_settings = copy.copy(settings)
+old_no_rendering_mode = settings.no_rendering_mode
+old_synchronous_mode = settings.synchronous_mode
+old_fixed_delta_seconds = settings.fixed_delta_seconds
 settings.synchronous_mode = True
 settings.fixed_delta_seconds = 0.05
 settings.no_rendering_mode = False
@@ -150,6 +134,10 @@ try:
 finally:
     for actor in reversed(actors):
         actor.destroy()
-    world.apply_settings(old_settings)
+    settings = world.get_settings()
+    settings.no_rendering_mode = old_no_rendering_mode
+    settings.synchronous_mode = old_synchronous_mode
+    settings.fixed_delta_seconds = old_fixed_delta_seconds
+    world.apply_settings(settings)
 PY
 }

@@ -227,7 +227,7 @@ class LeaderboardEvaluator(object):
         print("\033[1m> Loading the world\033[0m", flush=True)
         t1 = time.time()
         current_map = self.client.get_world().get_map().name.split("/")[-1]
-        if current_map != town:
+        if current_map != town and current_map != f"{town}_Opt":
             self.world = self.client.load_world(town, reset_settings=False)
         else:
             self.world = self.client.get_world()
@@ -255,7 +255,7 @@ class LeaderboardEvaluator(object):
         self.world.tick()
 
         map_name = CarlaDataProvider.get_map().name.split("/")[-1]
-        if map_name != town:
+        if map_name != town and map_name != f"{town}_Opt":
             raise Exception("The CARLA server uses the wrong map!"
                             " This scenario requires the use of map {}".format(town))
 

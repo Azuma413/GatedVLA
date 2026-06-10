@@ -55,6 +55,8 @@ class ExpertConfig(BaseConfig):
     py123d_dataset = "carla"
     # Py123D split name
     py123d_split = "train"
+    # If true, use a reduced RGB+LiDAR sensor rig for Polaris CARLA smoke tests.
+    py123d_rgb_only_smoke = False
 
     # ---- Performance settings ---
     # If true, also run speed benchmarking during expert data collection

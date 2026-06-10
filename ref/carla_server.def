@@ -1,0 +1,333 @@
+Bootstrap: docker
+From: carlasim/carla:0.9.15
+
+%labels
+    Description "CARLA 0.9.15 based on official carlasim/carla:0.9.15 Docker image"
+    Maintainer  "your_name"
+
+%help
+    Build:
+      singularity build --fakeroot carla_leaderboard.sif carla_leaderboard.def
+
+    Run CARLA server (default: off-screen + nosound + Low quality + port 2000):
+      singularity run --nv --writable-tmpfs carla_leaderboard.sif
+
+    Or run explicitly:
+      singularity exec --nv --writable-tmpfs carla_leaderboard.sif carla-server
+
+    Change defaults with env vars:
+      CARLA_PORT=2000
+      CARLA_QUALITY=Low|Epic|...
+      CARLA_RENDERER=auto|vulkan|opengl|none
+      CARLA_ARGS="(override renderer args entirely)"
+      CARLA_STDOUT_LOG=1   # pipe stdout/stderr to carla-server.stdout.log
+      CARLA_USE_STDBUF=1   # only if you need line-buffering (may be unstable)
+      CARLA_HEADLESS=1     # force SDL_VIDEODRIVER=offscreen
+
+    Example:
+      CARLA_PORT=2002 CARLA_QUALITY=Epic singularity run --nv --writable-tmpfs carla_leaderboard.sif
+
+%environment
+    export LANG=en_US.UTF-8
+    export LC_ALL=en_US.UTF-8
+
+    # Default CARLA root (symlink created in %post if needed)
+    export CARLA_ROOT=/opt/carla
+
+    # Ensure helper scripts are on PATH
+    export PATH=/opt/bin:$PATH
+
+    # useful for headless environments
+    export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/xdg-runtime}
+
+    # optional: keep these paths available (if present)
+    export PYTHONPATH=${CARLA_ROOT}/PythonAPI/carla:${CARLA_ROOT}/PythonAPI/carla/agents:${PYTHONPATH}
+
+%post
+    set -eux
+
+    # Install minimal utilities if available (depends on base image)
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends locales xdg-user-dirs xdg-utils
+        rm -rf /var/lib/apt/lists/*
+        locale-gen en_US.UTF-8 || true
+        update-locale LANG=en_US.UTF-8 || true
+    fi
+
+    # Try to locate CarlaUE4.sh in the base image
+    FOUND_SH=""
+    if [ -f /home/carla/CarlaUE4.sh ]; then
+        FOUND_SH="/home/carla/CarlaUE4.sh"
+    elif [ -f /opt/carla/CarlaUE4.sh ]; then
+        FOUND_SH="/opt/carla/CarlaUE4.sh"
+    else
+        FOUND_SH="$(find /home /opt -maxdepth 6 -type f -name CarlaUE4.sh 2>/dev/null | head -n 1 || true)"
+    fi
+
+    if [ -n "${FOUND_SH}" ]; then
+        ROOT_DIR="$(dirname "${FOUND_SH}")"
+        chmod +x "${FOUND_SH}" || true
+        if [ ! -e /opt/carla ]; then
+            ln -sfn "${ROOT_DIR}" /opt/carla
+        fi
+    else
+        echo "Warning: CarlaUE4.sh not found in base image" >&2
+    fi
+
+    # Ensure PythonAPI path exists (some images nest it)
+    if [ ! -d /opt/carla/PythonAPI ]; then
+        FOUND_PY="$(find /home /opt -maxdepth 6 -type d -name PythonAPI 2>/dev/null | head -n 1 || true)"
+        if [ -n "${FOUND_PY}" ]; then
+            ln -sfn "${FOUND_PY}" /opt/carla/PythonAPI
+        fi
+    fi
+
+    # Ensure CARLA can write logs and Saved data as non-root
+    if [ -d /home/carla/CarlaUE4 ]; then
+        mkdir -p /home/carla/CarlaUE4/Saved/Logs
+        chmod -R a+rwX /home/carla/CarlaUE4/Saved || true
+    fi
+
+    # Avoid chmod failures on read-only filesystems
+    if [ -f /opt/carla/CarlaUE4.sh ]; then
+        sed -i '/chmod .*CarlaUE4-Linux-Shipping/d' /opt/carla/CarlaUE4.sh || true
+    fi
+
+    # ---- Convenience commands ----
+    mkdir -p /opt/bin
+
+    # Fallback stub if xdg-user-dir is missing
+    if ! command -v xdg-user-dir >/dev/null 2>&1; then
+        cat > /opt/bin/xdg-user-dir <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  DESKTOP) echo "/tmp" ;;
+  *) echo "/tmp" ;;
+esac
+EOS
+        chmod +x /opt/bin/xdg-user-dir
+    fi
+
+    cat > /opt/bin/carla-server <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT="${CARLA_PORT:-2000}"
+QUALITY="${CARLA_QUALITY:-Low}"
+LOG_ARGS="${CARLA_LOG_ARGS--log -stdout -FullStdOutLogOutput}"
+# If 1, pipe stdout/stderr to a file via tee. Some UE4 builds
+# are sensitive to LD_PRELOAD from stdbuf, so this is opt-in.
+STDOUT_TEE="${CARLA_STDOUT_LOG:-0}"
+USE_STDBUF="${CARLA_USE_STDBUF:-0}"
+# Pick graphics adapter:
+# - If CARLA_GRAPHICS_ADAPTER is explicitly set, use it.
+# - Otherwise, if CUDA_VISIBLE_DEVICES is set, use its first entry.
+#   (e.g. "3" or "3,5" -> 3)
+if [ -n "${CARLA_GRAPHICS_ADAPTER:-}" ]; then
+  GRAPHICS_ADAPTER_VALUE="${CARLA_GRAPHICS_ADAPTER}"
+elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && [ "${CUDA_VISIBLE_DEVICES}" != "all" ]; then
+  GRAPHICS_ADAPTER_VALUE="${CUDA_VISIBLE_DEVICES%%,*}"
+  GRAPHICS_ADAPTER_VALUE="${GRAPHICS_ADAPTER_VALUE#gpu:}"
+  # If CUDA_VISIBLE_DEVICES is non-numeric (e.g. UUID), fallback to 0.
+  case "${GRAPHICS_ADAPTER_VALUE}" in
+    ''|*[!0-9]*) GRAPHICS_ADAPTER_VALUE="0" ;;
+  esac
+else
+  GRAPHICS_ADAPTER_VALUE=""
+fi
+GRAPHICS_ADAPTER_ARGS=()
+if [ -n "${GRAPHICS_ADAPTER_VALUE}" ]; then
+  GRAPHICS_ADAPTER_ARGS=(-graphicsadapter="${GRAPHICS_ADAPTER_VALUE}")
+fi
+
+# Renderer selection:
+# - If CARLA_ARGS is set, use it as-is.
+# - Otherwise, auto-pick Vulkan only when an ICD json is present.
+#   Override with CARLA_RENDERER=vulkan|opengl|none
+EXTRA_ARGS=""
+if [ "${CARLA_ARGS+x}" = "x" ]; then
+  EXTRA_ARGS="${CARLA_ARGS}"
+else
+  RENDERER="${CARLA_RENDERER:-auto}"
+  case "${RENDERER}" in
+    vulkan) EXTRA_ARGS="-vulkan" ;;
+    opengl) EXTRA_ARGS="-opengl" ;;
+    none) EXTRA_ARGS="" ;;
+    auto)
+      if ls /etc/vulkan/icd.d/*.json >/dev/null 2>&1; then
+        EXTRA_ARGS="-vulkan"
+      else
+        EXTRA_ARGS=""
+      fi
+      ;;
+    *)
+      echo "Unknown CARLA_RENDERER='${RENDERER}'. Use vulkan|opengl|none|auto." >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# Force Vulkan ICD if available (helps on headless nodes)
+export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/etc/vulkan/icd.d/nvidia_icd.json}"
+export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+
+# Headless-friendly defaults
+# Only force SDL_VIDEODRIVER when explicitly requested. Some builds
+# exit early if offscreen is forced.
+if [ -z "${SDL_VIDEODRIVER:-}" ]; then
+  if [ -n "${DISPLAY:-}" ]; then
+    export SDL_VIDEODRIVER="x11"
+  elif [ "${CARLA_HEADLESS:-0}" = "1" ]; then
+    export SDL_VIDEODRIVER="offscreen"
+  fi
+fi
+export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
+
+# Ensure XDG runtime dir exists (avoids some headless warnings)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/xdg-runtime}"
+mkdir -p "${XDG_RUNTIME_DIR}" || true
+chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+
+# Ensure Saved/Logs is writable (avoid early exit)
+if [ -d "${CARLA_ROOT}/CarlaUE4" ]; then
+  mkdir -p "${CARLA_ROOT}/CarlaUE4/Saved/Logs" 2>/dev/null || true
+fi
+
+# Log capture (even if UE4 log is not created)
+LOG_DIR="${CARLA_LOG_DIR:-${CARLA_ROOT:-/opt/carla}/CarlaUE4/Saved/Logs}"
+mkdir -p "${LOG_DIR}" 2>/dev/null || true
+LOG_STDOUT="${LOG_DIR}/carla-server.stdout.log"
+
+# Resolve CARLA root dynamically if needed
+CARLA_ROOT="${CARLA_ROOT:-/opt/carla}"
+if [ ! -x "${CARLA_ROOT}/CarlaUE4.sh" ]; then
+  FOUND_SH=""
+  if [ -x /home/carla/CarlaUE4.sh ]; then
+    FOUND_SH="/home/carla/CarlaUE4.sh"
+  elif [ -x /opt/carla/CarlaUE4.sh ]; then
+    FOUND_SH="/opt/carla/CarlaUE4.sh"
+  else
+    FOUND_SH="$(find /home /opt -maxdepth 6 -type f -name CarlaUE4.sh 2>/dev/null | head -n 1 || true)"
+  fi
+  if [ -n "${FOUND_SH}" ]; then
+    CARLA_ROOT="$(dirname "${FOUND_SH}")"
+  else
+    echo "CarlaUE4.sh not found." >&2
+    exit 1
+  fi
+fi
+
+cd "${CARLA_ROOT}"
+
+# Default: off-screen (no spectator window), no sound, low quality, port 2000
+set +e
+HAS_GRAPHICS_ADAPTER=0
+HAS_CARLA_RPC_PORT=0
+HAS_RENDER_OFFSCREEN=0
+HAS_NOSOUND=0
+HAS_QUALITY_LEVEL=0
+HAS_RENDERER=0
+for arg in "$@"; do
+  case "${arg}" in
+    -graphicsadapter|-graphicsadapter=*)
+      HAS_GRAPHICS_ADAPTER=1
+      ;;
+    -carla-rpc-port|-carla-rpc-port=*)
+      HAS_CARLA_RPC_PORT=1
+      ;;
+    -RenderOffScreen)
+      HAS_RENDER_OFFSCREEN=1
+      ;;
+    -nosound)
+      HAS_NOSOUND=1
+      ;;
+    -quality-level|-quality-level=*)
+      HAS_QUALITY_LEVEL=1
+      ;;
+    -vulkan|-opengl)
+      HAS_RENDERER=1
+      ;;
+  esac
+done
+
+if [ $# -eq 0 ]; then
+  CMD=(./CarlaUE4.sh -RenderOffScreen -nosound -quality-level="${QUALITY}" -carla-rpc-port="${PORT}" "${GRAPHICS_ADAPTER_ARGS[@]}" ${LOG_ARGS} ${EXTRA_ARGS})
+else
+  CMD=(./CarlaUE4.sh "$@")
+  if [ "${HAS_RENDER_OFFSCREEN}" = "0" ]; then
+    CMD+=(-RenderOffScreen)
+  fi
+  if [ "${HAS_NOSOUND}" = "0" ]; then
+    CMD+=(-nosound)
+  fi
+  if [ "${HAS_QUALITY_LEVEL}" = "0" ]; then
+    CMD+=(-quality-level="${QUALITY}")
+  fi
+  if [ "${HAS_CARLA_RPC_PORT}" = "0" ]; then
+    CMD+=(-carla-rpc-port="${PORT}")
+  fi
+  if [ "${HAS_GRAPHICS_ADAPTER}" = "0" ]; then
+    CMD+=("${GRAPHICS_ADAPTER_ARGS[@]}")
+  fi
+  if [ "${HAS_RENDERER}" = "0" ]; then
+    CMD+=(${EXTRA_ARGS})
+  fi
+  CMD+=(${LOG_ARGS})
+fi
+
+if [ "${STDOUT_TEE}" = "1" ]; then
+  if [ "${USE_STDBUF}" = "1" ] && command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL "${CMD[@]}" 2>&1 | tee -a "${LOG_STDOUT}"
+  else
+    "${CMD[@]}" 2>&1 | tee -a "${LOG_STDOUT}"
+  fi
+  rc=${PIPESTATUS[0]}
+else
+  "${CMD[@]}"
+  rc=$?
+fi
+set -e
+
+if [ "${rc}" -ne 0 ]; then
+  if [ -f "${LOG_DIR}/CarlaUE4.log" ]; then
+    echo "---- CarlaUE4.log (tail) ----" >&2
+    tail -n 200 "${LOG_DIR}/CarlaUE4.log" >&2 || true
+  else
+    echo "CarlaUE4.log not found at ${LOG_DIR}" >&2
+    if [ -f "${LOG_STDOUT}" ]; then
+      echo "---- carla-server.stdout.log (tail) ----" >&2
+      tail -n 200 "${LOG_STDOUT}" >&2 || true
+    fi
+  fi
+  exit "${rc}"
+fi
+EOS
+    chmod +x /opt/bin/carla-server
+
+    cat > /opt/bin/carla-python <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+exec python "$@"
+EOS
+    chmod +x /opt/bin/carla-python
+
+%runscript
+    #!/usr/bin/env bash
+    set -euo pipefail
+    exec /opt/bin/carla-server "$@"
+
+%test
+    if [ -x /opt/bin/carla-server ]; then
+        echo "carla-server ready"
+    fi
+    if [ -x /opt/carla/CarlaUE4.sh ]; then
+        echo "CarlaUE4.sh present"
+    else
+        echo "Warning: CarlaUE4.sh not found" >&2
+    fi
+    if [ -x /opt/bin/carla-server ]; then
+        bash -n /opt/bin/carla-server
+    fi

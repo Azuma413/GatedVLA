@@ -82,9 +82,8 @@ class ObsManager(ObsManagerBase):
         self.criteria_stop = criteria_stop
 
         # splitting because for Town13 the name is 'Carla/Maps/Town13/Town13' instead of 'Town13'
-        maps_h5_path = self._map_dir / (
-            self._world.get_map().name.split("/")[-1] + ".h5"
-        )
+        map_name = self._world.get_map().name.split("/")[-1].removesuffix("_Opt")
+        maps_h5_path = self._map_dir / (map_name + ".h5")
         with h5py.File(maps_h5_path, "r", libver="latest", swmr=True) as hf:
             self._road = np.array(hf["road"], dtype=np.uint8)
             self._lane_marking_all = np.array(hf["lane_marking_all"], dtype=np.uint8)

@@ -210,7 +210,7 @@ def camera_sensor_setup(
             f"Added sensor: {result[-1]['id']} at position ({cam_pos[0]}, {cam_pos[1]}, {cam_pos[2]}), size: {cam_width}x{cam_height}px",  # noqa: E501
         )
 
-        if not sensor_agent:
+        if not sensor_agent and not getattr(config, "py123d_rgb_only_smoke", False):
             # GT sensors
             for base_id, sensor_type in [
                 ("semantics", "sensor.camera.semantic_segmentation"),

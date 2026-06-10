@@ -14,47 +14,6 @@ source .venv/bin/activate
 
 AlpamayoのSFTは `3rd_party/alpamayo/pyproject.toml` が要求するPython 3.12環境を使います。LEAD用の `.venv` ではなく、Alpamayoディレクトリ側で別途 `uv sync` してください。
 
-### Polaris / Apptainer
-
-Polarisでは計算ノード上でApptainer imageを作成します。
-
-```bash
-cd /eagle/RobustViT/hiratsuka/VLA4AD_Research
-qsub scripts/polaris/build_apptainer.pbs
-```
-
-CARLA imageだけ作り直す場合:
-
-```bash
-qsub -v FORCE_CARLA=1 scripts/polaris/build_apptainer.pbs
-```
-
-CARLAの描画疎通はRGBセンサが実際に1枚返るところまで確認します。
-
-```bash
-qsub scripts/polaris/carla_render_diagnostics.pbs
-tail -f logs/polaris_carla_render_diagnostics.out
-```
-
-A100上でNVIDIA Vulkan/OpenGL経路が即終了する場合に備えて、CARLA imageはUbuntu 22.04 runtimeにCARLA 0.9.15本体をコピーする構成にし、Mesa `llvmpipe` Vulkan ICDも入れています。Polaris A100では `nullrhi` は起動しますがRGB画像を生成できません。`host-vulkan` と `software-vulkan` はCARLA 0.9.15/UE4.26が終了コード1で即終了することを確認済みです。
-
-短い123D/Py123D収集smoke:
-
-```bash
-qsub scripts/polaris/collect_py123d_smoke.pbs
-tail -f logs/polaris_collect_py123d_smoke.out
-```
-
-必要に応じてCARLA起動モードを変えます。
-
-```bash
-qsub -v CARLA_SERVER_MODE=host-vulkan scripts/polaris/collect_py123d_smoke.pbs
-qsub -v CARLA_SERVER_MODE=software-vulkan scripts/polaris/collect_py123d_smoke.pbs
-qsub -v CARLA_SERVER_MODE=nullrhi scripts/polaris/collect_py123d_smoke.pbs
-```
-
-`nullrhi` はRGB画像を生成しないため、画像付きデータ収集の合格条件には使えません。CARLA接続やleaderboard側のPython環境だけを切り分けるための診断モードです。
-
 ## 1. 123D形式でCARLAデータを収集
 
 ### ローカルでCARLAを起動する場合

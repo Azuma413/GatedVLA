@@ -536,6 +536,38 @@ class ExpertData(ExpertBase):
             for i in range(1, self.config_expert.num_radar_sensors + 1):
                 radar_arrays.append(input_data[f"radar{i}"])
             input_data["radar"] = np.concatenate(radar_arrays, axis=0)
+        if (
+            self.save_path is not None
+            and self.config_expert.datagen
+            and self.config_expert.py123d_rgb_only_smoke
+        ):
+            rgb_cameras = []
+            for camera_idx in range(1, self.config_expert.num_cameras + 1):
+                rgb_data = input_data[f"rgb_{camera_idx}"]
+                if isinstance(rgb_data, tuple):
+                    rgb_data = rgb_data[1]
+                rgb = rgb_data[:, :, :3]
+                input_data[f"rgb_{camera_idx}"] = rgb
+                rgb_cameras.append(rgb)
+            input_data["rgb"] = np.concatenate(rgb_cameras, axis=1)
+            input_data["semantics_camera_pc"] = np.empty((0, 5), dtype=np.float32)
+            input_data["semantics_camera_pc_all"] = input_data["semantics_camera_pc"]
+            input_data["bounding_boxes"] = self.get_bounding_boxes(
+                input_data=input_data,
+            )
+            self.stored_bounding_boxes_of_this_step = input_data["bounding_boxes"]
+            self.id2bb_map = {bb["id"]: bb for bb in input_data["bounding_boxes"]}
+            self.id2actor_map = {
+                actor.id: actor
+                for actor in self.carla_world.get_actors()
+                if actor.is_alive and actor.id in self.id2bb_map
+            }
+            self.stop_sign_criteria.tick(self.ego_vehicle)
+            input_data["hdmap"] = self.ss_bev_manager.get_observation(
+                self.close_traffic_lights,
+            )["hdmap_classes"]
+            self.tick_data = input_data
+            return input_data
         if self.save_path is not None and self.config_expert.datagen:
             if self.config_expert.perturbate_sensors:
                 # Process perturbated RGB images for each camera
@@ -1409,15 +1441,24 @@ class ExpertData(ExpertBase):
         }
         boxes.append(result)
 
-        transfuser_camera_semantics_pc = input_data["semantics_camera_pc"].copy()
-        transfuser_camera_semantics_pc_semantics_id = np.array(
-            list(constants.SEMANTIC_SEGMENTATION_CONVERTER.values()),
-        )[
-            transfuser_camera_semantics_pc[
-                :,
-                CameraPointCloudIndex.UNREAL_SEMANTICS_ID,
-            ].astype(np.int32)
-        ]
+        transfuser_camera_semantics_pc = input_data.get(
+            "semantics_camera_pc",
+            np.empty((0, 5), dtype=np.float32),
+        ).copy()
+        if len(transfuser_camera_semantics_pc) == 0:
+            transfuser_camera_semantics_pc_semantics_id = np.empty(
+                (0,),
+                dtype=np.int32,
+            )
+        else:
+            transfuser_camera_semantics_pc_semantics_id = np.array(
+                list(constants.SEMANTIC_SEGMENTATION_CONVERTER.values()),
+            )[
+                transfuser_camera_semantics_pc[
+                    :,
+                    CameraPointCloudIndex.UNREAL_SEMANTICS_ID,
+                ].astype(np.int32)
+            ]
         global_camera_pc = {
             TransfuserSemanticSegmentationClass.VEHICLE: transfuser_camera_semantics_pc[
                 (
