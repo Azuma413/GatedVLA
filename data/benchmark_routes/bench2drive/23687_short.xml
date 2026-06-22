@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+  <route id="23687" road_id="174" town="Town12">
+    <waypoints>
+      <position x="-2501.1" y="4243.9" z="365.1" />
+      <position x="-2500.8" y="4241.9" z="365.0" />
+      <position x="-2500.5" y="4239.9" z="365.0" />
+      <position x="-2500.2" y="4237.9" z="365.0" />
+      <position x="-2499.9" y="4236.0" z="365.0" />
+      <position x="-2499.6" y="4234.0" z="364.9" />
+    </waypoints>
+    <scenarios>
+      <scenario name="HighwayExit_1" type="HighwayExit">
+        <trigger_point x="-2500.5" y="4239.9" yaw="-81.4" z="365.0" />
+        <start_actor_flow x="-2500.7" y="4266.9" z="365.4" />
+        <end_actor_flow x="-2469.2" y="4109.8" z="363.4" />
+        <flow_speed value="13" />
+        <source_dist_interval from="11" to="46" />
+      </scenario>
+    </scenarios>
+    <weathers>
+      <weather cloudiness="70.0" fog_density="50.0" precipitation="60.0" precipitation_deposits="60.0" route_percentage="0" sun_altitude_angle="45.0" sun_azimuth_angle="-1.0" wetness="0.0" wind_intensity="60.0" />
+      <weather cloudiness="70.0" fog_density="50.0" precipitation="60.0" precipitation_deposits="60.0" route_percentage="100" sun_altitude_angle="45.0" sun_azimuth_angle="-1.0" wetness="0.0" wind_intensity="60.0" />
+    </weathers>
+  </route>
+</routes>

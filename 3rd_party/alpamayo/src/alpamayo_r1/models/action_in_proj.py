@@ -166,4 +166,9 @@ class PerWaypointActionInProjV2(torch.nn.Module):
         timestep_feats = self.timestep_fourier_encoder(timesteps[..., -1])
         timestep_feats = timestep_feats.repeat(1, T, 1)
         x = torch.cat((action_feats, timestep_feats), dim=-1)
+        # Fourier features are computed in fp32 for precision, but the encoder MLP
+        # runs in the model's compute dtype. Under DDP+autocast this cast happens
+        # implicitly; under DeepSpeed (no autocast) it must be explicit, otherwise
+        # the bf16 Linear sees fp32 input ("mat1 and mat2 must have the same dtype").
+        x = x.to(next(self.encoder.parameters()).dtype)
         return self.norm(self.encoder(x.flatten(0, 1)).reshape(B, T, -1))

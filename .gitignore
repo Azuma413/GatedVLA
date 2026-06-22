@@ -202,3 +202,5 @@ data/carla_*
 data/polaris_smoke/
 
 .carla_wheels
+
+.env

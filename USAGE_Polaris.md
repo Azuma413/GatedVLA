@@ -286,20 +286,142 @@ route town="Town06"  -> client.load_world("Town06")   (要: AdditionalMaps入り
 
 ## 2. 123DログをAlpamayo用PAI風形式へ変換
 
-未確認です。上のsmokeでPy123D Arrowは生成済みですが、PAI風形式へのexportはまだ通していません。
+`scripts/export_py123d_to_pai.py` を `lead.sif` の中で実行します。GPUは不要で、login nodeでも動きますが、Polarisのlogin nodeはプロセス数(RLIMIT_NPROC)が厳しく、numpy/OpenBLASやOpenCVがスレッドを大量に作ろうとして失敗します。**必ず `OPENBLAS_NUM_THREADS=1` などスレッド数を1に絞って**実行してください（OpenCVの `WorkerThread ... res = 11` 警告は出ますが致命的ではありません）。
+
+```bash
+cd /eagle/RobustViT/hiratsuka/VLA4AD_Research
+ml use /soft/modulefiles; ml spack-pe-base; ml apptainer
+
+apptainer exec \
+  --env OPENBLAS_NUM_THREADS=1 --env OMP_NUM_THREADS=1 \
+  --env MKL_NUM_THREADS=1 --env NUMEXPR_NUM_THREADS=1 \
+  -B "$(pwd):/workspace/VLA4AD_Research" \
+  containers/lead.sif \
+  lead-python scripts/export_py123d_to_pai.py \
+    --logs-root data/carla_alpamayo_4c_py123d \
+    --output-dir data/carla_alpamayo_pai \
+    --split train \
+    --overwrite
+```
+
+出力には `clip_index.parquet`, `features.csv`, `metadata/feature_presence.parquet`, `camera/<4カメラ>/`, `labels/egomotion`, `labels/navigation_command` が含まれます。4つのAlpamayoカメラが揃っていないログはエラーになります。
+
+確認結果(2026-06-22): 上の§1で収集した6 clip(`data/carla_alpamayo_4c_py123d/logs/carla_train/...`)を `lead.sif` でexportし、`data/carla_alpamayo_pai/`(`Done. Exported 6 clips.`、全clipが `chunk=0 / split=train`)を生成。次の§4 SFTはこのchunk 0をそのまま使います。
 
 ## 3. Alpamayo-R1のcheckpointを用意
 
-未確認です。
+gatedモデルなので、HuggingFaceで `nvidia/Alpamayo-R1-10B` のアクセス権を取得しておきます。Polarisではトークンを `.env`(`HF_TOKEN=...`、リポジトリ直下、git管理外)に置き、ALCF proxy経由で `lead.sif` 同梱の `hf` CLIでダウンロードします（約21GB / safetensors 5 shard）。
+
+```bash
+cd /eagle/RobustViT/hiratsuka/VLA4AD_Research
+ml use /soft/modulefiles; ml spack-pe-base; ml apptainer
+HF_TOKEN=$(grep -E '^HF_TOKEN=' .env | cut -d= -f2-)
+
+apptainer exec \
+  --env HTTP_PROXY=http://proxy.alcf.anl.gov:3128 --env HTTPS_PROXY=http://proxy.alcf.anl.gov:3128 \
+  --env http_proxy=http://proxy.alcf.anl.gov:3128 --env https_proxy=http://proxy.alcf.anl.gov:3128 \
+  --env HF_TOKEN="${HF_TOKEN}" \
+  -B "$(pwd):/workspace/VLA4AD_Research" \
+  containers/lead.sif \
+  hf download nvidia/Alpamayo-R1-10B \
+    --local-dir /workspace/VLA4AD_Research/outputs/checkpoints/Alpamayo-R1-10B
+```
+
+加えて、SFT/評価時にVLMの **processor/tokenizer** として `Qwen/Qwen3-VL-8B-Instruct` が必要です（重みではなく設定ファイルのみ。`model.checkpoint_path` の重みとは別物）。実行ノードがオフラインでも動くよう、これも事前にリポジトリ内のHFキャッシュへ落としておきます。
+
+```bash
+mkdir -p outputs/hf_home
+apptainer exec \
+  --env HTTP_PROXY=http://proxy.alcf.anl.gov:3128 --env HTTPS_PROXY=http://proxy.alcf.anl.gov:3128 \
+  --env http_proxy=http://proxy.alcf.anl.gov:3128 --env https_proxy=http://proxy.alcf.anl.gov:3128 \
+  --env HF_TOKEN="${HF_TOKEN}" --env HF_HOME=/workspace/VLA4AD_Research/outputs/hf_home \
+  -B "$(pwd):/workspace/VLA4AD_Research" \
+  containers/lead.sif \
+  hf download Qwen/Qwen3-VL-8B-Instruct --exclude "*.safetensors" "*.bin" "*.pth" "*.gguf"
+```
+
+確認結果(2026-06-22): `outputs/checkpoints/Alpamayo-R1-10B`(21GB, `model-0000{1..5}-of-00005.safetensors` + `config.json` + `model.safetensors.index.json`)と `outputs/hf_home/hub/models--Qwen--Qwen3-VL-8B-Instruct`(processor/tokenizer)を取得済み。
 
 ## 4. AlpamayoをSFT
 
-未確認です。
+AlpamayoのSFTはPython 3.12 + torch 2.8 + flash-attn + deepspeed + vllm + cosmos-rl が必要で、`lead.sif`(Python 3.10)とは別環境です。Polarisでは専用のApptainer image `containers/alpamayo.sif` を `alpamayo.def` からビルドして使います（`lead.def` と同じく、依存だけ `uv sync --no-install-project` で入れ、`alpamayo_r1` / `finetune` のソースは実行時に `PYTHONPATH`=bind mountで解決）。
 
-### SFTを短く確認する場合
+```bash
+cd /eagle/RobustViT/hiratsuka/VLA4AD_Research
+qsub scripts/polaris/build_alpamayo.pbs
+tail -f logs/polaris_build_alpamayo.out
+```
 
-未確認です。
+`alpamayo.def` はALCF proxyを使い、A100(sm_80)向けに `TORCH_CUDA_ARCH_LIST=8.0` を固定してflash-attnを入れます（prebuilt wheelが取れれば数分で完了）。ビルド後 `%test` で `torch 2.8.0+cu128 / flash_attn 2.8.3 / transformers 4.57.1 / deepspeed 0.18.2` が確認できます。
+
+### Polarisハードウェアに合わせた必須調整（4× A100 40GB）
+
+FINETUNE_SFTは8× H100 80GBで検証されています。Polaris計算ノードは1ノード4× A100 **40GB** なので、本番configそのままでは載りません。`scripts/polaris/sft_alpamayo_short.pbs` は次のPolaris調整込みで本番の `train_hf`(`sft_stage1`/`sft_stage2`)を回します（**smoke用の軽量モデル/データではなく**、本物の10B checkpoint・§2のPAIデータ・本番configを使い、ステップ数だけ1に絞っています）。
+
+1. **Stage 1 は ZeRO-2 + optimizer CPU offload**(`finetune/sft/configs/deepspeed/zero2_offload.json`)。本番は ZeRO-2 だがそのままだとAdam状態で40GBを超える。**ZeRO-3 は使えない**: AlpamayoのVLM重み読み込みが素の `load_state_dict` で、ZeRO-3 の遅延初期化(size-0 placeholder)と衝突して `size mismatch ... current model is torch.Size([0])` で落ちる。offloadでoptimizer/masterをCPUへ逃がせばZeRO-2のまま載る。
+2. **Stage 2 も ZeRO-2 + offload**。本番の `deepspeed: null`(DDP)はfrozen 10B VLMを各GPUに複製してOOMする。offloadでexpertのoptimizerをCPUへ。
+3. **`action_in_proj.py` の dtype 修正**(`3rd_party/alpamayo/src/alpamayo_r1/models/action_in_proj.py`)。action expertはFourier特徴をfp32で作るが、DeepSpeed(autocastなし)ではbf16 Linearにfp32が入り `mat1 and mat2 must have the same dtype` で落ちる。encoder直前で `x = x.to(next(self.encoder.parameters()).dtype)` とモデルのcompute dtypeへ揃える（DDP+autocast時は暗黙に行われる変換で、挙動は不変）。
+4. `gradient_checkpointing` は `TrainableAlpamayoR1` が非対応なので使わない。fragmentation対策に `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` を付与。
+
+Qwen processorはオフライン参照（`HF_HOME=outputs/hf_home`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`）。W&Bは `report_to=none` で無効です。
+
+### SFTを短く確認する場合（Stage 1 → Stage 2、各1 step）
+
+```bash
+qsub scripts/polaris/sft_alpamayo_short.pbs
+tail -f logs/polaris_sft_alpamayo_short.out
+```
+
+既定値:
+
+```bash
+STAGE=all            # all | 1 | 2
+NPROC=4              # 1ノード4GPU
+PAI_DIR=.../data/carla_alpamayo_pai
+CKPT=.../outputs/checkpoints/Alpamayo-R1-10B
+OUT_ROOT=.../outputs/alpamayo_sft_polaris
+CHUNK_IDS=0-1        # §2で出した chunk 0
+MAX_STEPS=1
+```
+
+Stage 1だけ / Stage 2だけを回すには `qsub -v STAGE=1 ...` / `qsub -v STAGE=2 ...`。Stage 2はStage 1の `stage1/checkpoint-${MAX_STEPS}` を読みます。内部のコマンドは本番と同じ `alpamayo-torchrun --nproc_per_node 4 -m finetune.sft.train_hf --config-name sft_stage{1,2} ...`(+ 上記Polaris調整 + `+trainer.max_steps=1 trainer.save_steps=1`)です。
+
+成功すると次が生成されます。
+
+```text
+outputs/alpamayo_sft_polaris/stage1/checkpoint-1/   (model-0000x-of-0000y.safetensors, trainer_state.json, ...)
+outputs/alpamayo_sft_polaris/stage2/checkpoint-1/   (同上)
+```
+
+確認結果(2026-06-22): 4× A100で Stage 1(`epoch 1.0`)→ Stage 2(`train_loss 2.484`, `train_runtime 95.7s`)を各1 stepで通し、両 `checkpoint-1` を保存。ログ末尾は `=== SFT verification done ===`。
 
 ## 5. AlpamayoをBench2Drive評価し入力動画を保存
 
-未確認です。
+closed-loop評価(`lead -m lead --alpamayo --bench2drive`)は **CARLA(`carla.sif`) と Alpamayo推論を1プロセスで**動かします。Alpamayo推論コード(`lead/inference/alpamayo_inference.py`)は `3rd_party/alpamayo` を `sys.path` に足して `alpamayo_r1` / `finetune.sft.models` をimportするので、CARLA python APIを持つ `lead.sif`(Python 3.10)の中で動きます（§4の学習用 `alpamayo.sif` ではなく `lead.sif`）。データ収集と同じ「node 0=CARLAサーバ / node 1=クライアント」の2ノード構成を使います。
+
+`scripts/polaris/eval_alpamayo_b2d_short.pbs`(= `eval_alpamayo_b2d_short.sh`)が一式を行います。USAGE.md §5と同じく `LEAD_CLOSED_LOOP_CONFIG='produce_input_video=true produce_frame_frequency=1'`、`ALPAMAYO_INFERENCE_INTERVAL=10` で、4カメラを横連結した入力動画 `{route_id}_input.mp4` を出します。
+
+Polaris固有の注意:
+
+- **`lead.sif` には flash_attn が入っていない**(torch 2.7.1)。SFT checkpointの `config.json` は `attn_implementation=flash_attention_2` なので、スクリプトが評価前に **checkpointの `config.json` を `sdpa` へ書き換え**ます(`ATTN_IMPL=sdpa`)。本番の推論コードは無改造のまま動きます。
+- processorはオフライン参照(`HF_HOME=outputs/hf_home`, `HF_HUB_OFFLINE=1`)。
+- 入力動画の `.mp4` は **routeが正常終了したとき(agentのcleanup)に finalize**されます。途中で `qdel` すると `moov atom not found` の壊れたmp4になります。短い確認では、routeを数秒で完走させて確実にfinalizeさせるため、長いTown12 route `23687.xml` の先頭数waypointだけにした `23687_short.xml` を使います（評価経路・agent・コードは本番のまま、1エピソードを短くしただけ）。
+
+```bash
+qsub -v ROUTE=data/benchmark_routes/bench2drive/23687_short.xml,OUTPUT_ROOT=outputs/alpamayo_b2d_video_short \
+  scripts/polaris/eval_alpamayo_b2d_short.pbs
+tail -f logs/polaris_eval_alpamayo_b2d_short.out
+```
+
+既定の `CHECKPOINT=outputs/alpamayo_sft_polaris/stage2/checkpoint-1` を評価します。本番フルrouteを流すなら `ROUTE=data/benchmark_routes/bench2drive/23687.xml` とし、walltimeを延ばしてroute完走を待ちます（途中killはmp4を壊すので避ける）。
+
+出力例:
+
+```text
+outputs/alpamayo_b2d_video_short/23687_input.mp4
+outputs/alpamayo_b2d_video_short/metric_info.json
+outputs/alpamayo_b2d_video_short/infractions.json
+outputs/alpamayo_b2d_video_short/checkpoint_endpoint.json
+```
+
+確認結果(2026-06-22): CARLA(Town12) + `lead.sif` のAlpamayo agent(sdpaでcheckpointロード、`Agent setup time≈52s`)でcross-node closed-loopが起動し、agentが毎frameでtrajectoryを出して `23687_short.xml` を完走(`Alpamayo Bench2Drive eval finished`)。finalize済みの4カメラ入力動画 `23687_input.mp4`(mpeg4, 3200×600 = 800px×4カメラ横連結, 1251 frame, 62.5s)と `metric_info.json` / `infractions.json`(`RouteCompletionTest` 等) / `checkpoint_endpoint.json` を生成。決め手は「`lead.sif` 内でsdpaロード」+「scenario付きの短縮routeで完走させてmp4をfinalize」。

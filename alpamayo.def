@@ -1,0 +1,129 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+%labels
+    Author VLA4AD_Research
+    Description "Alpamayo-R1 Python 3.12 runtime for SFT / evaluation on Polaris"
+
+%files
+    3rd_party/alpamayo/pyproject.toml /opt/build/alpamayo/pyproject.toml
+
+%environment
+    export ALPAMAYO_ROOT=${ALPAMAYO_ROOT:-/workspace/VLA4AD_Research/3rd_party/alpamayo}
+    export NVIDIA_DRIVER_CAPABILITIES=all
+    export PYTHONNOUSERSITE=1
+    export UV_LINK_MODE=copy
+    export VIRTUAL_ENV=/opt/venvs/alpamayo
+    export PATH=/opt/venvs/alpamayo/bin:/usr/local/bin:$PATH
+    export PYTHONPATH=${ALPAMAYO_ROOT}/src:${ALPAMAYO_ROOT}:${PYTHONPATH:-}
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export UV_LINK_MODE=copy
+    export UV_PYTHON_INSTALL_DIR=/opt/uv/python
+    export PATH=/root/.local/bin:/opt/venvs/alpamayo/bin:$PATH
+    # ALCF proxy (passed in from build host via APPTAINERENV_*; default to ALCF proxy)
+    export HTTP_PROXY=${HTTP_PROXY:-http://proxy.alcf.anl.gov:3128}
+    export HTTPS_PROXY=${HTTPS_PROXY:-http://proxy.alcf.anl.gov:3128}
+    export http_proxy=${http_proxy:-${HTTP_PROXY}}
+    export https_proxy=${https_proxy:-${HTTPS_PROXY}}
+    # Polaris GPUs are A100 (sm_80). Limiting the arch + parallel jobs keeps a
+    # from-source flash-attn build within reasonable time/memory.
+    export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.0}
+    export MAX_JOBS=${MAX_JOBS:-32}
+    export NVCC_THREADS=${NVCC_THREADS:-2}
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        ffmpeg \
+        git \
+        git-lfs \
+        libegl1 \
+        libgl1 \
+        libglib2.0-0 \
+        libglvnd0 \
+        libglx0 \
+        libgomp1 \
+        libsm6 \
+        libssl-dev \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        ninja-build \
+        pkg-config \
+        procps \
+        rsync \
+        unzip \
+        wget \
+        zip
+    rm -rf /var/lib/apt/lists/*
+
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv
+    uv python install 3.12
+
+    uv venv --python 3.12 /opt/venvs/alpamayo
+    . /opt/venvs/alpamayo/bin/activate
+    cd /opt/build/alpamayo
+    # Install dependencies only; the alpamayo_r1 / finetune source is bind-mounted
+    # at runtime via PYTHONPATH (ALPAMAYO_ROOT), matching lead.sif's layout.
+    # flash-attn is configured no-build-isolation in pyproject; torch is installed
+    # first so the flash-attn build (or prebuilt wheel) can find it.
+    uv sync --no-install-project --no-dev --active
+    python - <<'PY'
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda)
+import flash_attn
+print("flash_attn", flash_attn.__version__)
+import transformers, deepspeed
+print("transformers", transformers.__version__, "deepspeed", deepspeed.__version__)
+PY
+    rm -rf /root/.cache/uv
+    chmod -R a+rwX /opt/venvs/alpamayo /opt/build/alpamayo
+
+    cat >/usr/local/bin/alpamayo-python <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${ALPAMAYO_ROOT:-/workspace/VLA4AD_Research/3rd_party/alpamayo}"
+exec /opt/venvs/alpamayo/bin/python "$@"
+EOF
+
+    cat >/usr/local/bin/alpamayo-torchrun <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${ALPAMAYO_ROOT:-/workspace/VLA4AD_Research/3rd_party/alpamayo}"
+exec /opt/venvs/alpamayo/bin/torchrun "$@"
+EOF
+
+    cat >/usr/local/bin/alpamayo-shell <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${ALPAMAYO_ROOT:-/workspace/VLA4AD_Research/3rd_party/alpamayo}"
+exec /bin/bash "$@"
+EOF
+
+    chmod +x /usr/local/bin/alpamayo-python /usr/local/bin/alpamayo-torchrun /usr/local/bin/alpamayo-shell
+
+%runscript
+    exec /usr/local/bin/alpamayo-shell "$@"
+
+%test
+    /opt/venvs/alpamayo/bin/python - <<'PY'
+import torch, flash_attn, transformers, deepspeed
+print("Alpamayo runtime OK:", torch.__version__, flash_attn.__version__)
+PY
+
+%help
+    Alpamayo-R1 SFT / evaluation runtime image (Python 3.12).
+
+    Build on a Polaris compute node:
+      qsub scripts/polaris/build_alpamayo.pbs
+
+    Run from the repository root (bind repo to /workspace/VLA4AD_Research):
+      apptainer exec --nv -B "$PWD:/workspace/VLA4AD_Research" containers/alpamayo.sif \
+        alpamayo-torchrun --nproc_per_node 4 -m finetune.sft.train_hf ...
