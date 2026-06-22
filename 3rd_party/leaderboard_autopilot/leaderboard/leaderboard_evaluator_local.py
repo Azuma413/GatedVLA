@@ -188,16 +188,14 @@ class LeaderboardEvaluator(object):
             client_timeout = args.timeout
         client.set_timeout(client_timeout)
 
-        settings = carla.WorldSettings(
-            synchronous_mode = True,
-            fixed_delta_seconds = 1.0 / self.frame_rate
-        )
-        client.get_world().apply_settings(settings)
-
+        # Defer world settings and TrafficManager creation to
+        # _load_and_wait_for_world(), i.e. AFTER the client has load_world()'d the
+        # route's map. On Polaris, calling get_trafficmanager() on a freshly
+        # booted complex map (or before any client load_world) SIGSEGVs deep in
+        # the TM's in-memory map build; calling it right after the client's own
+        # load_world() is reliable.
         traffic_manager_port = self.find_free_port()
-        traffic_manager = client.get_trafficmanager(traffic_manager_port)
-        traffic_manager.set_synchronous_mode(True)
-        traffic_manager.set_hybrid_physics_mode(True)
+        traffic_manager = None
 
         return client, client_timeout, traffic_manager, traffic_manager_port
 
@@ -217,8 +215,9 @@ class LeaderboardEvaluator(object):
             self.world.apply_settings(settings)
 
             # Make the TM back to async
-            self.traffic_manager.set_synchronous_mode(False)
-            self.traffic_manager.set_hybrid_physics_mode(False)
+            if self.traffic_manager is not None:
+                self.traffic_manager.set_synchronous_mode(False)
+                self.traffic_manager.set_hybrid_physics_mode(False)
 
     def _load_and_wait_for_world(self, args, town):
         """
@@ -228,16 +227,26 @@ class LeaderboardEvaluator(object):
         t1 = time.time()
         current_map = self.client.get_world().get_map().name.split("/")[-1]
         if current_map != town and current_map != f"{town}_Opt":
-            self.world = self.client.load_world(town, reset_settings=False)
+            self.world = self.client.load_world(town)
         else:
             self.world = self.client.get_world()
         print(f"\033[1m>  Load_world time={time.time()-t1}", flush=True)
 
-        # Large Map settings are always reset, for some reason
+        # Apply world settings AFTER load_world. Set synchronous mode explicitly
+        # (it is no longer set in _setup_simulation). Large Map settings are reset
+        # on load, so (re)apply them too.
         settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 1.0 / self.frame_rate
         settings.tile_stream_distance = 650
         settings.actor_active_distance = 650
         self.world.apply_settings(settings)
+
+        # Create the TrafficManager now, right after this client's load_world().
+        if self.traffic_manager is None:
+            self.traffic_manager = self.client.get_trafficmanager(self.traffic_manager_port)
+            self.traffic_manager.set_synchronous_mode(True)
+            self.traffic_manager.set_hybrid_physics_mode(True)
 
         self.world.reset_all_traffic_lights()
         CarlaDataProvider.set_client(self.client)

@@ -454,6 +454,8 @@ class LeaderboardWrapper:
             str(int(self.args.resume)),
             "--port",
             str(self.args.port),
+            "--host",
+            str(self.args.host),
             "--traffic-manager-port",
             str(self.args.traffic_manager_port),
             "--traffic-manager-seed",
@@ -637,6 +639,7 @@ Examples:
     )
 
     # CARLA settings
+    parser.add_argument("--host", type=str, default="localhost", help="CARLA server host")
     parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
     parser.add_argument(
         "--traffic-manager-port",

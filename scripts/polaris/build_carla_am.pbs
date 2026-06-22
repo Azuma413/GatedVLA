@@ -1,0 +1,36 @@
+#!/bin/sh
+# Build a CARLA image WITH AdditionalMaps (Town06/07/11/12/13/15) into a SEPARATE
+# file containers/carla_am.sif, so the working containers/carla.sif is never
+# clobbered mid-experiment. Verify carla_am.sif, then swap it in.
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=1:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -o logs/polaris_build_carla_am.out
+
+set -eu
+REPO_DIR=${REPO_DIR:-/eagle/RobustViT/hiratsuka/VLA4AD_Research}
+ml use /soft/modulefiles
+ml spack-pe-base
+ml apptainer
+
+export HTTP_PROXY=${HTTP_PROXY:-http://proxy.alcf.anl.gov:3128}
+export HTTPS_PROXY=${HTTPS_PROXY:-http://proxy.alcf.anl.gov:3128}
+export http_proxy=${HTTP_PROXY} https_proxy=${HTTPS_PROXY}
+# 7.4 GB download + extraction: keep apptainer scratch on eagle (lustre), not /tmp.
+export APPTAINER_CACHEDIR=${REPO_DIR}/.apptainer/cache
+export APPTAINER_TMPDIR=${REPO_DIR}/.apptainer/tmp_carla_am
+mkdir -p "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}" "${REPO_DIR}/logs" "${REPO_DIR}/containers"
+cd "${REPO_DIR}"
+
+echo "[$(date -u '+%FT%TZ')] Building containers/carla_am.sif (with AdditionalMaps)"
+apptainer build --fakeroot --force containers/carla_am.sif carla.def
+
+echo "[$(date -u '+%FT%TZ')] Maps in carla_am.sif:"
+apptainer exec containers/carla_am.sif bash -c \
+  'ls /opt/carla/CarlaUE4/Content/Carla/Maps/*.umap 2>/dev/null | xargs -n1 basename | sed "s/.umap//"' \
+  | grep -vE "_Opt|BuiltData|OpenDrive" | sort -u
+rm -rf "${APPTAINER_TMPDIR}" || true
+echo "[$(date -u '+%FT%TZ')] build_carla_am done"

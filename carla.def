@@ -24,6 +24,7 @@ From: carlasim/carla:0.9.15
     apt-get install -y --no-install-recommends \
         ca-certificates \
         locales \
+        wget \
         xdg-utils \
         xdg-user-dirs
     rm -rf /var/lib/apt/lists/*
@@ -45,6 +46,49 @@ From: carlasim/carla:0.9.15
     fi
     chmod +x /opt/carla/CarlaUE4.sh || true
     sed -i '/chmod .*CarlaUE4-Linux-Shipping/d' /opt/carla/CarlaUE4.sh || true
+
+    # Install AdditionalMaps (Town06, Town07, Town11, Town12, Town13, Town15).
+    # These are needed for the majority of LEAD data collection routes.
+    # Uses ALCF proxy during Apptainer build on compute nodes.
+    # Set ADDITIONAL_MAPS_SKIP=1 in the host environment to skip this step.
+    if [ "${ADDITIONAL_MAPS_SKIP:-0}" != "1" ]; then
+        CARLA_VERSION=0.9.15
+        # CARLA hosts AdditionalMaps on its release bucket (NOT github releases,
+        # which 404). Overridable via ADDITIONAL_MAPS_URL.
+        MAPS_URL="${ADDITIONAL_MAPS_URL:-https://carla-releases.s3.us-east-005.backblazeb2.com/Linux/AdditionalMaps_${CARLA_VERSION}.tar.gz}"
+        MAPS_TAR="/tmp/AdditionalMaps_${CARLA_VERSION}.tar.gz"
+        # Inherit proxy from host environment; fall back to ALCF proxy.
+        export http_proxy="${http_proxy:-${HTTP_PROXY:-http://proxy.alcf.anl.gov:3128}}"
+        export https_proxy="${https_proxy:-${http_proxy}}"
+        export HTTP_PROXY="${http_proxy}"
+        export HTTPS_PROXY="${https_proxy}"
+        MAPS_OK=0
+        if wget -q --tries=3 --timeout=300 -O "${MAPS_TAR}" "${MAPS_URL}" 2>/dev/null && [ -s "${MAPS_TAR}" ]; then
+            MAPS_OK=1
+        fi
+        if [ "${MAPS_OK}" = "1" ]; then
+            # Determine archive top-level: CARLA packages extract directly as CarlaUE4/...
+            TOP=$(tar -tzf "${MAPS_TAR}" 2>/dev/null | head -1 | cut -d'/' -f1 || true)
+            # --no-same-owner: under apptainer --fakeroot, restoring the
+            # archive's uid/gid (1000) fails with EPERM and aborts the build.
+            if [ "${TOP}" = "CarlaUE4" ]; then
+                tar --no-same-owner -xzf "${MAPS_TAR}" -C "${CARLA_DIR}"
+            else
+                tar --no-same-owner -xzf "${MAPS_TAR}" -C "${CARLA_DIR}" --strip-components=1
+            fi
+            rm -f "${MAPS_TAR}"
+            echo "AdditionalMaps installed to ${CARLA_DIR}"
+            find "${CARLA_DIR}/CarlaUE4/Content/Carla/Maps" -maxdepth 1 -mindepth 1 -type d | sort || true
+        else
+            rm -f "${MAPS_TAR}"
+            echo "WARNING: Could not download AdditionalMaps_${CARLA_VERSION}.tar.gz" >&2
+            echo "  URL: ${MAPS_URL}" >&2
+            echo "  Town06, Town07, Town15 etc. will be unavailable in this image." >&2
+            echo "  Re-build with network access or pre-stage the file at ${MAPS_URL}." >&2
+        fi
+    else
+        echo "Skipping AdditionalMaps (ADDITIONAL_MAPS_SKIP=1)"
+    fi
 
     mkdir -p /opt/bin /tmp/xdg-runtime /opt/carla/CarlaUE4/Saved/Logs
     chmod -R a+rwX /tmp/xdg-runtime /opt/carla/CarlaUE4/Saved || true

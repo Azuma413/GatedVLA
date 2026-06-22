@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=3:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -o logs/polaris_carla_load_world_matrix.out
+
+set -euo pipefail
+
+cd /eagle/RobustViT/hiratsuka/VLA4AD_Research
+mkdir -p logs
+
+ml use /soft/modulefiles
+ml spack-pe-base
+ml apptainer
+
+exec bash scripts/polaris/carla_load_world_matrix.sh

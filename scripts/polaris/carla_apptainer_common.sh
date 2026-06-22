@@ -57,6 +57,32 @@ carla_software_env_args() {
         --env LP_NUM_THREADS="${CARLA_SOFTWARE_THREADS:-16}"
 }
 
+# Write a DefaultEngine.ini copy whose default maps point at <town>, so the
+# CARLA server boots directly on that map. The packaged CARLA 0.9.15 server
+# ignores the command-line map argument (verified on Polaris: passing
+# /Game/Carla/Maps/Town03_Opt or Town03_Opt still boots ServerDefaultMap,
+# Town10HD_Opt). Booting on the correct map avoids an in-client load_world(),
+# which on a remote client corrupts the TrafficManager and SIGSEGVs on the
+# next get_trafficmanager()/apply_settings() call.
+#
+# Usage: prepare_boot_map_ini <carla_sif> <town> <out_ini>
+prepare_boot_map_ini() {
+    local carla_sif=$1
+    local town=$2
+    local out_ini=$3
+    local map_obj="/Game/Carla/Maps/${town}.${town}"
+
+    mkdir -p "$(dirname "${out_ini}")"
+    apptainer exec "${carla_sif}" cat /opt/carla/CarlaUE4/Config/DefaultEngine.ini \
+        > "${out_ini}.base"
+    sed -E \
+        -e "s#^(GameDefaultMap=).*#\1${map_obj}#" \
+        -e "s#^(ServerDefaultMap=).*#\1${map_obj}#" \
+        -e "s#^(EditorStartupMap=).*#\1${map_obj}#" \
+        "${out_ini}.base" > "${out_ini}"
+    rm -f "${out_ini}.base"
+}
+
 pick_port() {
     python3 - <<'PY'
 import socket
