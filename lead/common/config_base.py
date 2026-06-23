@@ -285,12 +285,34 @@ class BaseConfig:
                 },
             }
         elif self.target_dataset == TargetDataset.CARLA_ALPAMAYO_4CAMERAS:
-            # Four-camera rig matching Alpamayo/Physical AI AV feature names:
-            # cross-left, front-wide, cross-right, and front-tele.
+            # Four-camera rig matching Alpamayo/Physical AI AV feature names,
+            # consumed in this order by AlpamayoAgent as camera_indices [0, 1, 2, 6]:
+            #   cam 1 -> idx 0  camera_cross_left_120fov   (front-left, looks outward)
+            #   cam 2 -> idx 1  camera_front_wide_120fov   (straight ahead)
+            #   cam 3 -> idx 2  camera_cross_right_120fov  (front-right, looks outward)
+            #   cam 4 -> idx 6  camera_front_tele_30fov    (straight ahead, telephoto)
+            #
+            # Alpamayo-R1 does not consume camera extrinsics at inference time; it only
+            # identifies a view by its camera index/name. So the orientation just needs to
+            # make each CARLA view *look like* the real AV view the model associates with
+            # that camera. The previous +/-30 deg cross cameras (with 120 deg FOV) overlapped
+            # the front view so heavily that all four panels looked forward-facing.
+            #
+            # cross_camera_yaw_deg angles the cross cameras outward to the front-left/right.
+            # Value taken from the public Physical AI AV dataset: the sensor_extrinsics of the
+            # cross_left/cross_right cameras cluster around 66.6-66.7 deg, indicating a nominal
+            # mounting yaw of +/-200/3 deg (= 66.666... deg). Matching this keeps each CARLA view
+            # looking like the real AV view Alpamayo-R1 associates with that camera index/name
+            # (the model identifies a view by index/name, not by extrinsics, so the appearance is
+            # what matters). The previous +/-30 deg cross cameras (with 120 deg FOV) overlapped
+            # the front view so heavily that all four panels looked forward-facing.
+            # Data collection and eval share this config, so the collected SFT data and the eval
+            # rig stay consistent.
+            cross_camera_yaw_deg = 200.0 / 3.0
             return {
                 1: {
                     "pos": [1.5, -0.3, 1.6],
-                    "rot": [0.0, 0.0, -30.0],
+                    "rot": [0.0, 0.0, -cross_camera_yaw_deg],
                     "width": 800,
                     "height": 600,
                     "cropped_height": 600,
@@ -306,7 +328,7 @@ class BaseConfig:
                 },
                 3: {
                     "pos": [1.5, 0.3, 1.6],
-                    "rot": [0.0, 0.0, 30.0],
+                    "rot": [0.0, 0.0, cross_camera_yaw_deg],
                     "width": 800,
                     "height": 600,
                     "cropped_height": 600,
