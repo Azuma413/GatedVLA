@@ -3,15 +3,24 @@
 set -euo pipefail
 
 REPO_DIR=${REPO_DIR:-/eagle/RobustViT/hiratsuka/VLA4AD_Research}
-HOST_NVIDIA_LIB_DIR=${HOST_NVIDIA_LIB_DIR:-${REPO_DIR}/.apptainer/nvidia-libs}
-HOST_NVIDIA_JSON_DIR=${HOST_NVIDIA_JSON_DIR:-${REPO_DIR}/.apptainer/nvidia-json}
+# Per-job overlay dirs: when many independent collection jobs start at once they
+# must NOT share these paths. With a single shared dir the `find -delete` below
+# races across jobs (one job deletes a symlink another is about to delete) and,
+# under `set -e`, aborts the loser with Exit 1 (observed 2026-06-28: jobs
+# 7226090/91 died at startup when 5 jobs launched together). Default to a
+# per-PBS-job subdir so concurrent jobs are isolated; callers may still override.
+_APPTAINER_OVERLAY_TAG=${_APPTAINER_OVERLAY_TAG:-${PBS_JOBID:-shared}}
+HOST_NVIDIA_LIB_DIR=${HOST_NVIDIA_LIB_DIR:-${REPO_DIR}/.apptainer/${_APPTAINER_OVERLAY_TAG}/nvidia-libs}
+HOST_NVIDIA_JSON_DIR=${HOST_NVIDIA_JSON_DIR:-${REPO_DIR}/.apptainer/${_APPTAINER_OVERLAY_TAG}/nvidia-json}
 
 prepare_host_graphics_overlay() {
     mkdir -p \
         "${HOST_NVIDIA_LIB_DIR}" \
         "${HOST_NVIDIA_JSON_DIR}/vulkan/icd.d"
 
-    find "${HOST_NVIDIA_LIB_DIR}" -type l -delete
+    # Tolerate concurrent deletion (another job may have removed a symlink
+    # first); never let this abort the job under `set -e`.
+    find "${HOST_NVIDIA_LIB_DIR}" -type l -delete 2>/dev/null || true
     for lib in /usr/lib64/libcuda.so* /usr/lib64/libGLX_nvidia.so* /usr/lib64/libEGL_nvidia.so* /usr/lib64/libnvidia*.so*; do
         [ -e "${lib}" ] || continue
         ln -sfn "/host/usr/lib64/$(basename "${lib}")" "${HOST_NVIDIA_LIB_DIR}/$(basename "${lib}")"

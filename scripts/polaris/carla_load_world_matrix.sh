@@ -206,6 +206,7 @@ start_carla() {
         --env "CARLA_PORT=${port}"
         --env CARLA_LOG_DIR=/opt/carla/CarlaUE4/Saved/Logs
         --env NVIDIA_DRIVER_CAPABILITIES=all
+        --env "CARLA_EXTRA_FLAGS=${CARLA_EXTRA_FLAGS:-}"
     )
 
     case "${CARLA_SERVER_MODE}" in
@@ -249,7 +250,8 @@ start_carla() {
             -NoSplash \
             -log \
             -stdout \
-            -FullStdOutLogOutput
+            -FullStdOutLogOutput \
+            ${CARLA_EXTRA_FLAGS}
     ' >"${log_file}" 2>&1 &
     printf '%s\n' "$!"
 }

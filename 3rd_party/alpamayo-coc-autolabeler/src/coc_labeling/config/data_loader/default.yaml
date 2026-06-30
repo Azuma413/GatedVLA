@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# config for data loader
+temporal_defaults: &temporal_defaults
+  hist_length_sec: 2 # seconds
+  fut_length_sec: 6 # seconds
+  time_interval: 0.5 # interval between selected frames in seconds
+  fps: 10
+
+meta_action:
+  <<: *temporal_defaults
+  num_total_frames: 200 # total number of frames in a video
+  convert2text: true
+  add_ts_prefix: true
+  debug: false # enable detailed per-line parser diagnostics
+
+# config for video loader
+video:
+  <<: *temporal_defaults
+  event_start_from_source_fps: false # event_start specified in the source fps (e.g. 30) instead of fps above
+  use_fpv: true
+  use_bev: false
+  save_segment_videos: false # if true, save extracted FPV segment videos for visualization/debug
+  segment_video_output_dir: null # optional output root; defaults to <data.video_dir>/segment_videos when saving enabled
+  segment_video_skip_existing: true # if true, do not re-encode an already existing segment video
+  save_segment_videos_source_fps: true # if true, save contiguous raw segment at source fps spanning sampled frames
+  save_segment_video_metadata: true # save sidecar JSON with sampled frame indices/timestamps used by VLM
+  segment_video_web_compatible: true # transcode saved segment video to browser-safe H.264/yuv420p via ffmpeg
+  segment_video_ffmpeg_bin: ffmpeg # ffmpeg executable name/path used for transcoding
+
+# config for vector loader
+vector:
+  <<: *temporal_defaults
+  trajdata:
+    dataset: clipgt
+    split: all
+    num_workers: 128
+    max_agent_num: 50
+    radius: 50
+
+keyframe:
+  filter_clip_missing_wm: false
+  meta_action_filter: null
+  segment_filter_exclude: null
+  segment_filter_include: null
+  sft_timestamp_alignment_file: null # parquet file containing all episode timestamps for each clip
+  round_event_start_frame_interval: 0 # round start frame to be nearest integer multiple of this value
+  deduplicate_segments: false # remove duplicate segments with same filename and start
+  segment_generator_type: "json" # default is to parse jsons from keyframe_auto_select.py with relative timestamp

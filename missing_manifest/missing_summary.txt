@@ -1,0 +1,32 @@
+target routes : 3274
+missing routes: 833  (25.4%)
+
+Missing per town:
+  Town15     361
+  Town12     179
+  Town13     96
+  Town10HD   82
+  Town03     37
+  Town06     29
+  Town07     20
+  Town05     17
+  Town04     12
+
+Missing per scenario:
+  AccidentTwoWays                          175
+  ConstructionObstacleTwoWays              171
+  noScenarios                              129
+  NonSignalizedJunctionLeftTurn            53
+  SignalizedJunctionRightTurn              53
+  CrossJunctionDefectTrafficLight          45
+  SignalizedJunctionLeftTurnEnterFlow      45
+  ParkingExit                              44
+  NonSignalizedJunctionLeftTurnEnterFlow   30
+  SignalizedJunctionLeftTurn               23
+  ConstructionObstacle                     20
+  ParkedObstacle                           14
+  RedLightWithoutLeadVehicle               12
+  Accident                                 9
+  VehicleOpensDoorTwoWays                  6
+  MergerIntoSlowTrafficV2                  3
+  HighwayExit                              1

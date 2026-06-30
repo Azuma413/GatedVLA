@@ -207,7 +207,15 @@ def write_video_from_frames(
 
     if not written_timestamps:
         raise RuntimeError(f"No frames written for camera {camera_id}")
-    return pd.DataFrame({"timestamp": np.asarray(written_timestamps, dtype=np.int64)})
+    # The CoC autolabeler video loader needs BOTH a frame-index column and a
+    # timestamp column to map keyframe timestamps to mp4 frames; frame_index is the
+    # written order (== frame position in the mp4).
+    return pd.DataFrame(
+        {
+            "frame_index": np.arange(len(written_timestamps), dtype=np.int64),
+            "timestamp": np.asarray(written_timestamps, dtype=np.int64),
+        }
+    )
 
 
 def add_file_to_zip(zip_path: Path, source_path: Path, arcname: str) -> None:

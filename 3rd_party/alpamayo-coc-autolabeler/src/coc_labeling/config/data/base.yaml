@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+dataset_name: pai # Default trajdata dataset prefix.
+
+##### Group-split mode (multi-node large-scale runs)
+# These are intentionally null until a run supplies concrete local paths.
+# Group-split launchers populate the *_root fields; single-node runs use the
+# fields below. Loaders that require a path fail fast if the value is still null.
+segment_config_dir: null # Directory with per-group keyframe JSONs, for example: /path/to/keyframes/groups
+wm_file_check: null # Optional list file for clips with available WM outputs, for example: /path/to/wm_clip_ids.txt
+meta_action_dir_root: null # Root directory for meta-action group folders, for example: /path/to/meta_action/groups
+video_dir_root: null # Root directory for video group folders, for example: /path/to/physical_ai_data
+cache_dir_root: null # Root directory for trajdata caches, for example: /path/to/trajdata_cache
+data_dir_root: null # Root directory for parquet clip data, for example: /path/to/physical_ai_data
+
+##### Single-node mode (small-scale runs)
+# Keyframe segment inputs (choose one based on segment_generator_type)
+segment_config_path: null # JSON from keyframe_auto_select.py, for example: ./experiments/keyframes/segments_relative_timestamp_sampled.json
+segment_list_parquet_file: null # Optional parquet segment list alternative, for example: ./experiments/segments.parquet
+
+# Data roots used by loaders
+cache_dir: null # Trajdata cache for parquet files, for example: /path/to/trajdata_cache
+data_dir: null # Parquet clip data, for example: /path/to/physical_ai_data
+video_dir: null # Camera videos root, for example: /path/to/physical_ai_data
+meta_action_dir: null # Meta-action outputs, for example: /path/to/meta_action/final_outputs

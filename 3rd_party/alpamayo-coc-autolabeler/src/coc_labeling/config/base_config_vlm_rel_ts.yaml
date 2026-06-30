@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+defaults:
+  - data: keyframe_rel_ts
+  - data_loader: default
+  - misc/job_split@_global_
+  - misc/verbose@_global_
+  - _self_ # ensures that anything defined in this file overrides values from other config files
+
+mode: vlm
+model_name: qwen3.5_35b
+timeout_sec: 600
+vlm_agent:
+  agent_name: VLMCoCAgent
+  temperature: 0.0
+  top_p: 1.0
+  repetition_penalty: 1.0
+
+# per experiment
+exp_name: coc_labeling_test_rel_ts # path to save results
+resume_exp_dir: null
+verbose:
+  verbose_data: true
+
+data_loader:
+  # event_start will be a frame number from the 30 fps video, to more precisely select images
+  video:
+    event_start_from_source_fps: true
+    save_segment_videos: true
+    segment_video_output_dir: ./experiments/video_segment
+    segment_video_skip_existing: true
+
+  # load segment list from json file, relative timestamp for keyframes
+  keyframe:
+    segment_generator_type: "json"
+    meta_action_filter: null #Defaults to keep all. If set to meta_action_filter:[go_straight], only keep "go_straight" meta-actions

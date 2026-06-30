@@ -1,0 +1,27 @@
+#!/bin/sh
+#PBS -l select=16:ngpus=4
+#PBS -l walltime=6:00:00
+#PBS -q prod
+#PBS -A RobustViT
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -o logs/polaris_collect_pbs.out
+
+# One cooperating collection job: runs one per-node worker on each of its nodes
+# (mpiexec -ppn 1), each draining the SHARED campaign claim queue. Submit several
+# of these (same CAMPAIGN) for scale; a node failure only aborts ITS job, the
+# others keep collecting, and resubmitting re-claims the dead job's stale routes.
+#
+#   qsub -v CAMPAIGN=lead scripts/polaris/collect_pbs.pbs          # one 16-node job
+#   bash scripts/polaris/collect_pbs_launch.sh                     # submit many at once
+
+set -eu
+REPO_DIR=${REPO_DIR:-/eagle/RobustViT/hiratsuka/VLA4AD_Research}
+
+ml use /soft/modulefiles
+ml spack-pe-base
+ml apptainer
+
+cd "${REPO_DIR}"
+mkdir -p logs
+exec bash scripts/polaris/collect_pbs.sh

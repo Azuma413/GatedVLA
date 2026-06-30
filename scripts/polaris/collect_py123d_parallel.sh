@@ -233,10 +233,14 @@ run_server() {
     echo "scenario=${scenario_id} server_host=$(hostname -f) route=${route_for_job} town=${route_town_name} port=${carla_port}"
 
     cleanup() {
-        if [ -n "${CARLA_PID:-}" ] && kill -0 "${CARLA_PID}" 2>/dev/null; then
-            kill "${CARLA_PID}" 2>/dev/null || true
-            wait "${CARLA_PID}" 2>/dev/null || true
-        fi
+        # CARLA/UE4 IGNORES SIGTERM, so the old `kill` + `wait` blocked forever:
+        # the rank never exited, mpiexec never finished, and the whole job sat idle
+        # holding all its nodes until walltime (hours of wasted node-hours after the
+        # actual collection had already finished in minutes). Force-kill with
+        # SIGKILL and nuke any surviving CarlaUE4 on this node (cross-node => one
+        # CARLA per node); do NOT block on wait.
+        [ -n "${CARLA_PID:-}" ] && kill -9 "${CARLA_PID}" 2>/dev/null || true
+        pkill -9 -f 'CarlaUE4-Linux-Shipping' 2>/dev/null || true
     }
     trap cleanup EXIT
 
@@ -365,7 +369,8 @@ run_client() {
                 --port "${CARLA_PORT}" \
                 --traffic-manager-port "${TM_PORT}" \
                 --timeout 600 \
-                --output-dir "/workspace/VLA4AD_Research/${OUTPUT_ROOT}/outputs" \
+                --resume \
+                --output-dir "/workspace/VLA4AD_Research/${OUTPUT_ROOT}/outputs/$(basename "${ROUTE_FOR_JOB}" .xml)" \
                 --routes "/workspace/VLA4AD_Research/${ROUTE_FOR_JOB}"
         status=$?
         set -e
@@ -420,14 +425,21 @@ run_worker() {
     route_for_job=$(sed -n "$((scenario_id + 1))p" "${ROUTES_MANIFEST}")
     if [ -z "${route_for_job}" ]; then
         echo "No route for scenario ${scenario_id} (manifest has fewer lines)" >&2
-        exit 2
+        exit 0   # not an error: idle rank must not abort the mpiexec job
     fi
 
+    # Per-rank error isolation: a server/client failure is logged but the rank
+    # ALWAYS exits 0, so mpiexec never SIGTERMs the sibling pairs (one flaky
+    # node/route no longer kills the whole allocation). Failures are still
+    # recorded in summary.jsonl / failed_routes.txt by run_server/run_client.
     if [ "$((rank % 2))" = "0" ]; then
-        run_server "${scenario_id}" "${route_for_job}"
+        ( run_server "${scenario_id}" "${route_for_job}" ) \
+            || echo "scenario ${scenario_id} server rank failed (isolated, rc=$?)"
     else
-        run_client "${scenario_id}" "${route_for_job}"
+        ( run_client "${scenario_id}" "${route_for_job}" ) \
+            || echo "scenario ${scenario_id} client rank failed (isolated, rc=$?)"
     fi
+    exit 0
 }
 
 # ---------------------------------------------------------------------------
