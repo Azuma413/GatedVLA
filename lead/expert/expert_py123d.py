@@ -104,6 +104,11 @@ TRAFFIC_LIGHT_LOG_RADIUS_M: float = 80.0
 # Max distance (m) from a TL waypoint to a 123D lane centerline for a match.
 LANE_CENTERLINE_MATCH_THRESHOLD_M: float = 0.1
 
+# Re-query traffic lights only after ego moved this far when the previous query
+# found no nearby traffic lights. Town12 has many frames far from any TL, and
+# repeatedly scanning all TL actors dominates wall time there.
+TRAFFIC_LIGHT_EMPTY_CACHE_DISTANCE_M: float = 5.0
+
 # Length (m) of the lane centerline start segment used to match TL waypoints.
 LANE_START_MATCH_LENGTH_M: float = 5.0
 
@@ -215,6 +220,8 @@ class ExpertPy123D(Expert):
 
         # Initialize map writer
         self._init_py123d_map()
+        self._traffic_light_waypoint_cache = None
+        self._traffic_light_empty_cache_location = None
 
         # Initialize log writer
         self._init_py123d_log()
@@ -496,11 +503,12 @@ class ExpertPy123D(Expert):
         modalities.append(ego_state)
 
         # Convert LEAD's bounding boxes format to Py123D
-        box_detections = self._extract_py123d_box_detections(input_data, ts)
-        LOG.debug(f"Extracted {len(box_detections.box_detections)} bounding boxes")
-        modalities.append(
-            box_detections,
-        )  # NOTE: We also write the modality if no boxes are found.
+        if not self.config_expert.py123d_skip_box_detections:
+            box_detections = self._extract_py123d_box_detections(input_data, ts)
+            LOG.debug(f"Extracted {len(box_detections.box_detections)} bounding boxes")
+            modalities.append(
+                box_detections,
+            )  # NOTE: We also write the modality if no boxes are found.
 
         # Convert camera data (needs ego state for world-space extrinsic)
         cameras = self._extract_py123d_camera_data(input_data, ts, ego_state)
@@ -508,14 +516,16 @@ class ExpertPy123D(Expert):
         modalities.extend(cameras)
 
         # Convert LiDAR data
-        lidar = self._extract_py123d_lidar_data(ts)
-        if lidar is not None:
-            LOG.debug(f"Extracted LiDAR with {lidar.point_cloud_3d.shape[0]} points")
-            modalities.append(lidar)
+        if not self.config_expert.py123d_disable_lidar:
+            lidar = self._extract_py123d_lidar_data(ts)
+            if lidar is not None:
+                LOG.debug(f"Extracted LiDAR with {lidar.point_cloud_3d.shape[0]} points")
+                modalities.append(lidar)
 
         # Traffic light detections
-        traffic_lights = self._extract_py123d_traffic_lights(ts)
-        modalities.append(traffic_lights)
+        if not self.config_expert.py123d_skip_traffic_lights:
+            traffic_lights = self._extract_py123d_traffic_lights(ts)
+            modalities.append(traffic_lights)
 
         return ModalitiesSync(timestamp=ts, modalities=modalities)
 
@@ -817,17 +827,32 @@ class ExpertPy123D(Expert):
 
         ego_loc = self.ego_location
 
-        # One query point per affected-lane waypoint (CARLA: +y right → 123D /
+        empty_cache_location = getattr(self, "_traffic_light_empty_cache_location", None)
+        if (
+            empty_cache_location is not None
+            and ego_loc.distance(empty_cache_location) < TRAFFIC_LIGHT_EMPTY_CACHE_DISTANCE_M
+        ):
+            return TrafficLightDetections(detections=[], timestamp=timestamp)
+
+        # Cache static TL actors and affected-lane waypoints per route. Actor
+        # state stays dynamic and is read below on every actual query.
+        traffic_light_waypoints = getattr(self, "_traffic_light_waypoint_cache", None)
+        if traffic_light_waypoints is None:
+            traffic_light_waypoints = []
+            for actor in self.carla_world.get_actors().filter("*traffic_light*"):
+                if not isinstance(actor, carla.TrafficLight):
+                    continue
+                traffic_light_waypoints.append((actor, actor.get_affected_lane_waypoints()))
+            self._traffic_light_waypoint_cache = traffic_light_waypoints
+
+        # One query point per affected-lane waypoint (CARLA: +y right -> 123D /
         # ISO 8855: +y left, hence the y negation). Filter is per-waypoint so
         # only lanes near the ego are logged, even at wide intersections.
         query_points: list[geom.Point] = []
         point_status: list[TrafficLightStatus] = []
         point_actor_ids: list[int] = []
         actor_ids_in_radius: set[int] = set()
-        for actor in self.carla_world.get_actors().filter("*traffic_light*"):
-            if not isinstance(actor, carla.TrafficLight):
-                continue
-            waypoints = actor.get_affected_lane_waypoints()
+        for actor, waypoints in traffic_light_waypoints:
             for waypoint in waypoints:
                 lane_loc = waypoint.transform.location
                 if ego_loc.distance(lane_loc) > TRAFFIC_LIGHT_LOG_RADIUS_M:
@@ -843,11 +868,18 @@ class ExpertPy123D(Expert):
                 point_actor_ids.append(actor.id)
 
         if not actor_ids_in_radius:
-            LOG.info(
+            self._traffic_light_empty_cache_location = carla.Location(
+                x=ego_loc.x,
+                y=ego_loc.y,
+                z=ego_loc.z,
+            )
+            LOG.debug(
                 f"Traffic-light map query skipped: no traffic lights within "
                 f"{TRAFFIC_LIGHT_LOG_RADIUS_M:.0f} m.",
             )
             return TrafficLightDetections(detections=[], timestamp=timestamp)
+
+        self._traffic_light_empty_cache_location = None
 
         # Single batched map call. `dwithin` (not `intersects`) absorbs sub-cm
         # noise on polygon edges; same threshold reused as the centerline filter.

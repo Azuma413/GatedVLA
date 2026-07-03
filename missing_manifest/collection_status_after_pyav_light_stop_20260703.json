@@ -1,0 +1,67 @@
+{
+  "completed_before_pyav_light_routes": 5,
+  "counts_by_town": {
+    "Town07": {
+      "failed_current_run": 1,
+      "ok_current_run": 1
+    },
+    "Town10HD": {
+      "failed_current_run": 1
+    },
+    "Town12": {
+      "failed_current_run": 2,
+      "interrupted_partial": 2,
+      "not_started": 131,
+      "ok_current_run": 41
+    },
+    "Town13": {
+      "not_started": 89
+    },
+    "Town15": {
+      "not_started": 341
+    }
+  },
+  "current_run": "logs/local_collection/20260703_0546_pyav_light_remaining",
+  "current_run_failed": 4,
+  "current_run_interrupted_partial": 2,
+  "current_run_ok": 42,
+  "current_run_summary_records": 46,
+  "failed_manifest": "missing_manifest/failed_routes_pyav_light_20260703.tsv",
+  "failure_reasons": {
+    "checkpoint_failed:RouteScenario_route_001639_rep0:Failed - Agent timed out": 1,
+    "traffic_manager_bind": 3
+  },
+  "interrupted_manifest": "missing_manifest/interrupted_routes_pyav_light_20260703.txt",
+  "not_started_manifest": "missing_manifest/not_started_routes_pyav_light_20260703.txt",
+  "not_started_routes": 561,
+  "pyav_export_smoke_test": {
+    "command": "uv run python scripts/export_py123d_to_pai.py --logs-root data/carla_alpamayo_4c_py123d/logs/carla_train/Town12_Rep-1_Town12_000_route0_07_03_05_52_53 --output-dir /tmp/pyav_verify_20260703_town12_000 --overwrite --max-logs 1",
+    "input_log": "data/carla_alpamayo_4c_py123d/logs/carla_train/Town12_Rep-1_Town12_000_route0_07_03_05_52_53",
+    "output_dir": "/tmp/pyav_verify_20260703_town12_000",
+    "status": "ok",
+    "verified_outputs": [
+      "clip_index.parquet",
+      "metadata/feature_presence.parquet",
+      "features.csv",
+      "4 camera mp4+timestamp zip entries",
+      "labels/egomotion zip",
+      "labels/navigation_command zip"
+    ]
+  },
+  "pyav_verification": {
+    "checked_successful_current_run_routes": 42,
+    "convertible_to_pyav": 42,
+    "not_convertible_to_pyav": 0,
+    "required_features": [
+      "sync.arrow readable by ArrowSceneAPI",
+      "navigation_command.parquet with timestamp_us/timestamp and command_near",
+      "four Alpamayo cameras: left/front/right/tele",
+      "ego_state_se3 readable for egomotion",
+      "clip long enough for default 1.6s history + 6.4s future event_t0s"
+    ]
+  },
+  "remaining_manifest": "missing_manifest/remaining_routes_after_pyav_light_stop_20260703.txt",
+  "remaining_routes_to_collect": 567,
+  "source_manifest": "missing_manifest/remaining_routes_pyav_light_after_completed_20260703.txt",
+  "source_manifest_routes": 609
+}

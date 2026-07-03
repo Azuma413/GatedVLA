@@ -57,6 +57,12 @@ class ExpertConfig(BaseConfig):
     py123d_split = "train"
     # If true, use a reduced RGB+LiDAR sensor rig for Polaris CARLA smoke tests.
     py123d_rgb_only_smoke = False
+    # If true, do not spawn/process/write LiDAR for Py123D collection.
+    py123d_disable_lidar = False
+    # If true, do not write Py123D box detections.
+    py123d_skip_box_detections = False
+    # If true, do not write Py123D traffic light detections.
+    py123d_skip_traffic_lights = False
 
     # ---- Performance settings ---
     # If true, also run speed benchmarking during expert data collection

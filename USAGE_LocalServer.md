@@ -1,243 +1,288 @@
 # オンプレサーバでの残りデータ収集手順
 
-Polarisでポイントが枯渇した残り **833ルート**（全3274本の25.4%）をオンプレのA6000 GPUサーバで収集する手順です。
+オンプレGPUサーバで、残り **567ルート** を高速化済みの PyAV-light 設定で収集する手順です。
 
-**方針: 1TB級の既存収集データはオンプレに転送しません。** Polaris側で「未収集ルートの一覧」（約52KBのテキスト1枚）だけを確定・転送し、オンプレはそれを直接収集します。ルートXMLはgit管理下（3364本）なので、`git clone` 済みのオンプレには既に存在します。
+現在の残りルートは [missing_manifest/remaining_routes.txt](missing_manifest/remaining_routes.txt) に凍結済みです。このリストは、既存収集分、今回の成功分、失敗分、途中停止分を整理した後の「まだ収集が必要なルート」です。
+
+この手順では、PyAV/CoC/学習に必要な4カメラ、egomotion、navigation_commandを残し、不要なLiDAR、box detection書き出し、traffic light書き出し、perturbated sensorsを無効化します。
+
+---
 
 ## 前提条件
 
 | 項目 | 内容 |
 |------|------|
-| GPU | NVIDIA RTX A6000（48GB）× 3 |
+| GPU | NVIDIA RTX A6000 / RTX 6000 Ada など、CARLAを動かせるGPU |
 | CARLA | 0.9.15（バイナリ展開済み） |
-| Python環境 | `.venv`（`lead` パッケージインストール済み） |
-| リポジトリ | このリポジトリを `git clone`、サブモジュール済み |
-| 収集済みデータ | **転送不要**（未収集リストのみ転送） |
+| Python環境 | `uv run` で起動可能な `.venv` |
+| リポジトリ | このリポジトリを `git clone` 済み |
+| ルートmanifest | `missing_manifest/remaining_routes.txt` |
+
+CARLAバイナリが標準パスにない場合は、実行時に `CARLA_BIN=/path/to/CarlaUE4-Linux-Shipping` を追加してください。
 
 ---
 
-## 0. 環境確認（オンプレ側）
+## 0. 環境確認
 
 ```bash
 cd /path/to/VLA4AD_Research
-export REPO_DIR="$(pwd)"
 
-# Pythonとleadが動くか確認
-.venv/bin/python3 -c "import lead; print('lead OK')"
+# Python環境が壊れていないか確認
+uv run python -c "import lead; print('lead OK')"
 
-# CARLAバイナリのパスを確認（以下のどちらかが存在するはず）
+# 壊れている場合だけ同期し直す
+uv sync
+
+# CARLAバイナリ確認
 ls 3rd_party/CARLA_0915/CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping
-# または
-ls 3rd_party/CARLA_0.9.15/CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping
 
-# GPUが3枚見えているか
-nvidia-smi --list-gpus
+# GPU確認
+nvidia-smi
 
-# ルートXMLがclone済みか（3364本あるはず）
-git ls-files data/data_routes/lead/ | grep -c '\.xml$'
+# 残りroute数確認
+wc -l missing_manifest/remaining_routes.txt
 ```
 
-CARLA バイナリが標準パスにない場合は後続のコマンドで `CARLA_BIN=` を明示します。
+期待値:
 
----
-
-## 1. Polarisで未収集リストを確定・エクスポート（すでに実行済み）
-
-既存の1TBクリップツリーをスキャンできるのはPolarisだけです。`export_missing_manifest.sh` が
-`find_missing_routes.py` を1回だけ実行し、結果を小さなテキストに凍結します。
-
-```bash
-# Polaris側
-cd /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research
-bash scripts/local/export_missing_manifest.sh
-```
-
-出力:
-
-```
-missing_manifest/
-  missing_routes.txt    # 未収集ルートXMLパス一覧（833行, 約52KB）
-  missing_summary.txt   # town別・シナリオ別の集計（人間用）
+```text
+567 missing_manifest/remaining_routes.txt
 ```
 
 ---
 
-## 3. 未収集ルートの確認（オンプレ・ドライラン）
+## 1. ドライラン
 
-`MISSING_LIST=` に転送したリストを指定し、`LAUNCH=0`（デフォルト）で計画だけ表示します。
-この経路では `find_missing_routes.py` は呼ばれず、1TBデータは不要です。
+実行前に、batch生成と見積もりだけ確認します。
 
 ```bash
-cd /path/to/VLA4AD_Research
-MISSING_LIST=missing_manifest/missing_routes.txt \
-  bash scripts/local/collect_missing_local.sh
+CHUNK=1 \
+MISSING_LIST=missing_manifest/remaining_routes.txt \
+uv run bash scripts/local/collect_missing_local.sh
 ```
 
-出力例:
-
-```
-=== On-prem missing-route collection ===
-MISSING_LIST  = missing_manifest/missing_routes.txt  (frozen; dataset NOT scanned)
-CHUNK         = 2 routes/batch
-N_WORKERS     = 3 (GPUs: 0..2)
-QUALITY_LEVEL = Epic
-WORK          = logs/local_collection/20260701_120000
-
-Missing routes: 833
-
-Time estimate per town (A6000, sequential):
-  Town15    :  361 routes × 6.3 min = 37.9 h
-  Town12    :  179 routes × 12.1 min = 35.9 h
-  ...
-Total sequential : 110.7 h (4.6 days)
-With 3 workers  : 36.9 h (1.54 days)
-
-Batches: 419  (2 routes/batch)
->> DRY-RUN. Re-run with LAUNCH=1 to start collection.
-```
+`LAUNCH=1` を付けない限り、CARLAは起動しません。
 
 ---
 
-## 4. 収集の実行（オンプレ）
+## 2. 収集実行
 
-### 3-GPU フル並列（推奨）
-
-```bash
-MISSING_LIST=missing_manifest/missing_routes.txt \
-  LAUNCH=1 bash scripts/local/collect_missing_local.sh
-```
-
-### GPU数を絞る場合
+### 3 GPUを使う場合
 
 ```bash
-# GPU 1枚だけ使う
-N_WORKERS=1 MISSING_LIST=missing_manifest/missing_routes.txt \
-  LAUNCH=1 bash scripts/local/collect_missing_local.sh
+GPU_IDS=0,1,2 N_WORKERS=3 N_GPUS=3 CHUNK=1 MAX_RETRIES=1 CLIENT_TIMEOUT=21600 \
+EXTRA_LEAD_EXPERT_CONFIG="py123d_rgb_only_smoke=true perturbate_sensors=false py123d_disable_lidar=true py123d_skip_box_detections=true py123d_skip_traffic_lights=true" \
+MISSING_LIST=missing_manifest/remaining_routes.txt \
+LAUNCH=1 uv run bash scripts/local/collect_missing_local.sh
 ```
 
-### CARLAバイナリが標準パスにない場合
+### GPU 1,2 だけを使う場合
 
 ```bash
-CARLA_BIN=/your/custom/path/CarlaUE4-Linux-Shipping \
-  MISSING_LIST=missing_manifest/missing_routes.txt \
-  LAUNCH=1 bash scripts/local/collect_missing_local.sh
+GPU_IDS=1,2 N_WORKERS=2 N_GPUS=2 CHUNK=1 MAX_RETRIES=1 CLIENT_TIMEOUT=21600 \
+EXTRA_LEAD_EXPERT_CONFIG="py123d_rgb_only_smoke=true perturbate_sensors=false py123d_disable_lidar=true py123d_skip_box_detections=true py123d_skip_traffic_lights=true" \
+MISSING_LIST=missing_manifest/remaining_routes.txt \
+LAUNCH=1 uv run bash scripts/local/collect_missing_local.sh
 ```
+
+### GPU 1枚だけを使う場合
+
+```bash
+GPU_IDS=0 N_WORKERS=1 N_GPUS=1 CHUNK=1 MAX_RETRIES=1 CLIENT_TIMEOUT=21600 \
+EXTRA_LEAD_EXPERT_CONFIG="py123d_rgb_only_smoke=true perturbate_sensors=false py123d_disable_lidar=true py123d_skip_box_detections=true py123d_skip_traffic_lights=true" \
+MISSING_LIST=missing_manifest/remaining_routes.txt \
+LAUNCH=1 uv run bash scripts/local/collect_missing_local.sh
+```
+
+設定の意味:
+
+- `CHUNK=1`: 1 CARLAセッション1 route。失敗切り分けと再収集を簡単にする。
+- `MAX_RETRIES=1`: その場で粘らず、失敗routeを後で再queueする。
+- `CLIENT_TIMEOUT=21600`: 重いTown12/Town13/Town15 route用に6時間まで許容する。
+- `py123d_rgb_only_smoke=true`: 4カメラ中心の軽量Py123D収集にする。
+- `perturbate_sensors=false`: perturbated cameraを収集しない。
+- `py123d_disable_lidar=true`: LiDARを収集しない。
+- `py123d_skip_box_detections=true`: Py123D box detectionを書き出さない。
+- `py123d_skip_traffic_lights=true`: Py123D traffic light detectionを書き出さない。
+
+この設定でも、PyAV/PAI変換に必要な `sync.arrow`、4カメラ、`egomotion`、`navigation_command` は残ります。
 
 ---
 
-## 4. ログとモニタリング
+## 3. ログ確認
 
-収集中は各ログファイルでリアルタイム確認できます。
+実行すると `logs/local_collection/<timestamp>/` が作成されます。
 
 ```bash
-WORK=logs/local_collection/<timestamp>   # 実際のWORKパスに置き換え
+WORK=logs/local_collection/<timestamp>
 
-# 全体サマリ（完了・失敗の集計）
+# 全体summary
 tail -f ${WORK}/summary.jsonl
 
-# ワーカー0の進捗
+# workerログ
 tail -f ${WORK}/worker_00.log
+tail -f ${WORK}/worker_01.log
 
-# ワーカー0のCARLAサーバログ
+# CARLA / clientログ
 tail -f ${WORK}/server_00.log
-
-# ワーカー0のクライアントログ（step/frame進捗）
 tail -f ${WORK}/client_00.log
-```
 
-オンプレで新規収集したclip数の確認（既存データは転送していないので0から増える）:
-
-```bash
-find data/carla_alpamayo_4c_py123d -name "sync.arrow" | wc -l
-# 0 → 833 に近づけば完了（成功率に依存）
+# GPU使用状況
+nvidia-smi
 ```
 
 成功/失敗の集計:
 
 ```bash
-.venv/bin/python3 -c "
-import json, collections
-c = collections.Counter(json.loads(l).get('status') for l in open('${WORK}/summary.jsonl') if l.strip())
+uv run python - <<'PYCODE'
+import json
+from collections import Counter
+from pathlib import Path
+
+work = Path("logs/local_collection/<timestamp>")
+c = Counter()
+reasons = Counter()
+for line in (work / "summary.jsonl").read_text().splitlines():
+    if not line.strip():
+        continue
+    row = json.loads(line)
+    c[row.get("status")] += 1
+    if row.get("status") != "ok":
+        reasons[row.get("reason", "")] += 1
 print(dict(c))
-"
+print(dict(reasons))
+PYCODE
+```
+
+Py123D実ログ数の確認:
+
+```bash
+find data/carla_alpamayo_4c_py123d/logs/carla_train -name sync.arrow | wc -l
 ```
 
 ---
 
-## 5. 中断と再開
+## 4. 中断
 
-**Ctrl-C で安全に中断**できます。スクリプトが SIGINT をキャッチし、起動中の CARLA プロセスをすべて SIGKILL して終了します。
-
-再開は `WORK=` に前回のディレクトリを指定し、**同じ `MISSING_LIST`** で `LAUNCH=1` 再実行します。
-バッチXMLと各バッチの出力先（`data/outputs/<batch>/`）が固定されるため、leaderboardの
-`checkpoint_endpoint.json` + `--resume` により**収集済みルートは自動スキップ**されます。
+`screen` で起動している場合は、対象sessionとCARLA/leaderboardプロセスを停止してください。
 
 ```bash
-WORK=logs/local_collection/20260701_120000 \
-  MISSING_LIST=missing_manifest/missing_routes.txt \
-  LAUNCH=1 bash scripts/local/collect_missing_local.sh
+screen -ls
+ps -eo pid,ppid,stat,etime,cmd | grep -E 'collect_|CarlaUE4|leaderboard|python -m lead|timeout 21600' | grep -v grep
 ```
 
-> **注意:** オンプレには1TBデータがないため `find_missing_routes.py` は使えません。
-> 再開時のスキップ判定は「凍結リストを再分割した同一バッチ + per-batch `--resume`」に依存します。
-> したがって再開時は **`WORK` と `MISSING_LIST` を前回と同じにする**ことが重要です。
+停止する場合は、対象PIDを確認してから `kill -9` します。
+
+```bash
+kill -9 <pid> <pid> ...
+screen -wipe
+```
+
+停止後の確認:
+
+```bash
+pgrep -af CarlaUE4
+pgrep -af leaderboard_evaluator_local
+pgrep -af collect_missing_local
+screen -ls
+```
 
 ---
 
-## 6. 完了確認
+## 5. 再開
 
-**未収集ルートの「特定」はステップ1でaurora側に確定済み**なので、オンプレでは
-「凍結リストの833本すべてが成功収集できたか」だけを確認すれば完了です。
-ルート単位の再特定（`find_missing_routes.py`）は不要です。
-
-判定は `summary.jsonl` のバッチ成否で行います。
+同じ `WORK` を指定して再実行すると、`checkpoint_endpoint.json` と `--resume` により成功済みbatchはスキップされます。
 
 ```bash
-# バッチ成否の集計（ok 以外が残っていれば未完）
-.venv/bin/python3 -c "
-import json, collections
-c = collections.Counter(json.loads(l).get('status') for l in open('${WORK}/summary.jsonl') if l.strip())
-print(dict(c))
-"
+WORK=logs/local_collection/<timestamp> \
+GPU_IDS=0,1,2 N_WORKERS=3 N_GPUS=3 CHUNK=1 MAX_RETRIES=1 CLIENT_TIMEOUT=21600 \
+EXTRA_LEAD_EXPERT_CONFIG="py123d_rgb_only_smoke=true perturbate_sensors=false py123d_disable_lidar=true py123d_skip_box_detections=true py123d_skip_traffic_lights=true" \
+MISSING_LIST=missing_manifest/remaining_routes.txt \
+LAUNCH=1 uv run bash scripts/local/collect_missing_local.sh
+```
 
-# 失敗バッチ一覧（あれば再収集対象）
+別サーバへ移す場合は、前サーバの `summary.jsonl` を基準に成功routeを除外した新しい `remaining_routes.txt` を作ってから実行してください。単に同じmanifestを別サーバで再実行すると、前サーバで成功したrouteも再実行対象になります。
+
+---
+
+## 6. 完了判定
+
+`summary.jsonl` に `ok` 以外が残っていなければ、そのmanifest分は完了です。
+
+```bash
+uv run python - <<'PYCODE'
+import json
+from collections import Counter
+from pathlib import Path
+
+work = Path("logs/local_collection/<timestamp>")
+c = Counter()
+for line in (work / "summary.jsonl").read_text().splitlines():
+    if line.strip():
+        c[json.loads(line).get("status")] += 1
+print(dict(c))
+PYCODE
+```
+
+失敗がある場合:
+
+```bash
 cat ${WORK}/failed_batches.txt 2>/dev/null
 ```
 
-CARLAはルートにより収集が失敗します（実測でTown03等は失敗率が高い）。
-失敗バッチが残っていたら、**同じ `WORK` + `MISSING_LIST`** で再実行すれば
-`--resume` により成功済みルートはスキップされ、失敗分だけが再収集されます。
-これを `summary.jsonl` が全 `ok` になるまで繰り返せば、833本すべてが揃った状態になります。
+`traffic_manager_bind` は再実行で通ることが多いです。`Agent timed out` はroute固有に重いか、agentが詰まっている可能性があります。完了までには、失敗routeだけを再manifest化して回収します。
+
+---
+
+## 7. PyAV / CoC 確認
+
+今回のPyAV-light設定で収集した成功routeは、実データから以下を確認済みです。
+
+- PyAV/PAI変換可能
+- 4カメラあり
+- `navigation_command.parquet` あり
+- `egomotion` 生成可能
+- `features.csv`, `clip_index.parquet`, `feature_presence.parquet` 生成可能
+- CoC autolabelerが使う `camera_front_wide_120fov` zipを生成可能
+
+変換例:
 
 ```bash
-# 失敗分の再収集（成功済みはスキップ）
-WORK=logs/local_collection/<ts> \
-  MISSING_LIST=missing_manifest/missing_routes.txt \
-  LAUNCH=1 bash scripts/local/collect_missing_local.sh
+uv run python scripts/export_py123d_to_pai.py \
+  --logs-root data/carla_alpamayo_4c_py123d/logs/carla_train/<clip_dir> \
+  --output-dir /tmp/pyav_verify_one_clip \
+  --overwrite \
+  --max-logs 1
 ```
 
+CoCについては、形式としては対応しています。ただしCoCのmeta-action/keyframe pipelineは短いclipを落とすため、目安として17.5秒未満のclipはCoCラベリング対象から外れる可能性があります。
+
+---
 
 ## スクリプト構成
 
-| ファイル | 実行場所 | 役割 |
-|--------|--------|------|
-| [scripts/local/export_missing_manifest.sh](scripts/local/export_missing_manifest.sh) | **Polaris** | 1TBクリップをスキャンし未収集リスト(52KB)を凍結出力 |
-| [scripts/local/collect_missing_local.sh](scripts/local/collect_missing_local.sh) | オンプレ | 凍結リスト → バッチ生成 → 収集起動のオーケストレーター |
-| [scripts/local/collect_local_parallel.sh](scripts/local/collect_local_parallel.sh) | オンプレ | N_WORKERS 並列 CARLA+client エンジン（ファイルベースキュー） |
-| [scripts/tools/find_missing_routes.py](scripts/tools/find_missing_routes.py) | Polaris | 完全クリップのないルートを特定（フルデータスキャン） |
-| [scripts/tools/build_route_batches.py](scripts/tools/build_route_batches.py) | 両方 | ルートをtown別バッチXMLにグループ化 |
+| ファイル | 役割 |
+|--------|------|
+| [scripts/local/collect_missing_local.sh](scripts/local/collect_missing_local.sh) | manifest検証、batch生成、並列収集起動 |
+| [scripts/local/collect_local_parallel.sh](scripts/local/collect_local_parallel.sh) | N_WORKERS並列のCARLA+client実行 |
+| [scripts/tools/validate_route_manifest.py](scripts/tools/validate_route_manifest.py) | 不正routeの事前除外 |
+| [scripts/tools/build_route_batches.py](scripts/tools/build_route_batches.py) | route XMLをtown別batch XMLに変換 |
+| [scripts/export_py123d_to_pai.py](scripts/export_py123d_to_pai.py) | Py123D ArrowログをPAI/PyAV形式へ変換 |
 
 ### ログ構成
 
-```
+```text
 logs/local_collection/<timestamp>/
-  batch_manifest.txt        # バッチXMLパス一覧
-  routes_filtered.txt       # 未収集ルートパス一覧
-  summary.jsonl             # 全バッチの成功/失敗レコード
-  failed_batches.txt        # 失敗したバッチのパス
-  worker_00.log             # ワーカー0の進捗ログ
-  server_00.log             # ワーカー0のCARLAサーバログ
-  client_00.log             # ワーカー0のクライアントログ
-  carla_saved_00/           # ワーカー0のCARLA Savedディレクトリ
-  ...（worker_01, 02 も同様）
+  batch_manifest.txt
+  routes_filtered.txt
+  routes_filtered.raw.txt
+  invalid_routes_lt2_waypoints.txt
+  route_validation_summary.txt
+  summary.jsonl
+  failed_batches.txt
+  worker_00.log
+  server_00.log
+  client_00.log
+  carla_saved_00/
+  batches/
 ```

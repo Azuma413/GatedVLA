@@ -138,30 +138,34 @@ class BaseAgent:
         )
 
         # --- LiDAR ---
-        input_data["lidar"] = common_utils.lidar_to_ego_coordinate(
-            self.config_expert.lidar_rot_1,
-            self.config_expert.lidar_pos_1,
-            input_data["lidar1"],
-        )
-        if self.config_expert.use_two_lidars:
-            input_data["lidar"] = np.concatenate(
-                (
-                    input_data["lidar"],
-                    common_utils.lidar_to_ego_coordinate(
-                        self.config_expert.lidar_rot_2,
-                        self.config_expert.lidar_pos_2,
-                        input_data["lidar2"],
-                    ),
-                ),
-                axis=0,
+        if self.config_expert.py123d_disable_lidar:
+            input_data["lidar"] = np.empty((0, 3), dtype=np.float32)
+            original_lidar_num_points = 0
+        else:
+            input_data["lidar"] = common_utils.lidar_to_ego_coordinate(
+                self.config_expert.lidar_rot_1,
+                self.config_expert.lidar_pos_1,
+                input_data["lidar1"],
             )
-        lidar_x, lidar_y = input_data["lidar"][:, 0], input_data["lidar"][:, 1]
-        # Remove lidar points inside ego bounding boxes. We already need LiDAR for expert.
-        input_data["lidar"] = input_data["lidar"][
-            (np.abs(lidar_x) > self.config_expert.ego_extent_x)
-            & (np.abs(lidar_y) > self.config_expert.ego_extent_y)
-        ]
-        original_lidar_num_points = input_data["lidar"].shape[0]
+            if self.config_expert.use_two_lidars:
+                input_data["lidar"] = np.concatenate(
+                    (
+                        input_data["lidar"],
+                        common_utils.lidar_to_ego_coordinate(
+                            self.config_expert.lidar_rot_2,
+                            self.config_expert.lidar_pos_2,
+                            input_data["lidar2"],
+                        ),
+                    ),
+                    axis=0,
+                )
+            lidar_x, lidar_y = input_data["lidar"][:, 0], input_data["lidar"][:, 1]
+            # Remove lidar points inside ego bounding boxes. We already need LiDAR for expert.
+            input_data["lidar"] = input_data["lidar"][
+                (np.abs(lidar_x) > self.config_expert.ego_extent_x)
+                & (np.abs(lidar_y) > self.config_expert.ego_extent_y)
+            ]
+            original_lidar_num_points = input_data["lidar"].shape[0]
 
         # --- Radar ---
         if self.config_expert.use_radars:
@@ -202,7 +206,10 @@ class BaseAgent:
 
         # Remove lidar points on ground
         lidar_x, lidar_y = input_data["lidar"][:, 0], input_data["lidar"][:, 1]
-        if self.config_expert.save_only_non_ground_lidar:
+        if (
+            self.config_expert.save_only_non_ground_lidar
+            and not self.config_expert.py123d_disable_lidar
+        ):
             ground_mask = ransac.remove_ground(
                 input_data["lidar"],
                 self.config_expert,
@@ -219,7 +226,10 @@ class BaseAgent:
                     ~radar_ground_mask[: self.radar_pc_queue[-1].shape[0]]
                 ]  # Filter out ground points from the latest radar pc
 
-        if self.config_expert.save_lidar_only_inside_bev:
+        if (
+            self.config_expert.save_lidar_only_inside_bev
+            and not self.config_expert.py123d_disable_lidar
+        ):
             lidar_x, _lidar_y, lidar_z = (
                 input_data["lidar"][:, 0],
                 input_data["lidar"][:, 1],

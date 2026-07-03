@@ -447,7 +447,7 @@ class ExpertData(ExpertBase):
                 self.config_expert,
                 perturbation_rotation=self.perturbation_rotation,
                 perturbation_translation=self.perturbation_translation,
-                lidar=True,
+                lidar=not self.config_expert.py123d_disable_lidar,
                 perturbate=self.config_expert.perturbate_sensors,
                 sensor_agent=False,
                 radar=self.config_expert.use_radars,
@@ -1503,10 +1503,17 @@ class ExpertData(ExpertBase):
                         lane_type=carla.libcarla.LaneType.Any,
                     )
 
-                    next_wps = expert_utils.wps_next_until_lane_end(vehicle_wp)
-                    next_lane_wps = next_wps[-1].next(1)
-                    if len(next_lane_wps) == 0:
-                        next_lane_wps = [next_wps[-1]]
+                    next_wps = (
+                        expert_utils.wps_next_until_lane_end(vehicle_wp)
+                        if vehicle_wp is not None
+                        else []
+                    )
+                    if next_wps:
+                        next_lane_wps = next_wps[-1].next(1)
+                        if len(next_lane_wps) == 0:
+                            next_lane_wps = [next_wps[-1]]
+                    else:
+                        next_lane_wps = []
 
                     next_next_wps = []
                     for wp in next_lane_wps:

@@ -53,10 +53,12 @@ CHUNK=${CHUNK:-2}
 
 N_WORKERS=${N_WORKERS:-3}          # parallel CARLA+client pairs (= GPUs used)
 N_GPUS=${N_GPUS:-${N_WORKERS}}
+GPU_IDS=${GPU_IDS:-}
 BASE_PORT=${BASE_PORT:-2000}
 OUTPUT_ROOT=${OUTPUT_ROOT:-data}
 QUALITY_LEVEL=${QUALITY_LEVEL:-Epic}
 MAX_RETRIES=${MAX_RETRIES:-2}
+RETRY_RESTART_DELAY=${RETRY_RESTART_DELAY:-5}
 CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-7200}
 CARLA_READY_TIMEOUT=${CARLA_READY_TIMEOUT:-180}
 LAUNCH=${LAUNCH:-0}
@@ -68,6 +70,7 @@ WORK=${WORK:-logs/local_collection/$(date +%Y%m%d_%H%M%S)}
 # ---------------------------------------------------------------------------
 FIND_MISSING="${REPO_DIR}/scripts/tools/find_missing_routes.py"
 BUILD_BATCHES="${REPO_DIR}/scripts/tools/build_route_batches.py"
+VALIDATE_MANIFEST="${REPO_DIR}/scripts/tools/validate_route_manifest.py"
 COLLECT_SH="${REPO_DIR}/scripts/local/collect_local_parallel.sh"
 
 # Python: prefer repo venv.
@@ -94,6 +97,7 @@ CARLA_BIN=${CARLA_BIN:-}
 # Pre-flight checks
 # ---------------------------------------------------------------------------
 [ -f "${BUILD_BATCHES}" ] || { echo "ERROR: ${BUILD_BATCHES} not found" >&2; exit 2; }
+[ -f "${VALIDATE_MANIFEST}" ] || { echo "ERROR: ${VALIDATE_MANIFEST} not found" >&2; exit 2; }
 [ -f "${COLLECT_SH}" ]    || { echo "ERROR: ${COLLECT_SH} not found" >&2; exit 2; }
 [ -x "${VENV_PYTHON}" ]   || { echo "ERROR: Python not found: ${VENV_PYTHON}" >&2; exit 2; }
 
@@ -119,8 +123,10 @@ else
     echo "TARGET        = ${TARGET}  (scanning full dataset via find_missing_routes)"
 fi
 echo "CHUNK         = ${CHUNK} routes/batch"
-echo "N_WORKERS     = ${N_WORKERS} (GPUs: 0..$((N_GPUS-1)))"
+echo "N_WORKERS     = ${N_WORKERS} (GPU_IDS: ${GPU_IDS:-0..$((N_GPUS-1))})"
 echo "QUALITY_LEVEL = ${QUALITY_LEVEL}"
+echo "MAX_RETRIES   = ${MAX_RETRIES}"
+echo "RETRY_DELAY   = ${RETRY_RESTART_DELAY}"
 echo "OUTPUT_ROOT   = ${OUTPUT_ROOT}"
 echo "WORK          = ${WORK}"
 echo "LAUNCH        = ${LAUNCH}"
@@ -130,6 +136,8 @@ echo ""
 # Step 1: Resolve the missing-route list
 # ---------------------------------------------------------------------------
 MISSING="${WORK}/routes_filtered.txt"
+INVALID_ROUTES="${WORK}/invalid_routes_lt2_waypoints.txt"
+VALIDATION_SUMMARY="${WORK}/route_validation_summary.txt"
 if [ -n "${MISSING_LIST}" ]; then
     # On-prem: use the frozen list as-is (no dataset scan).
     cp "${MISSING_LIST}" "${MISSING}"
@@ -140,12 +148,28 @@ else
         --out "${MISSING}"
 fi
 
+RAW_MISSING="${WORK}/routes_filtered.raw.txt"
+cp "${MISSING}" "${RAW_MISSING}"
+"${VENV_PYTHON}" "${VALIDATE_MANIFEST}" \
+    --routes-file "${RAW_MISSING}" \
+    --valid-out "${MISSING}" \
+    --invalid-out "${INVALID_ROUTES}" \
+    --summary-out "${VALIDATION_SUMMARY}" \
+    --min-waypoints 2
+
+n_missing_raw=$(grep -c '[^[:space:]]' "${RAW_MISSING}" || true)
 n_missing=$(grep -c '[^[:space:]]' "${MISSING}" || true)
+n_invalid=$(grep -c '[^[:space:]]' "${INVALID_ROUTES}" || true)
+echo "Routes before validation: ${n_missing_raw}"
+echo "Routes after validation : ${n_missing}"
+echo "Excluded invalid routes : ${n_invalid}  (${INVALID_ROUTES})"
+echo ""
+
 if [ "${n_missing}" -eq 0 ]; then
-    echo ">> Nothing missing — list is empty."
+    echo ">> Nothing missing — list is empty after validation."
     exit 0
 fi
-echo "Missing routes: ${n_missing}"
+echo "Missing routes to collect: ${n_missing}"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -231,10 +255,12 @@ echo ""
 ROUTES_FILE="${WORK}/batch_manifest.txt" \
 N_WORKERS="${N_WORKERS}" \
 N_GPUS="${N_GPUS}" \
+GPU_IDS="${GPU_IDS}" \
 BASE_PORT="${BASE_PORT}" \
 OUTPUT_ROOT="${OUTPUT_ROOT}" \
 QUALITY_LEVEL="${QUALITY_LEVEL}" \
 MAX_RETRIES="${MAX_RETRIES}" \
+RETRY_RESTART_DELAY="${RETRY_RESTART_DELAY}" \
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT}" \
 CARLA_READY_TIMEOUT="${CARLA_READY_TIMEOUT}" \
 CARLA_BIN="${CARLA_BIN}" \

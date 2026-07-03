@@ -316,6 +316,14 @@ class PrivilegedRoutePlanner:
                 the neighboring lane, while a value of 0.0 means the route will stay in the center of
                 the current lane.
         """
+        n_route_waypoints = len(self.route_waypoints)
+        if n_route_waypoints == 0:
+            return
+        start_index = max(0, min(start_index, n_route_waypoints - 1))
+        end_index = max(start_index, min(end_index, n_route_waypoints))
+        if start_index >= end_index:
+            return
+
         for idx in range(start_index, end_index):
             # Get the location of the left / right center lane
             if shift_to_left_lane:

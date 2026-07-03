@@ -296,6 +296,13 @@ class LeaderboardEvaluator(object):
         # Prepare the statistics of the route
         route_name = f"{config.name}_rep{config.repetition_index}"
         self.statistics_manager.create_route_data(route_name, config.index)
+        now = datetime.now()
+        route_string = pathlib.Path(args.routes).stem + '_'
+        route_string += f'route{config.index}'
+        route_date_string = route_string + '_' + '_'.join(
+            map(lambda x: '%02d' % x, (now.month, now.day, now.hour, now.minute, now.second))
+        )
+        os.environ["ROUTE_INDEX"] = route_date_string
 
         print("\033[1m> Loading the world\033[0m")
 
@@ -319,7 +326,7 @@ class LeaderboardEvaluator(object):
             print(f"\n{traceback.format_exc()}\033[0m")
 
             entry_status, crash_message = FAILURE_MESSAGES["Simulation"]
-            self._register_statistics(config.index, entry_status, crash_message)
+            self._register_statistics(route_date_string, config.index, entry_status, crash_message)
             self._cleanup()
             return True
 
@@ -327,15 +334,6 @@ class LeaderboardEvaluator(object):
 
         # Set up the user's agent, and the timer to avoid freezing the simulation
         try:
-            now = datetime.now()
-            # route_string = pathlib.Path(os.environ.get('ROUTES', '')).stem + '_'
-            route_string = pathlib.Path(args.routes).stem + '_'
-            route_string += f'route{config.index}'
-            route_date_string = route_string + '_' + '_'.join(
-                map(lambda x: '%02d' % x, (now.month, now.day, now.hour, now.minute, now.second))
-            )
-            os.environ["ROUTE_INDEX"] = route_date_string
-
             self._agent_watchdog = Watchdog(args.timeout)
             self._agent_watchdog.start()
             agent_class_name = getattr(self.module_agent, 'get_entry_point')()
