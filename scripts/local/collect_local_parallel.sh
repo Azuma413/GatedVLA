@@ -265,6 +265,7 @@ process_batch() {
     local carla_saved="${JOB_ROOT}/carla_saved_$(printf '%02d' "${worker_id}")"
 
     mkdir -p "${carla_saved}"
+    touch "${server_log}" "${client_log}"
 
     local batch_status=1
     local attempt
@@ -323,6 +324,18 @@ process_batch() {
                 local client_stat=""
                 client_stat=$(ps -p "${client_pid}" -o stat= 2>/dev/null || true)
                 if [ -z "${client_stat}" ] || [[ "${client_stat}" == Z* ]]; then
+                    break
+                fi
+                local carla_stat=""
+                carla_stat=$(ps -p "${_CARLA_PID}" -o stat= 2>/dev/null || true)
+                if [ -z "${carla_stat}" ] || [[ "${carla_stat}" == Z* ]]; then
+                    reason="carla_exited"
+                    log "[w${worker_id}] CARLA exited while client was running" >&2
+                    kill "${client_pid}" 2>/dev/null || true
+                    sleep 2
+                    kill -9 "${client_pid}" 2>/dev/null || true
+                    wait "${client_pid}" 2>/dev/null
+                    client_status=126
                     break
                 fi
                 fatal_reason=$(classify_client_log "${client_log}" "${client_log_start}" 2>/dev/null)
@@ -390,6 +403,10 @@ process_batch() {
 
     if [ "${batch_status}" -ne 0 ]; then
         printf '%s\n' "${batch_path}" >> "${JOB_ROOT}/failed_batches.txt"
+    fi
+    if [ "${batch_status}" -ne 0 ]; then
+        log "[w${worker_id}] Cooling down ${RETRY_RESTART_DELAY}s after failed batch" >&2
+        sleep "${RETRY_RESTART_DELAY}"
     fi
     return "${batch_status}"
 }
