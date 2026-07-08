@@ -45,6 +45,7 @@ class ModeConfig:
         use_py123d: bool = False,
         is_plant: bool = False,
         is_alpamayo: bool = False,
+        is_vlajepa: bool = False,
     ) -> tuple[LeaderboardType, str, str, str | None, str]:
         """Get mode configuration based on CLI arguments.
 
@@ -105,6 +106,15 @@ class ModeConfig:
             return (
                 _resolve_leaderboard_type(),
                 "lead/inference/alpamayo_agent.py",
+                checkpoint,
+                checkpoint,
+                "SENSORS",
+            )
+
+        if is_vlajepa:
+            return (
+                _resolve_leaderboard_type(),
+                "lead/inference/vlajepa_agent.py",
                 checkpoint,
                 checkpoint,
                 "SENSORS",
@@ -408,6 +418,7 @@ class LeaderboardWrapper:
                 use_py123d=self.args.py123d if hasattr(self.args, "py123d") else False,
                 is_plant=getattr(self.args, "plant", False),
                 is_alpamayo=getattr(self.args, "alpamayo", False),
+                is_vlajepa=getattr(self.args, "vlajepa", False),
             )
         )
         self.leaderboard_type = leaderboard_type
@@ -629,6 +640,15 @@ Examples:
         "--alpamayo",
         action="store_true",
         help="Use lead/inference/alpamayo_agent.py with SENSORS track (requires --checkpoint)",
+    )
+    parser.add_argument(
+        "--vlajepa",
+        action="store_true",
+        help=(
+            "Use lead/inference/vlajepa_agent.py with SENSORS track. Connects to a "
+            "VLA-JEPA policy server (VLAJEPA_SERVER_HOST/PORT); --checkpoint is a "
+            "placeholder label, the model lives on the server."
+        ),
     )
 
     # Py123D option for expert mode

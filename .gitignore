@@ -200,6 +200,7 @@ outputs
 uv.lock
 data/carla_*
 data/polaris_smoke/
+data/lerobot/
 
 .carla_wheels
 

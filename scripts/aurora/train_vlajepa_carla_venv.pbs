@@ -1,0 +1,67 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=1:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_train_vlajepa_carla_venv.out
+
+# Train VLA-JEPA on the CARLA (PAI->LeRobot) dataset on Aurora Intel XPU using the
+# native `frameworks` module (torch 2.10+xpu) + a venv of the extra deps. The
+# generic IPEX container cannot see Aurora's XPUs (driver mismatch), so we run
+# natively. Short smoke by default; override via qsub -v.
+#   qsub -v MAX_STEPS=30000,NPROC=12,BS=1 scripts/aurora/train_vlajepa_carla_venv.pbs
+# NB: no `set -u` (Aurora lmod init references unbound vars).
+set -eo pipefail
+
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+VENV=${VENV:-${REPO_DIR}/outputs/vlajepa_venv}
+NPROC=${NPROC:-1}          # total XPU ranks (tiles). 1 node has 12 tiles.
+PPN=${PPN:-${NPROC}}       # ranks per node (<=12)
+MAX_STEPS=${MAX_STEPS:-5}
+BS=${BS:-1}
+CONFIG=${CONFIG:-scripts/config/vlajepa_carla_ft.yaml}
+
+module use /soft/modulefiles
+module load frameworks
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+
+# Aurora XPU: autocast device, xccl-over-mpiexec bootstrap, offline HF.
+export VLAJEPA_AMP_DEVICE=xpu
+export VLAJEPA_XPU_MPI=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_DIR}/3rd_party/VLA-JEPA:${PYTHONPATH:-}"
+
+cd "${REPO_DIR}/3rd_party/VLA-JEPA"
+mkdir -p "${REPO_DIR}/logs" "${REPO_DIR}/outputs/vlajepa_carla"
+
+echo "[$(date -u '+%FT%TZ')] Training VLA-JEPA/CARLA (Aurora XPU, xccl) NPROC=${NPROC} PPN=${PPN} MAX_STEPS=${MAX_STEPS} BS=${BS}"
+
+# Aurora distributed = mpiexec + xccl, per ALCF docs (data-science/frameworks/
+# pytorch). --pmi=pmix is required for the oneCCL/xccl KVS; --envall propagates our
+# env (VLAJEPA_XPU_MPI, PYTHONPATH, HF offline, venv) to every rank. train_starvla's
+# VLAJEPA_XPU_MPI bootstrap derives rank/size via mpi4py and inits the xccl group;
+# accelerate reuses it. Model/data paths override the yaml's container paths.
+# CPU affinity (12 tiles, 2 sockets x 4 cores/rank) — only applied for the full node.
+CPU_BIND="verbose,list:4-7:8-11:12-15:16-19:20-23:24-27:56-59:60-63:64-67:68-71:72-75:76-79"
+CPU_BIND_ARG=""
+[ "${PPN}" = "12" ] && CPU_BIND_ARG="--cpu-bind=${CPU_BIND}"
+
+# shellcheck disable=SC2086
+mpiexec --pmi=pmix --envall -n "${NPROC}" -ppn "${PPN}" ${CPU_BIND_ARG} \
+  "${VENV}/bin/python" -u starVLA/training/train_starvla.py \
+  --config_yaml "${CONFIG}" \
+  --run_root_dir="${REPO_DIR}/outputs/vlajepa_carla" \
+  --framework.qwenvl.base_vlm="${REPO_DIR}/outputs/models/Qwen3-VL-2B-Instruct" \
+  --framework.vj2_model.base_encoder="${REPO_DIR}/outputs/models/vjepa2-vitl-fpc64-256" \
+  --datasets.vla_data.data_root_dir="${REPO_DIR}/data/lerobot" \
+  --datasets.vla_data.per_device_batch_size="${BS}" \
+  --trainer.max_train_steps="${MAX_STEPS}" \
+  --trainer.save_interval="${MAX_STEPS}" \
+  --trainer.num_warmup_steps=0
+
+echo "[$(date -u '+%FT%TZ')] === VLA-JEPA/CARLA training (Aurora XPU) done ==="

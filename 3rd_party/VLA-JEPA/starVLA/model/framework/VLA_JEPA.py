@@ -24,6 +24,10 @@ logger = initialize_overwatch(__name__)
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
+# Autocast device type. Aurora (Intel XPU) has no CUDA; set VLAJEPA_AMP_DEVICE=xpu.
+import os as _os
+AMP_DEVICE = _os.environ.get("VLAJEPA_AMP_DEVICE", "cuda")
+
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
@@ -197,7 +201,7 @@ class VLA_JEPA(baseframework):
         embodied_action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor([self.embodied_action_token_id], device=qwen_inputs['input_ids'].device))
         embodied_action_indices = embodied_action_indices.nonzero(as_tuple=True)
         
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(AMP_DEVICE, dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -247,7 +251,7 @@ class VLA_JEPA(baseframework):
             return {"wm_loss": teacher_forcing_wm_loss}
 
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
+        with torch.autocast(AMP_DEVICE, dtype=torch.float32):
             # 标签对齐：取最后 chunk_len 段
             actions = torch.tensor(
                 np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
@@ -270,7 +274,14 @@ class VLA_JEPA(baseframework):
 
             #print(embodied_action_repeated.shape, actions_target_repeated.shape, state_repeated.shape) if state_repeated is not None else print("No state for action model")
             #exit()
-            action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
+            # The action model runs in fp32. On CUDA the fp32 autocast above casts
+            # the bf16 conditioning to fp32; XPU autocast does not support fp32 (it
+            # disables autocast), so cast explicitly to match the fp32 weights.
+            action_loss = self.action_model(
+                embodied_action_repeated.float(),
+                actions_target_repeated.float(),
+                state_repeated.float() if state_repeated is not None else None,
+            )  # (B, chunk_len, action_dim)
 
         return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
 
@@ -316,7 +327,7 @@ class VLA_JEPA(baseframework):
         #embodied_action_indices = ~torch.isin(qwen_inputs['input_ids'], torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device))
         embodied_action_indices = embodied_action_indices.nonzero(as_tuple=True)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(AMP_DEVICE, dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -330,8 +341,13 @@ class VLA_JEPA(baseframework):
 
         state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(embodied_action_tokens, state)  # (B, chunk_len, action_dim)
+        with torch.autocast(AMP_DEVICE, dtype=torch.float32):
+            # See forward(): match the fp32 action-model weights explicitly (XPU has
+            # no fp32 autocast).
+            pred_actions = self.action_model.predict_action(
+                embodied_action_tokens.float(),
+                state.float() if state is not None else None,
+            )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}

@@ -783,7 +783,62 @@ class SingleFrankaRobotiqDeltaJointsDataConfig:
 
 
 
+@dataclass
+class CarlaEgoDataConfig:
+    """CARLA driving (LEAD/PAI -> LeRobot v2.1).
+
+    Four camera views are exposed to the VLM; the two front views (indices 0 and 2:
+    front_wide, front_tele) are used as the V-JEPA world-model views. The action is
+    the ego frame-to-frame local delta [dx, dy, dyaw] (metres, metres, radians),
+    which is O(1) and left unnormalized (StateActionToTensor only). No proprio state.
+    """
+
+    video_keys = [
+        "video.front_wide",
+        "video.cross_left",
+        "video.front_tele",
+        "video.cross_right",
+    ]
+    state_keys: list = field(default_factory=list)
+    action_keys = [
+        "action.dx",
+        "action.dy",
+        "action.dyaw",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+
+    def __init__(self, observation_indices, action_indices):
+        self.observation_indices = observation_indices
+        self.action_indices = action_indices
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.action_keys),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+
 ROBOT_TYPE_CONFIG_MAP = {
+    "carla_ego": CarlaEgoDataConfig,
     "libero_franka": Libero4in1DataConfig,
     "droid_franka": LeRobotDroidDataConfig,
     "fr3_real_world": FR3RealWorldConfig,

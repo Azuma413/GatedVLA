@@ -1,0 +1,49 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=0:20:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_diag_accel.out
+set +e
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+VENV=${VENV:-${REPO_DIR}/outputs/vlajepa_venv}
+module use /soft/modulefiles; module load frameworks
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+export VLAJEPA_AMP_DEVICE=xpu HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_DIR}/3rd_party/VLA-JEPA:${PYTHONPATH:-}"
+cd "${REPO_DIR}/3rd_party/VLA-JEPA"
+
+cat > /tmp/accel_probe.py <<'PY'
+import os, sys, socket
+def log(m):
+    print(f"[rank?] {m}", flush=True)
+log("py start")
+import torch; log(f"torch {torch.__version__}")
+from mpi4py import MPI
+comm = MPI.COMM_WORLD
+rank, world = comm.Get_rank(), comm.Get_size()
+local = int(os.environ.get("PALS_LOCAL_RANKID", rank))
+master = comm.bcast(socket.gethostname() if rank==0 else None, root=0)
+os.environ["MASTER_ADDR"]=f"{master}.hsn.cm.aurora.alcf.anl.gov"; os.environ["MASTER_PORT"]="29500"
+os.environ["RANK"]=str(rank); os.environ["WORLD_SIZE"]=str(world); os.environ["LOCAL_RANK"]=str(local)
+def log(m, _r=rank):
+    print(f"[rank {_r}] {m}", flush=True)
+log(f"mpi world={world} local={local}")
+torch.xpu.set_device(local); log("set_device ok")
+torch.distributed.init_process_group(backend="xccl", rank=rank, world_size=world, device_id=torch.device(f"xpu:{local}")); log("xccl init ok")
+import transformers; log(f"transformers {transformers.__version__}")
+from accelerate import Accelerator, DeepSpeedPlugin; log("import accelerate ok")
+acc = Accelerator(); log(f"Accelerator ok device={acc.device} np={acc.num_processes}")
+from starVLA.model.framework import build_framework; log("import build_framework ok")
+comm.Barrier()
+log("ALL OK")
+PY
+
+echo "########## mpiexec -n 2 accel probe ##########"
+mpiexec --pmi=pmix --envall -n 2 -ppn 2 "${VENV}/bin/python" -u /tmp/accel_probe.py 2>&1 \
+  | grep -viE 'Overriding a previously|dispatch key:|new kernel:|previous kernel:|operator: aten|Warning only once|_validate_compressed|ONEAPI_DEVICE_SELECTOR|Lmod|opencl:gpu|to enable Triton|support@alcf|revert|While processing|frameworks/2025|^ *---------|If you|Module (fullname|Filename)'
+echo "exit: $?"
+echo "########## DONE ##########"

@@ -44,7 +44,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             action_horizon=cfg.framework.action_model.action_horizon,
-            video_horizon=cfg.framework.vj2_model.num_frames)
+            video_horizon=cfg.framework.vj2_model.num_frames,
+            # Driving data has no gripper/position columns for pause-frame removal.
+            delete_pause_frame=vla_dataset_cfg.get("delete_pause_frame", True))
         
         vla_train_dataloader = DataLoader(
             vla_dataset,

@@ -1,0 +1,36 @@
+#!/bin/sh
+#PBS -l select=1
+#PBS -l walltime=1:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_build_vlajepa.out
+
+set -eu
+
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+IMAGE_DIR=${IMAGE_DIR:-${REPO_DIR}/containers}
+
+module use /soft/modulefiles || true
+module load apptainer
+
+export HTTP_PROXY=${HTTP_PROXY:-http://proxy.alcf.anl.gov:3128}
+export HTTPS_PROXY=${HTTPS_PROXY:-http://proxy.alcf.anl.gov:3128}
+export http_proxy=${http_proxy:-${HTTP_PROXY}}
+export https_proxy=${https_proxy:-${HTTPS_PROXY}}
+export APPTAINERENV_HTTP_PROXY=${HTTP_PROXY}
+export APPTAINERENV_HTTPS_PROXY=${HTTPS_PROXY}
+export APPTAINERENV_http_proxy=${HTTP_PROXY}
+export APPTAINERENV_https_proxy=${HTTPS_PROXY}
+export APPTAINER_CACHEDIR=${APPTAINER_CACHEDIR:-${REPO_DIR}/.apptainer/cache}
+export APPTAINER_TMPDIR=${APPTAINER_TMPDIR:-/tmp/${USER}/vla4ad-apptainer}
+
+mkdir -p "${IMAGE_DIR}" "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}" "${REPO_DIR}/logs"
+cd "${REPO_DIR}"
+
+echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Building VLA-JEPA XPU image"
+apptainer build --fakeroot --force "${IMAGE_DIR}/vlajepa.sif" vlajepa.def
+
+echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Done"
+ls -lh "${IMAGE_DIR}/vlajepa.sif"

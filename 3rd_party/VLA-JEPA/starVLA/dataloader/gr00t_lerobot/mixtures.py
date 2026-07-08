@@ -12,6 +12,13 @@ from typing import Dict, List, Tuple
 ## {nakename: [(data_name, sampling_weight, robot_type)] }
 DATASET_NAMED_MIXTURES = {
 
+    # CARLA driving (LEAD/PAI -> LeRobot v2.1). Action = ego frame-to-frame
+    # deltas [dx, dy, dyaw]. data_name "carla_lerobot" is the subdir under
+    # datasets.vla_data.data_root_dir.
+    "carla_ego": [
+        ("carla_lerobot", 1.0, "carla_ego"),
+    ],
+
     "libero_all": [
         ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),

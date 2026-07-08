@@ -66,6 +66,7 @@ EMBODIMENT_TAG_MAPPING = {
 # Robot type to embodiment tag mapping
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "libero_franka": EmbodimentTag.FRANKA,
+    "carla_ego": EmbodimentTag.NEW_EMBODIMENT,
     "oxe_droid": EmbodimentTag.OXE_DROID,
     "oxe_bridge": EmbodimentTag.OXE_BRIDGE,
     "oxe_rt1": EmbodimentTag.OXE_RT1,

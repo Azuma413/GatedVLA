@@ -18,9 +18,16 @@ import random
 from typing import Any, ClassVar
 
 import numpy as np
-import pytorch3d.transforms as pt
 import torch
 from pydantic import Field, PrivateAttr, field_validator, model_validator
+
+# pytorch3d is only needed by RotationTransform (rotation_6d / axis_angle target
+# rotations). CARLA driving uses no rotation transforms, and pytorch3d has no XPU
+# build, so import it lazily to keep the dataloader importable in vlajepa.sif.
+try:
+    import pytorch3d.transforms as pt
+except ImportError:  # pragma: no cover
+    pt = None
 
 from ..schema import DatasetMetadata, RotationType, StateActionMetadata
 from .base import InvertibleModalityTransform, ModalityTransform

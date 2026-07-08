@@ -1,0 +1,67 @@
+#!/bin/sh
+#PBS -l select=1
+#PBS -l walltime=1:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_prepare_data_vlajepa.out
+
+# Prepare the VLA-JEPA CARLA training data on an Aurora compute node (login nodes
+# have user namespaces disabled, so apptainer must run under PBS).
+#
+#   1. 123D logs -> PAI      (export_py123d_to_pai.py, in lead.sif, CPU only)
+#   2. PAI       -> LeRobot  (pai_to_lerobot.py,       in lead.sif, CPU only)
+#
+# Both run inside lead.sif (no --nv needed). Override paths via qsub -v.
+set -eu
+
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+LEAD_SIF=${LEAD_SIF:-${REPO_DIR}/containers/lead.sif}
+LOGS_ROOT=${LOGS_ROOT:-data/carla_alpamayo_4c_py123d}
+PAI_DIR=${PAI_DIR:-data/carla_alpamayo_pai}
+LEROBOT_DIR=${LEROBOT_DIR:-data/lerobot/carla_lerobot}
+SKIP_EXPORT=${SKIP_EXPORT:-0}   # set 1 if PAI already exists
+# carla_train には数千クリップあるので、検証時は少数だけ変換する。
+# 全件変換したい場合は MAX_LOGS=0 (=無制限) を渡す。
+MAX_LOGS=${MAX_LOGS:-8}
+
+module use /soft/modulefiles || true
+module load apptainer
+
+cd "${REPO_DIR}"
+mkdir -p logs "$(dirname "${LEROBOT_DIR}")"
+
+THREAD_ENV="--env OPENBLAS_NUM_THREADS=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env NUMEXPR_NUM_THREADS=1"
+
+MAXLOGS_ARG=""
+if [ "${MAX_LOGS}" != "0" ]; then
+  MAXLOGS_ARG="--max-logs ${MAX_LOGS}"
+fi
+
+if [ "${SKIP_EXPORT}" != "1" ]; then
+  echo "[$(date -u '+%FT%TZ')] Step 1: 123D -> PAI (max_logs=${MAX_LOGS})"
+  # shellcheck disable=SC2086
+  apptainer exec ${THREAD_ENV} \
+    -B "${REPO_DIR}:/workspace/VLA4AD_Research" \
+    "${LEAD_SIF}" \
+    lead-python scripts/export_py123d_to_pai.py \
+      --logs-root "${LOGS_ROOT}" \
+      --output-dir "${PAI_DIR}" \
+      --split train \
+      ${MAXLOGS_ARG} \
+      --overwrite
+fi
+
+echo "[$(date -u '+%FT%TZ')] Step 2: PAI -> LeRobot v2.1"
+# shellcheck disable=SC2086
+apptainer exec ${THREAD_ENV} \
+  -B "${REPO_DIR}:/workspace/VLA4AD_Research" \
+  "${LEAD_SIF}" \
+  lead-python scripts/pai_to_lerobot.py \
+    --pai-dir "${PAI_DIR}" \
+    --output-dir "${LEROBOT_DIR}" \
+    --overwrite
+
+echo "[$(date -u '+%FT%TZ')] === data prep done ==="
+ls -la "${LEROBOT_DIR}/meta" || true
