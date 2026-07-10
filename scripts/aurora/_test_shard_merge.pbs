@@ -1,0 +1,56 @@
+#!/bin/sh
+#PBS -l select=1
+#PBS -l walltime=0:30:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_test_shard_merge.out
+set -eu
+REPO_DIR=/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research
+cd "$REPO_DIR"
+module use /soft/modulefiles || true
+module load apptainer
+SIF=containers/lead.sif
+TE="--env OPENBLAS_NUM_THREADS=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env NUMEXPR_NUM_THREADS=1"
+N=12            # total clips
+SHARDS=3        # -> 4 clips/shard
+SER=data/_pai_val_serial
+SHR=data/_pai_val_shards
+MRG=data/_pai_val_merged
+rm -rf "$SER" "$SHR" "$MRG"
+mkdir -p "$SHR"
+
+echo "=== serial reference ($N clips) ==="
+apptainer exec $TE -B "$REPO_DIR:/workspace/VLA4AD_Research" "$SIF" \
+  lead-python scripts/export_py123d_to_pai.py \
+    --logs-root data/carla_alpamayo_4c_py123d --output-dir "$SER" \
+    --split train --max-logs $N --overwrite > logs/_val_serial.log 2>&1
+tail -1 logs/_val_serial.log
+
+echo "=== $SHARDS shards (parallel) ==="
+apptainer exec $TE -B "$REPO_DIR:/workspace/VLA4AD_Research" "$SIF" bash -c '
+  set -u
+  for i in $(seq 0 '"$((SHARDS-1))"'); do
+    sdir=$(printf "'"$SHR"'/shard_%04d" "$i")
+    lead-python scripts/export_py123d_to_pai.py \
+      --logs-root data/carla_alpamayo_4c_py123d --output-dir "$sdir" \
+      --split train --max-logs '"$N"' --num-shards '"$SHARDS"' --shard-index "$i" \
+      --overwrite > "'"$SHR"'/s_$(printf %04d $i).log" 2>&1 &
+  done
+  wait
+  echo "shards done"
+'
+
+echo "=== merge ==="
+apptainer exec $TE -B "$REPO_DIR:/workspace/VLA4AD_Research" "$SIF" \
+  lead-python scripts/merge_pai_shards.py \
+    --shard-root "$SHR" --output-dir "$MRG" --num-shards $SHARDS --overwrite
+
+echo "=== validate ==="
+apptainer exec $TE -B "$REPO_DIR:/workspace/VLA4AD_Research" "$SIF" \
+  lead-python scripts/_validate_pai_merge.py "$SER" "$MRG"
+
+echo "=== cleanup scratch ==="
+rm -rf "$SER" "$SHR" "$MRG"
+echo "=== test done ==="

@@ -8,12 +8,13 @@ and the batching changed across campaigns (CHUNK 24 -> 12 -> 10), so the same
 <batch>_route<idx> means different routes in different campaigns.  We therefore
 resolve each clip by the campaign that was live at the clip's timestamp.
 
-"Complete" = has all 4 cameras + lidar + ego_state + sync arrow files.
+"Complete" = has all 4 cameras + ego_state + sync arrow files.  (lidar is
+intentionally absent in part of the dataset and is not required.)
 
 Prints, to --out, the route XML paths (one per line) from the target set that
 have no complete clip.  Use that file to drive build_route_batches.py.
 """
-import argparse, os, re, glob, datetime, sys
+import argparse, os, re, glob, datetime, sys, json
 import xml.etree.ElementTree as ET
 
 REPO = os.environ.get("REPO_DIR", "/lus/eagle/projects/RobustViT/hiratsuka/VLA4AD_Research")
@@ -21,7 +22,7 @@ CAMP_DIR = os.path.join(REPO, "logs/production_collection")
 CLIP_DIR = os.path.join(REPO, "data/carla_alpamayo_4c_py123d/logs/carla_train")
 
 REQUIRED = ["camera.ftcam_f0.arrow", "camera.ftcam_l0.arrow", "camera.ftcam_r0.arrow",
-            "camera.ftcam_tele_f0.arrow", "lidar.lidar_top.arrow",
+            "camera.ftcam_tele_f0.arrow",
             "ego_state_se3.arrow", "sync.arrow"]
 CLIP_RE = re.compile(r'^(?P<town>Town[0-9A-Za-z]+)_Rep-?-?\d+_(?P<batch>.+)_route(?P<idx>\d+)_(?P<ts>\d{2}_\d{2}_\d{2}_\d{2}_\d{2})$')
 
@@ -45,6 +46,18 @@ def load_campaigns():
     return camps
 
 
+def route_id_from_json(json_path):
+    """Return route id (e.g. 'route_000924') from a clip's sibling summary json,
+    or None if the json is absent/unreadable or lacks a route_id."""
+    try:
+        with open(json_path) as f:
+            raw = json.load(f).get("route_id", "")
+    except (OSError, ValueError):
+        return None
+    m = re.search(r'route_\d+', raw)
+    return m.group(0) if m else None
+
+
 def collected_complete_ids(camps, year):
     def camp_for(ts):
         chosen = None
@@ -61,6 +74,14 @@ def collected_complete_ids(camps, year):
         if not os.path.isdir(p):
             continue
         if not all(os.path.isfile(os.path.join(p, f)) for f in REQUIRED):
+            continue
+        # Authoritative source: the clip's sibling <name>.json records route_id.
+        # Prefer it over the campaign-batch reverse lookup, which resolves to the
+        # wrong route for clips collected after the last campaign snapshot present
+        # in logs/production_collection (e.g. the carla_train_sub back-fill).
+        rid = route_id_from_json(p + ".json")
+        if rid:
+            ids.add(rid)
             continue
         m = CLIP_RE.match(d)
         if not m:

@@ -1,0 +1,152 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=6:00:00
+#PBS -q capacity
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_coc_parallel.out
+
+# Parallel CoC labeling that uses a WHOLE Aurora node: NSERVERS tile-local 8B vLLM
+# servers (ports BASE_PORT+i, one XPU tile each) + NSERVERS sharded CoC clients in
+# containers/coc_autolabeler.sif, all writing the same resumable RESUME_DIR. ~NSERVERS x
+# the single-tile throughput for the same node-hours (Aurora bills per node).
+#
+# Requires prep done first (meta+keyframe+video), i.e. the keyframe segment json exists:
+#   qsub -q capacity -v STAGE=prep,PAI_DIR=data/carla_alpamayo_pai,\
+#        WORK=outputs/coc_autolabel_aurora_full,COC_MODEL=qwen3_vl_8b scripts/aurora/coc_autolabel.pbs
+# Then:
+#   qsub scripts/aurora/coc_autolabel_parallel.pbs         # full dataset, 12 tiles
+#   qsub -v NSERVERS=2,PAI_DIR=data/carla_alpamayo_pai_verify,\
+#        WORK=outputs/coc_autolabel_aurora,RESUME_DIR=outputs/coc_autolabel_aurora/par_test \
+#        -q debug -l walltime=1:00:00 scripts/aurora/coc_autolabel_parallel.pbs   # small test
+# Re-submit to resume (RESUME_DIR skips finished segments).
+# NB: no `set -u` (Aurora lmod init references unbound vars).
+set -eo pipefail
+
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+WS=/workspace/VLA4AD_Research
+COC_SIF=${COC_SIF:-${REPO_DIR}/containers/coc_autolabeler.sif}
+COC_MODEL=qwen3_vl_8b                                  # 1-tile model (TP=1, no Ray)
+MODEL_DIR=Qwen3-VL-8B-Instruct
+MODEL_NAME_SERVED=Qwen/Qwen3-VL-8B-Instruct
+MODEL_PATH=${MODEL_PATH:-${REPO_DIR}/outputs/models/${MODEL_DIR}}
+MODEL_ARCH=Qwen3VLForConditionalGeneration
+NSERVERS=${NSERVERS:-12}                               # tiles per node
+BASE_PORT=${BASE_PORT:-50000}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
+MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-32}
+PAI_DIR=${PAI_DIR:-data/carla_alpamayo_pai}
+WORK=${WORK:-outputs/coc_autolabel_aurora_full}
+RESUME_DIR=${RESUME_DIR:-outputs/coc_autolabel_aurora_full/coc_labels_8b}
+export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-${REPO_DIR}/outputs/vllm_cache}
+
+cd "${REPO_DIR}"
+mkdir -p logs "${VLLM_CACHE_ROOT}" "logs/aurora_coc_parallel_srv"
+SEG_JSON="${WORK}/keyframes/segments_relative_timestamp_sampled.json"
+SHARD_DIR="${WORK}/shards"
+
+module use /soft/modulefiles
+module load frameworks
+FW_PYTHON=$(command -v python)
+module load apptainer   # for prep + clients (shadows python; servers use FW_PYTHON)
+
+TRAJDATA_PAI=/usr/local/lib/python3.10/dist-packages/trajdata/dataset_specific/pai/pai_dataset.py
+PAI_PATCH_BIND=""
+[ -f "${REPO_DIR}/scripts/aurora/_wa/pai_dataset.patched.py" ] && \
+  PAI_PATCH_BIND="-B ${REPO_DIR}/scripts/aurora/_wa/pai_dataset.patched.py:${TRAJDATA_PAI}"
+
+# Self-contained prep: build meta+keyframe+video once if the keyframe json is absent
+# (CPU, in the sif). Lets one capacity allocation do prep + parallel labeling.
+if [ ! -f "${REPO_DIR}/${SEG_JSON}" ]; then
+  echo "[$(date -u '+%FT%TZ')] keyframe json missing -> running STAGE=prep (meta+keyframe+video)"
+  # shellcheck disable=SC2086
+  apptainer exec --writable-tmpfs -B "${REPO_DIR}:${WS}" ${PAI_PATCH_BIND} \
+    --env STAGE=prep --env MODEL_NAME="${COC_MODEL}" \
+    --env PAI_DIR="${WS}/${PAI_DIR}" --env WORK="${WS}/${WORK}" \
+    --env no_proxy="localhost,127.0.0.1" --env NO_PROXY="localhost,127.0.0.1" \
+    "${COC_SIF}" bash "${WS}/scripts/aurora/coc_autolabel.sh"
+  [ -f "${REPO_DIR}/${SEG_JSON}" ] || { echo "prep did not produce ${SEG_JSON}"; exit 3; }
+fi
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT CCL_PROCESS_LAUNCHER=hydra TMPDIR=/tmp RAY_TMPDIR=/tmp
+export HTTP_PROXY=${HTTP_PROXY:-http://proxy.alcf.anl.gov:3128} HTTPS_PROXY=${HTTPS_PROXY:-http://proxy.alcf.anl.gov:3128}
+export http_proxy=${http_proxy:-${HTTP_PROXY}} https_proxy=${https_proxy:-${HTTPS_PROXY}}
+export no_proxy="localhost,127.0.0.1,${no_proxy:-}" NO_PROXY="${no_proxy}"
+export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-1800}
+
+echo "[$(date -u '+%FT%TZ')] prepopulating modelinfo cache for ${MODEL_ARCH}"
+HF_HUB_OFFLINE=0 "${FW_PYTHON}" "${REPO_DIR}/scripts/aurora/_wa/vllm_build_all_modelinfo_caches.py" \
+  --arch "${MODEL_ARCH}" || { echo "modelinfo prepopulation failed"; exit 6; }
+
+echo "[$(date -u '+%FT%TZ')] splitting segment json into ${NSERVERS} shards"
+"${FW_PYTHON}" "${REPO_DIR}/scripts/aurora/_split_segment_json.py" \
+  --input "${REPO_DIR}/${SEG_JSON}" --num-shards "${NSERVERS}" --out-dir "${REPO_DIR}/${SHARD_DIR}"
+
+# Cap per-process thread pools: 12 vLLM servers each defaulted their rayon/OMP pools
+# to all 208 cores, exhausting the node thread limit -> tokenizers rayon pool panics
+# with EAGAIN ("Resource temporarily unavailable"). Keep pools small.
+export RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-8}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-2}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-2}
+export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+
+# ---- launch NSERVERS tile-local 8B servers, one at a time (launch -> wait ready) ----
+# Serial startup avoids (a) 12x concurrent 16GB Lustre reads and (b) a thread-creation
+# spike; later servers also hit the warm page cache so they load fast.
+declare -a SRV_PIDS=()
+cleanup() {
+  echo "[$(date -u '+%FT%TZ')] stopping ${#SRV_PIDS[@]} servers"
+  for p in "${SRV_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+
+for i in $(seq 0 $((NSERVERS - 1))); do
+  port=$((BASE_PORT + i))
+  # ZE_AFFINITY_MASK is the Level-Zero per-process device filter torch-XPU honors
+  # (ONEAPI_DEVICE_SELECTOR did NOT isolate; with ZE_FLAT_DEVICE_HIERARCHY=FLAT mask=i
+  # exposes tile i as the only device).
+  ZE_AFFINITY_MASK="${i}" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    "${FW_PYTHON}" -m vllm.entrypoints.openai.api_server \
+      --model "${MODEL_PATH}" --served-model-name "${MODEL_NAME_SERVED}" \
+      --port "${port}" --dtype float16 --max-model-len "${MAX_MODEL_LEN}" \
+      --tensor-parallel-size 1 --max-num-seqs 1 --enforce-eager \
+      --limit-mm-per-prompt "{\"image\": ${MM_IMAGE_LIMIT}}" --trust-remote-code \
+      > "logs/aurora_coc_parallel_srv/server_${i}.log" 2>&1 &
+  SRV_PIDS+=($!)
+  ok=0
+  for t in $(seq 1 240); do   # up to 20 min per server
+    if ! kill -0 "${SRV_PIDS[$i]}" 2>/dev/null; then
+      echo "server ${i} died; tail:"; tail -n 30 "logs/aurora_coc_parallel_srv/server_${i}.log"; exit 4
+    fi
+    if curl -s "http://127.0.0.1:${port}/v1/models" 2>/dev/null | grep -q "${MODEL_NAME_SERVED}"; then ok=1; break; fi
+    sleep 5
+  done
+  [ "$ok" = 1 ] || { echo "server ${i} not ready; tail:"; tail -n 60 "logs/aurora_coc_parallel_srv/server_${i}.log"; exit 5; }
+  echo "  server ${i} (:${port}) ready"
+done
+echo "[$(date -u '+%FT%TZ')] all ${NSERVERS} servers ready; launching clients"
+
+# ---- launch NSERVERS sharded CoC clients (apptainer + PAI_PATCH_BIND set above) ----
+declare -a CLI_PIDS=()
+for i in $(seq 0 $((NSERVERS - 1))); do
+  port=$((BASE_PORT + i)); shard=$(printf "%02d" "$i")
+  # shellcheck disable=SC2086
+  apptainer exec --writable-tmpfs -B "${REPO_DIR}:${WS}" ${PAI_PATCH_BIND} \
+    --env STAGE=coc --env MODEL_NAME="${COC_MODEL}" --env SERVER_IP=127.0.0.1 \
+    --env COC_LABELING_MODEL_SERVER_PORT="${port}" \
+    --env PAI_DIR="${WS}/${PAI_DIR}" --env WORK="${WS}/${WORK}" \
+    --env RESUME_DIR="${WS}/${RESUME_DIR}" \
+    --env SEGMENT_JSON="${WS}/${SHARD_DIR}/segments_shard_${shard}.json" \
+    --env no_proxy="localhost,127.0.0.1" --env NO_PROXY="localhost,127.0.0.1" \
+    "${COC_SIF}" bash "${WS}/scripts/aurora/coc_autolabel.sh" \
+    > "logs/aurora_coc_parallel_client_${i}.log" 2>&1 &
+  CLI_PIDS+=($!)
+done
+
+rc=0
+for p in "${CLI_PIDS[@]}"; do wait "$p" || rc=1; done
+echo "[$(date -u '+%FT%TZ')] all clients done (rc=${rc})"
+echo "labels: $(find "${REPO_DIR}/${RESUME_DIR}" -name 'cot_*.yaml' 2>/dev/null | wc -l)"
+exit "${rc}"

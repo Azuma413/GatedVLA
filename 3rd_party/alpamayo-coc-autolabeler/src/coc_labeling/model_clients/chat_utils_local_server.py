@@ -45,8 +45,11 @@ def _resolve_ip_addr(ip_addr: Optional[str]) -> str:
 def completion_with_backoff_local_server(**kwargs: Any) -> Any:
     """Call reasoning endpoint with retry on transient connection issues."""
     ip_addr = _resolve_ip_addr(kwargs.pop("ip_addr", None))
+    # Port is env-configurable so several tile-local vLLM servers can run on one node
+    # (Aurora: 12 tiles => up to 12 servers on 50000..50011 for ~12x throughput).
+    port = os.environ.get("COC_LABELING_MODEL_SERVER_PORT", "50000")
     client = openai.Client(
-        base_url=f"http://{ip_addr}:50000/v1",
+        base_url=f"http://{ip_addr}:{port}/v1",
         api_key="EMPTY",
         timeout=TIMEOUT_MAX,
         max_retries=1,

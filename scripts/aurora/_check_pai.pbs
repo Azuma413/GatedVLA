@@ -1,0 +1,15 @@
+#!/bin/sh
+#PBS -l select=1
+#PBS -l walltime=0:15:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_check_pai.out
+set -eu
+REPO=/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research
+cd "$REPO"; module use /soft/modulefiles || true; module load apptainer
+apptainer exec --env OPENBLAS_NUM_THREADS=1 --env OMP_NUM_THREADS=1 \
+  -B "$REPO:/workspace/VLA4AD_Research" containers/lead.sif \
+  lead-python scripts/_check_pai_integrity.py data/carla_alpamayo_pai
+echo "=== check done ==="

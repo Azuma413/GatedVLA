@@ -76,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-seconds", default=6.4, type=float, help="Safe future margin for event_t0s.")
     parser.add_argument("--event-stride-seconds", default=1.0, type=float, help="Spacing between generated t0 samples.")
     parser.add_argument("--max-logs", default=None, type=int, help="Optional cap for smoke tests.")
+    parser.add_argument("--num-shards", default=1, type=int, help="Split the sorted log list into this many contiguous shards for parallel export.")
+    parser.add_argument("--shard-index", default=0, type=int, help="Which shard (0-based) this process exports. Requires --num-shards > 1.")
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -446,6 +448,17 @@ def main() -> None:
         log_dirs = log_dirs[: args.max_logs]
     if not log_dirs:
         raise FileNotFoundError(f"No 123D log directories with sync.arrow found under {args.logs_root}")
+
+    if args.num_shards > 1:
+        if not 0 <= args.shard_index < args.num_shards:
+            raise ValueError(f"--shard-index {args.shard_index} out of range for --num-shards {args.num_shards}")
+        per_shard = -(-len(log_dirs) // args.num_shards)  # ceil
+        start = args.shard_index * per_shard
+        log_dirs = log_dirs[start : start + per_shard]
+        LOG.info("Shard %d/%d: %d logs (global offset %d)", args.shard_index, args.num_shards, len(log_dirs), start)
+        if not log_dirs:
+            LOG.warning("Shard %d/%d is empty; nothing to export.", args.shard_index, args.num_shards)
+            return
 
     LOG.info("Exporting %d 123D logs to %s", len(log_dirs), args.output_dir)
     clips: list[ClipExport] = []

@@ -65,6 +65,21 @@ QWEN_MODEL_SPECS: Dict[str, tuple[str, str, Optional[str]]] = {
         "Qwen/Qwen3-VL-2B-Instruct",
         None,
     ),
+    # Dense 8B Qwen3-VL: best quality that fits ONE Aurora tile (no TP/Ray needed).
+    "qwen3_vl_8b": (
+        "models--Qwen--Qwen3-VL-8B-Instruct",
+        "Qwen/Qwen3-VL-8B-Instruct",
+        None,
+    ),
+    # Dense 32B Qwen3-VL for higher-quality CoC on Aurora XPU (same
+    # Qwen3VLForConditionalGeneration arch as 2B; served unquantized via TP over tiles).
+    # NOTE: 32B needs TP>=2 (62GB fp16 > one 64GB tile) and vLLM XPU Ray TP currently
+    # hangs during worker init on Aurora; qwen3_vl_8b is the working production choice.
+    "qwen3_vl_32b": (
+        "models--Qwen--Qwen3-VL-32B-Instruct",
+        "Qwen/Qwen3-VL-32B-Instruct",
+        None,
+    ),
 }
 
 
@@ -319,7 +334,7 @@ class QwenWrapper(BaseWrapper):
                     model_name=self.remote_model_name,
                     temperature=temperature,
                     json_schema=_schema_dict(json_schema),
-                    video_kwargs={"fps": [self.fps]},
+                    video_kwargs=None,  # frames are sent as images (see add_message); fps is video-only
                     ip_addr=self.ip_addr,
                     timeout=self.timeout_sec,
                     chat_template_kwargs=({"enable_thinking": False} if disable_thinking else None),
@@ -332,7 +347,7 @@ class QwenWrapper(BaseWrapper):
                     user_message=None,
                     model_name=self.remote_model_name,
                     temperature=temperature,
-                    video_kwargs={"fps": [self.fps]},
+                    video_kwargs=None,  # frames are sent as images (see add_message); fps is video-only
                     ip_addr=self.ip_addr,
                     timeout=self.timeout_sec,
                     chat_template_kwargs=({"enable_thinking": False} if disable_thinking else None),
@@ -492,13 +507,19 @@ class QwenWrapper(BaseWrapper):
                     video.append(f"data:image/jpeg;base64,{base64_str}")
 
             if self.remote_inference:
+                # Aurora XPU: the stock vLLM OpenAI server cannot decode the NVIDIA
+                # internal "data:video/jpeg;base64,<frame1,frame2,...>" convention (it
+                # treats the blob as a single video container and fails). Send the
+                # sampled frames as a list of image_url items instead, which Qwen3-VL
+                # on vLLM handles natively.
                 return {
                     "role": role,
                     "content": [
                         {
-                            "type": "video_url",
-                            "video_url": {"url": f"data:video/jpeg;base64,{','.join(video)}"},
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
                         }
+                        for frame_b64 in video
                     ],
                 }
             return {
