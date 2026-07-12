@@ -122,6 +122,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             batch_size=video_dataset_cfg.per_device_batch_size,
             collate_fn=video_collate_fn,
             num_workers=16,
+            # Deeper prefetch buffers the bursty cv2 decode (data_time avg < model_time
+            # but spiky) so it hides behind compute; persistent_workers avoids respawn
+            # stalls on the small per-rank dataset.
+            prefetch_factor=6,
+            persistent_workers=True,
             sampler=train_sampler,
-        )        
+        )
         return video_train_dataloader

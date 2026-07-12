@@ -1,0 +1,65 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=1:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_probe_max_bs.out
+
+# Probe the max per-device (per-tile) batch size that fits for VLA-JEPA stage-1 on
+# Aurora XPU, at the real 12-tile/node DDP footprint. Sweeps BS over a list, runs a
+# few steps each, and records OK / OOM. Stops at the first failure. W&B disabled.
+set -eo pipefail
+
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+VENV=${VENV:-${REPO_DIR}/outputs/vlajepa_venv}
+CONFIG=${CONFIG:-scripts/config/vlajepa_carla_video.yaml}
+VIDEO_DIR=${VIDEO_DIR:-${REPO_DIR}/data/vjepa_video/carla_full/clips}
+TEXT_FILE=${TEXT_FILE:-${REPO_DIR}/data/vjepa_video/carla_full/instructions.csv}
+BS_LIST=${BS_LIST:-"2 4 6 8 12"}
+STEPS=${STEPS:-5}
+
+module use /soft/modulefiles
+module load frameworks
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+
+export VLAJEPA_AMP_DEVICE=xpu
+export VLAJEPA_XPU_MPI=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PYTHONUNBUFFERED=1
+export WANDB_MODE=disabled
+export PYTHONPATH="${REPO_DIR}/3rd_party/VLA-JEPA:${PYTHONPATH:-}"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4
+
+cd "${REPO_DIR}/3rd_party/VLA-JEPA"
+CPU_BIND="verbose,list:4-7:8-11:12-15:16-19:20-23:24-27:56-59:60-63:64-67:68-71:72-75:76-79"
+
+echo "[$(date -u '+%FT%TZ')] === max-bs probe (12 tiles/node, steps=${STEPS}) ==="
+for BS in ${BS_LIST}; do
+  echo "----- trying per_device_batch_size=${BS} -----"
+  if mpiexec --pmi=pmix --envall -n 12 -ppn 12 --cpu-bind=${CPU_BIND} \
+      "${VENV}/bin/python" -u starVLA/training/train_vlajepa_video.py \
+      --config_yaml "${CONFIG}" \
+      --run_root_dir="${REPO_DIR}/outputs/_vjepa_bs_probe" \
+      --framework.qwenvl.base_vlm="${REPO_DIR}/outputs/models/Qwen3-VL-2B-Instruct" \
+      --framework.vj2_model.base_encoder="${REPO_DIR}/outputs/models/vjepa2-vitl-fpc64-256" \
+      --datasets.video_data.video_dir="${VIDEO_DIR}" \
+      --datasets.video_data.text_file="${TEXT_FILE}" \
+      --datasets.video_data.per_device_batch_size="${BS}" \
+      --trainer.max_train_steps="${STEPS}" \
+      --trainer.save_interval="${STEPS}" \
+      --trainer.num_warmup_steps=0 > "${REPO_DIR}/logs/_bs_${BS}.log" 2>&1; then
+    tstep=$(grep -aoE "[0-9.]+s/it" "${REPO_DIR}/logs/_bs_${BS}.log" | tail -1)
+    echo "PROBE_RESULT BS=${BS} => OK (${tstep})"
+  else
+    echo "PROBE_RESULT BS=${BS} => FAIL/OOM"
+    grep -aiE "out of memory|OOM|Allocation|RuntimeError|Error" "${REPO_DIR}/logs/_bs_${BS}.log" | head -3
+    echo "[$(date -u '+%FT%TZ')] stopping sweep at first failure."
+    break
+  fi
+done
+echo "[$(date -u '+%FT%TZ')] === probe done ==="
+grep -a "PROBE_RESULT" "${REPO_DIR}/logs/aurora_probe_max_bs.out" 2>/dev/null || true

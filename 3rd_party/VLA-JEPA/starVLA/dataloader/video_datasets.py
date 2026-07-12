@@ -128,9 +128,12 @@ class VideoFolderDataset(Dataset):
         # 3️⃣ 连续、递增、合法的 frame_ids
         frame_ids = np.arange(start, start + self.n_frames, dtype=np.int64)
 
+        # The n_frames are consecutive, so seek ONCE to the start and read forward.
+        # (Seeking per frame with CAP_PROP_POS_FRAMES was ~8 seeks/clip and dominated
+        # data loading; one seek + sequential reads is far cheaper.)
         frames = []
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_ids[0]))
         for idx in frame_ids:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if not ret:
                 raise ValueError(f"Unable to read frame at index {idx}")

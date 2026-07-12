@@ -1,0 +1,196 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=24:00:00
+#PBS -q capacity
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_sft_alpamayo.out
+
+# Alpamayo-R1-10B SFT on the CARLA PAI dataset, on ONE Aurora node (12 XPU tiles),
+# using the native `frameworks` module + venv + mpiexec/xccl (the CUDA/IPEX
+# container cannot see Aurora's XPUs; see aurora-xpu-distributed). This replaces
+# Polaris' `alpamayo-torchrun` (torchrun segfaults with oneCCL on Aurora).
+#
+#   Stage 1: full VLM SFT   — DeepSpeed ZeRO-2 (shards optimizer across 12 tiles),
+#            effective batch 36 = 12 tiles x per_device 1 x grad_accum 3, 2 epochs.
+#   Stage 2: action expert  — DDP, VLM frozen (fits in 64GB/tile, no ZeRO needed),
+#            effective batch 12 = 12 tiles x per_device 1 x grad_accum 1, 3 epochs.
+#
+# Attention: the checkpoint's config.json says flash_attention_2 (CUDA only). We
+# build a non-destructive sdpa view of the checkpoint (symlinks + patched
+# config.json) so both stages load with sdpa on XPU.
+#
+# Logs go to W&B project `alpamayo-carla-sft` (report_to=wandb; key from .env).
+#   qsub scripts/aurora/sft_alpamayo.pbs                 # both stages
+#   qsub -v STAGE=1 scripts/aurora/sft_alpamayo.pbs      # stage 1 only
+#   qsub -v STAGE=2 scripts/aurora/sft_alpamayo.pbs      # stage 2 only (needs stage1 ckpt)
+# NB: no `set -u` (Aurora lmod init references unbound vars).
+set -eo pipefail
+
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+VENV=${VENV:-${REPO_DIR}/outputs/alpamayo_venv}
+ALP=${REPO_DIR}/3rd_party/alpamayo
+
+STAGE=${STAGE:-all}
+NPROC=${NPROC:-12}          # total XPU tiles (1 node = 12)
+PPN=${PPN:-${NPROC}}
+
+# per-device (per-tile) micro batch + grad accum -> effective batch.
+BS1=${BS1:-1};   ACCUM1=${ACCUM1:-3}   # stage1 eff = 12*1*3 = 36
+BS2=${BS2:-1};   ACCUM2=${ACCUM2:-1}   # stage2 eff = 12*1*1 = 12
+EPOCHS1=${EPOCHS1:-2}
+EPOCHS2=${EPOCHS2:-3}
+MAX_STEPS=${MAX_STEPS:-0}   # >0 caps steps (probe/smoke); 0 = full (epoch-driven)
+SAVE_STRATEGY=${SAVE_STRATEGY:-epoch}   # smoke: set steps + SAVE_STEPS to force a save
+SAVE_STEPS=${SAVE_STEPS:-500}           # only used when SAVE_STRATEGY=steps
+LOG_STEPS=${LOG_STEPS:-5}               # trainer.logging_steps (loss cadence)
+
+PAI_DIR=${PAI_DIR:-${REPO_DIR}/data/carla_alpamayo_pai}
+TRAIN_CHUNKS=${TRAIN_CHUNKS:-0-48}     # all 48 chunks (range is [start,end))
+VAL_CHUNKS=${VAL_CHUNKS:-0-1}          # tiny; unused (no periodic eval)
+CKPT=${CKPT:-${REPO_DIR}/outputs/checkpoints/Alpamayo-R1-10B}
+# Base VLM used to build processor/config (weights come from CKPT). Point at the
+# local snapshot so it resolves fully offline (the checkpoint config has no
+# vlm_name_or_path key, so it would otherwise hit the HF id and fail offline).
+QWEN_DIR=${QWEN_DIR:-${REPO_DIR}/outputs/models/Qwen3-VL-8B-Instruct}
+# Attention impl. flash_attention_2 is CUDA-only; sdpa on XPU emits NaN logits on
+# some samples (fully-masked attention rows -> softmax(-inf) = NaN, which the
+# model's nan_to_num silently turns into loss 0.0). eager is numerically safe.
+ATTN_IMPL=${ATTN_IMPL:-eager}
+OUT_ROOT=${OUT_ROOT:-${REPO_DIR}/outputs/alpamayo_sft_aurora}
+WANDB_PROJECT_NAME=${WANDB_PROJECT_NAME:-alpamayo-carla-sft}
+
+module use /soft/modulefiles
+module load frameworks
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+
+cd "${REPO_DIR}"
+mkdir -p logs "${OUT_ROOT}"
+
+# --- credentials + networking (online W&B + HF via ALCF proxy) ---
+if [ -f "${REPO_DIR}/.env" ]; then set -a; . "${REPO_DIR}/.env"; set +a; fi
+export https_proxy=${https_proxy:-http://proxy.alcf.anl.gov:3128}
+export http_proxy=${http_proxy:-http://proxy.alcf.anl.gov:3128}
+export WANDB_PROJECT="${WANDB_PROJECT_NAME}"
+[ -n "${WANDB_API_KEY:-}" ] && export WANDB_API_KEY
+[ -n "${HF_TOKEN:-}" ] && export HF_TOKEN
+
+# --- HF: main model uses local paths (no network). We do NOT force offline:
+# transformers' save_pretrained rebuilds a *default* ReasoningVLAConfig(), whose
+# hardcoded default vlm_name_or_path="Qwen/Qwen3-VL-8B-Instruct" eagerly builds a
+# processor -> that one edge case resolves online via the proxy + HF_TOKEN.
+export HF_HOME=${REPO_DIR}/outputs/hf_home
+export TOKENIZERS_PARALLELISM=false
+
+export PYTHONUNBUFFERED=1
+export HYDRA_FULL_ERROR=1
+[ -n "${ALPAMAYO_DEBUG_LOSS:-}" ] && export ALPAMAYO_DEBUG_LOSS   # per-batch loss/NaN diag
+export PYTHONPATH="${ALP}/src:${ALP}:${PYTHONPATH:-}"
+# Aurora XPU bootstrap flag is implicit in alpamayo_xpu_entry.py (always on).
+# 12 ranks/node each spawn dataloader workers + BLAS threads; cap intra-op threads.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-4}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-4}
+
+# --- non-destructive XPU view of the checkpoint (flash_attention_2 -> ATTN_IMPL) ---
+CKPT_XPU=${CKPT}-xpu
+python - "$CKPT" "$CKPT_XPU" "$QWEN_DIR" "$ATTN_IMPL" <<'PY'
+import json, os, sys
+src, dst, qwen, attn = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+os.makedirs(dst, exist_ok=True)
+for name in os.listdir(src):
+    if name == "config.json":
+        continue
+    link = os.path.join(dst, name)
+    if not os.path.lexists(link):
+        os.symlink(os.path.join(src, name), link)
+with open(os.path.join(src, "config.json")) as f:
+    cfg = json.load(f)
+cfg["attn_implementation"] = attn   # flash_attention_2 is CUDA-only; use eager on XPU
+cfg["vlm_name_or_path"] = qwen      # resolve base VLM config/processor offline
+with open(os.path.join(dst, "config.json"), "w") as f:
+    json.dump(cfg, f, indent=2)
+print(f"XPU checkpoint view ready ({attn}): {dst}")
+PY
+CKPT=${CKPT_XPU}
+
+# CPU affinity for 12 tiles (2 sockets x 4 cores/rank).
+CPU_BIND="verbose,list:4-7:8-11:12-15:16-19:20-23:24-27:56-59:60-63:64-67:68-71:72-75:76-79"
+CPU_BIND_ARG=""
+[ "${PPN}" = "12" ] && CPU_BIND_ARG="--cpu-bind=${CPU_BIND}"
+
+MAXSTEPS_ARG=""
+[ "${MAX_STEPS}" -gt 0 ] && MAXSTEPS_ARG="+trainer.max_steps=${MAX_STEPS}"
+
+launch() {
+  # shellcheck disable=SC2086
+  mpiexec --pmi=pmix --envall -n "${NPROC}" -ppn "${PPN}" ${CPU_BIND_ARG} \
+    "${VENV}/bin/python" -u scripts/aurora/alpamayo_xpu_entry.py "$@"
+}
+
+STAGE1_OUT=${OUT_ROOT}/stage1
+STAGE2_OUT=${OUT_ROOT}/stage2
+
+if [ "${STAGE}" = "all" ] || [ "${STAGE}" = "1" ]; then
+  echo "[$(date -u '+%FT%TZ')] === Stage 1: VLM SFT (ZeRO-2, eff bs $((NPROC*BS1*ACCUM1)), ${EPOCHS1} epoch) ==="
+  launch \
+    --config-path pkg://finetune/sft/configs --config-name sft_stage1 \
+    data.train_dataset.local_dir="${PAI_DIR}" \
+    data.val_dataset.local_dir="${PAI_DIR}" \
+    data.train_dataset.chunk_ids="${TRAIN_CHUNKS}" \
+    data.val_dataset.chunk_ids="${VAL_CHUNKS}" \
+    data.train_dataset.use_default_keyframe=false \
+    data.val_dataset.use_default_keyframe=false \
+    model.checkpoint_path="${CKPT}" \
+    model.vlm_name_or_path="${QWEN_DIR}" \
+    paths.output_dir="${STAGE1_OUT}" \
+    trainer.deepspeed="${ALP}/finetune/sft/configs/deepspeed/zero2.json" \
+    trainer.per_device_train_batch_size="${BS1}" \
+    trainer.gradient_accumulation_steps="${ACCUM1}" \
+    trainer.num_train_epochs="${EPOCHS1}" \
+    trainer.report_to=wandb \
+    +trainer.run_name=alpamayo_carla_stage1 \
+    +trainer.save_strategy=${SAVE_STRATEGY} \
+    trainer.save_steps=${SAVE_STEPS} \
+    trainer.logging_steps=${LOG_STEPS} \
+    trainer.save_total_limit=1 \
+    ${MAXSTEPS_ARG} \
+    hydra.output_subdir=null hydra.run.dir="${STAGE1_OUT}/hydra"
+fi
+
+if [ "${STAGE}" = "all" ] || [ "${STAGE}" = "2" ]; then
+  STAGE1_CKPT=${STAGE1_CKPT:-$(ls -d "${STAGE1_OUT}"/checkpoint-* 2>/dev/null | sort -V | tail -1)}
+  if [ -z "${STAGE1_CKPT}" ]; then
+    echo "No stage-1 checkpoint under ${STAGE1_OUT}; run STAGE=1 first." >&2
+    exit 3
+  fi
+  echo "[$(date -u '+%FT%TZ')] === Stage 2: action expert (DDP, eff bs $((NPROC*BS2*ACCUM2)), ${EPOCHS2} epoch) using ${STAGE1_CKPT} ==="
+  launch \
+    --config-path pkg://finetune/sft/configs --config-name sft_stage2 \
+    data.train_dataset.local_dir="${PAI_DIR}" \
+    data.val_dataset.local_dir="${PAI_DIR}" \
+    data.train_dataset.chunk_ids="${TRAIN_CHUNKS}" \
+    data.val_dataset.chunk_ids="${VAL_CHUNKS}" \
+    data.train_dataset.use_default_keyframe=false \
+    data.val_dataset.use_default_keyframe=false \
+    model.pretrained_model_name_or_path="${CKPT}" \
+    model.stage1_vlm_checkpoint_path="${STAGE1_CKPT}" \
+    paths.output_dir="${STAGE2_OUT}" \
+    trainer.per_device_train_batch_size="${BS2}" \
+    trainer.gradient_accumulation_steps="${ACCUM2}" \
+    trainer.num_train_epochs="${EPOCHS2}" \
+    trainer.report_to=wandb \
+    +trainer.run_name=alpamayo_carla_stage2 \
+    +trainer.save_strategy=${SAVE_STRATEGY} \
+    trainer.save_steps=${SAVE_STEPS} \
+    trainer.logging_steps=${LOG_STEPS} \
+    trainer.save_total_limit=1 \
+    ${MAXSTEPS_ARG} \
+    hydra.output_subdir=null hydra.run.dir="${STAGE2_OUT}/hydra"
+fi
+
+echo "[$(date -u '+%FT%TZ')] === Alpamayo SFT done ==="
+find "${OUT_ROOT}" -maxdepth 2 -name "checkpoint-*" -type d 2>/dev/null

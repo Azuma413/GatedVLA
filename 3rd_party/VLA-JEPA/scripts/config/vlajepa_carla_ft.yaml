@@ -3,6 +3,9 @@ run_root_dir: /workspace/VLA4AD_Research/outputs/vlajepa_carla
 seed: 42
 trackers:
 - json
+- wandb
+wandb_project: vla-jepa-carla
+wandb_entity: null
 is_debug: false
 framework:
   name: VLA_JEPA

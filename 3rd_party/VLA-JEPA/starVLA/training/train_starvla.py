@@ -76,15 +76,20 @@ from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 # DeepSpeed's XPU init segfaults on Aurora; gate it behind an env var so single-
 # node XPU runs use plain accelerate. Set VLAJEPA_USE_DEEPSPEED=1 to re-enable
 # (e.g. on CUDA / multi-node).
+# Gradient accumulation must be set at Accelerator init (config isn't parsed yet),
+# so read it from env. VLAJEPA_GRAD_ACCUM=N makes accelerator.accumulate() step the
+# optimizer every N micro-batches; completed_steps then counts optimizer steps.
+_GRAD_ACCUM = int(os.environ.get("VLAJEPA_GRAD_ACCUM", "1"))
 if os.environ.get("VLAJEPA_USE_DEEPSPEED", "0") == "1":
     deepspeed_plugin = DeepSpeedPlugin()
-    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+    accelerator = Accelerator(gradient_accumulation_steps=_GRAD_ACCUM, deepspeed_plugin=deepspeed_plugin)
 else:
     # The frozen V-JEPA2 encoder runs under no_grad, so DDP sees unused params;
     # find_unused_parameters=True lets DDP handle that (DeepSpeed does not need it).
     from accelerate.utils import DistributedDataParallelKwargs
 
     accelerator = Accelerator(
+        gradient_accumulation_steps=_GRAD_ACCUM,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
 accelerator.print(accelerator.state)
@@ -226,7 +231,7 @@ class VLATrainer(TrainerUtils):
             # self.vlm_train_dataloader
         )
 
-        #self._init_wandb()
+        self._init_wandb()
         self._init_checkpointing()
 
     def _calculate_total_batch_size(self):
@@ -238,15 +243,21 @@ class VLATrainer(TrainerUtils):
         )
 
     def _init_wandb(self):
-        """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
+        """initialize Weights & Biases (main process only, if 'wandb' in trackers)"""
+        self.use_wandb = False
+        trackers = getattr(self.config, "trackers", []) or []
+        if "wandb" in trackers and self.accelerator.is_main_process:
+            wandb_dir = os.path.join(self.config.output_dir, "wandb")
+            os.makedirs(wandb_dir, exist_ok=True)
             wandb.init(
                 name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
+                dir=wandb_dir,
+                project=getattr(self.config, "wandb_project", "vla-jepa-carla"),
+                entity=getattr(self.config, "wandb_entity", None),
                 group="vla-train",
+                config=OmegaConf.to_container(self.config, resolve=True),
             )
+            self.use_wandb = True
 
     def _init_checkpointing(self):
         """initialize checkpoint directory"""
@@ -295,7 +306,8 @@ class VLATrainer(TrainerUtils):
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                if getattr(self, "use_wandb", False):
+                    wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -435,8 +447,10 @@ class VLATrainer(TrainerUtils):
                         }
                     )
 
-            # evaluate model
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            # evaluate model (skip step 0: with grad accumulation completed_steps is
+            # still 0 on the first micro-batch, and eval_action_model calls
+            # predict_action on the DDP-wrapped model which would raise).
+            if self.completed_steps > 0 and self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
             # record metrics
@@ -535,7 +549,7 @@ class VLATrainer(TrainerUtils):
             # optimizer step
             self.optimizer.step()
             self.lr_scheduler.step()
-            
+
             result_dict = {k: v.item() for k, v in output_dict.items()}
 
         return result_dict
@@ -551,8 +565,8 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
-        #if self.accelerator.is_main_process:
-        #    wandb.finish()
+        if self.accelerator.is_main_process and getattr(self, "use_wandb", False):
+            wandb.finish()
 
         self.accelerator.wait_for_everyone()
 

@@ -1,0 +1,32 @@
+#!/bin/sh
+#PBS -l select=1
+#PBS -l walltime=0:20:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_time_pai_to_lerobot.out
+
+# Time PAI -> LeRobot conversion on a small clip count to estimate full-run cost.
+set -eu
+REPO_DIR=/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research
+LEAD_SIF=${REPO_DIR}/containers/lead.sif
+N=${N:-40}
+cd "${REPO_DIR}"
+module use /soft/modulefiles || true
+module load apptainer
+
+THREAD_ENV="--env OPENBLAS_NUM_THREADS=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env NUMEXPR_NUM_THREADS=1"
+rm -rf data/lerobot/_timing_probe
+echo "[$(date -u '+%FT%TZ')] timing PAI->LeRobot for ${N} clips"
+START=$(date +%s)
+# shellcheck disable=SC2086
+apptainer exec ${THREAD_ENV} -B "${REPO_DIR}:/workspace/VLA4AD_Research" "${LEAD_SIF}" \
+  lead-python scripts/pai_to_lerobot.py \
+    --pai-dir data/carla_alpamayo_pai \
+    --output-dir data/lerobot/_timing_probe \
+    --max-clips "${N}" --overwrite
+END=$(date +%s)
+ELAPSED=$((END-START))
+echo "RESULT: ${N} clips in ${ELAPSED}s => $(python3 -c "print(f'{${ELAPSED}/${N}:.1f}')") s/clip; full 4459 => $(python3 -c "print(f'{4459*${ELAPSED}/${N}/3600:.1f}')") h serial"
+rm -rf data/lerobot/_timing_probe

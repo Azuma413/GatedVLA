@@ -1,0 +1,10 @@
+_target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+chat_template_version: r1_5
+# Navigation-conditioned Stage-1 target = chain-of-causation reasoning + discrete
+# trajectory tokens. User side: image, past trajectory, navigation route. Assistant
+# side (supervised): cot (CoC label) then traj_future (discrete traj tokens).
+components_order: ["image", "traj_history", "route", "prompt", "cot", "traj_future"]
+components_prompt: ["cot", "traj_future"]
+label_components: ["cot", "traj_future"]
+include_camera_ids: true
+include_frame_nums: true

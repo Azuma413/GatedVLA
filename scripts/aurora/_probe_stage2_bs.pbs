@@ -1,0 +1,71 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=1:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_probe_stage2_bs.out
+
+# Sweep per-device batch size for STAGE 2 (train_starvla / LeRobot 256^2) to find the
+# max that fits and its steady per-step time. Runs each BS for a few steps; reports
+# OK(+per-step) / OOM. Stops at the first OOM. W&B disabled.
+set -eo pipefail
+REPO_DIR=/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research
+VENV=${VENV:-${REPO_DIR}/outputs/vlajepa_venv}
+DATA_ROOT=${DATA_ROOT:-${REPO_DIR}/data/lerobot_256}
+BS_LIST=${BS_LIST:-"10 12 14"}
+GRAD_ACCUM=${GRAD_ACCUM:-1}
+STEPS=${STEPS:-20}
+
+module use /soft/modulefiles; module load frameworks
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+export VLAJEPA_AMP_DEVICE=xpu VLAJEPA_XPU_MPI=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export VLAJEPA_GRAD_ACCUM=${GRAD_ACCUM}
+export PYTHONUNBUFFERED=1 WANDB_MODE=disabled
+export PYTHONPATH="${REPO_DIR}/3rd_party/VLA-JEPA:${PYTHONPATH:-}"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4
+cd "${REPO_DIR}/3rd_party/VLA-JEPA"
+CPU_BIND="verbose,list:4-7:8-11:12-15:16-19:20-23:24-27:56-59:60-63:64-67:68-71:72-75:76-79"
+
+echo "[$(date -u '+%FT%TZ')] === stage-2 max-bs probe (12 tiles, steps=${STEPS}) ==="
+for BS in ${BS_LIST}; do
+  echo "----- stage-2 per_device_batch_size=${BS} ga=${GRAD_ACCUM} (global $((BS*12*GRAD_ACCUM))) -----"
+  if mpiexec --pmi=pmix --envall -n 12 -ppn 12 --cpu-bind=${CPU_BIND} \
+      "${VENV}/bin/python" -u starVLA/training/train_starvla.py \
+      --config_yaml scripts/config/vlajepa_carla_ft.yaml \
+      --run_root_dir="${REPO_DIR}/outputs/_stage2_bs_probe" \
+      --framework.qwenvl.base_vlm="${REPO_DIR}/outputs/models/Qwen3-VL-2B-Instruct" \
+      --framework.vj2_model.base_encoder="${REPO_DIR}/outputs/models/vjepa2-vitl-fpc64-256" \
+      --datasets.vla_data.data_root_dir="${DATA_ROOT}" \
+      --datasets.vla_data.per_device_batch_size="${BS}" \
+      --trainer.gradient_accumulation_steps="${GRAD_ACCUM}" \
+      --trainer.max_train_steps="${STEPS}" \
+      --trainer.save_interval="${STEPS}" \
+      --trainer.num_warmup_steps=0 > "${REPO_DIR}/logs/_s2bs_${BS}.log" 2>&1; then
+    PS=$(python3 - "${REPO_DIR}/logs/_s2bs_${BS}.log" <<'PY'
+import re,sys,statistics
+t=open(sys.argv[1],errors='ignore').read()
+d=[float(x) for x in re.findall(r"'data_time':\s*([0-9.]+)",t)]
+m=[float(x) for x in re.findall(r"'model_time':\s*([0-9.]+)",t)]
+n=min(len(d),len(m))
+if n>=8:
+    dd=statistics.mean(d[-6:]); mm=statistics.mean(m[-6:])
+    print(f"data={dd:.2f}s model={mm:.2f}s per-step={dd+mm:.2f}s 50k={50000*(dd+mm)/3600:.1f}h")
+else: print(f"only {n} steps")
+PY
+)
+    echo "PROBE_RESULT stage2 BS=${BS} ga=${GRAD_ACCUM} (global $((BS*12*GRAD_ACCUM))) => OK ${PS}"
+  else
+    # classify the failure: clean OOM vs GPU segfault (illegal memory access) vs other
+    if grep -qaiE "out of memory|OUT_OF_RESOURCES|OutOfMemory" "${REPO_DIR}/logs/_s2bs_${BS}.log"; then KIND="clean-OOM";
+    elif grep -qaiE "Segmentation fault from GPU|NotPresent|died from signal" "${REPO_DIR}/logs/_s2bs_${BS}.log"; then KIND="GPU-SEGFAULT";
+    else KIND="other"; fi
+    echo "PROBE_RESULT stage2 BS=${BS} ga=${GRAD_ACCUM} (global $((BS*12*GRAD_ACCUM))) => FAIL [${KIND}]"
+    grep -aiE "out of memory|OUT_OF_RESOURCES|Segmentation fault from GPU|NotPresent|died from signal" "${REPO_DIR}/logs/_s2bs_${BS}.log" | head -3
+    echo "stopping at first failure."; break
+  fi
+done
+echo "[$(date -u '+%FT%TZ')] === stage-2 probe done ==="
+grep -a "PROBE_RESULT" "${REPO_DIR}/logs/aurora_probe_stage2_bs.out" || true

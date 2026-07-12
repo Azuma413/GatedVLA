@@ -29,6 +29,33 @@ import time
 # Third-Party Libraries
 import torch
 import torch.distributed as dist
+
+# Aurora XPU distributed bootstrap — MUST run before the heavy imports below.
+# Mirrors train_starvla.py: Aurora's XPU collective (xccl over oneCCL) is launched
+# via mpiexec/PMIx, not torchrun's TCP rendezvous (which segfaults). Pinning this
+# rank's tile (set_device) before any import that touches XPU is essential.
+# Enabled by VLAJEPA_XPU_MPI=1 (set by the stage-1 PBS script).
+if os.environ.get("VLAJEPA_XPU_MPI", "0") == "1":
+    import socket
+
+    from mpi4py import MPI
+
+    _comm = MPI.COMM_WORLD
+    _rank, _world = _comm.Get_rank(), _comm.Get_size()
+    _local = int(os.environ.get("PALS_LOCAL_RANKID", os.environ.get("MPI_LOCALRANKID", _rank)))
+    _master = _comm.bcast(socket.gethostname() if _rank == 0 else None, root=0)
+    os.environ["MASTER_ADDR"] = f"{_master}.hsn.cm.aurora.alcf.anl.gov"
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ["RANK"] = str(_rank)
+    os.environ["WORLD_SIZE"] = str(_world)
+    os.environ["LOCAL_RANK"] = str(_local)
+    torch.xpu.set_device(_local)
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend="xccl", rank=_rank, world_size=_world,
+            device_id=torch.device(f"xpu:{_local}"),
+        )
+
 import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
@@ -44,14 +71,26 @@ from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(
-    deepspeed_plugin=deepspeed_plugin
-)
+# DeepSpeed's XPU init segfaults on Aurora; gate it behind an env var so single-
+# node XPU runs use plain accelerate DDP. Set VLAJEPA_USE_DEEPSPEED=1 to re-enable.
+if os.environ.get("VLAJEPA_USE_DEEPSPEED", "0") == "1":
+    deepspeed_plugin = DeepSpeedPlugin()
+    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+else:
+    # The frozen V-JEPA2 encoder runs under no_grad, so DDP sees unused params;
+    # find_unused_parameters=True lets DDP handle that.
+    from accelerate.utils import DistributedDataParallelKwargs
+
+    accelerator = Accelerator(
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+    )
 accelerator.print(accelerator.state)
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Autocast device type. Aurora (Intel XPU) has no CUDA; set VLAJEPA_AMP_DEVICE=xpu.
+AMP_DEVICE = os.environ.get("VLAJEPA_AMP_DEVICE", "cuda")
 
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
@@ -184,7 +223,7 @@ class VLATrainer(TrainerUtils):
             # self.vlm_train_dataloader
         )
 
-        #self._init_wandb()
+        self._init_wandb()
         self._init_checkpointing()
 
     def _calculate_total_batch_size(self):
@@ -196,15 +235,21 @@ class VLATrainer(TrainerUtils):
         )
 
     def _init_wandb(self):
-        """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
+        """initialize Weights & Biases (main process only, if 'wandb' in trackers)"""
+        self.use_wandb = False
+        trackers = getattr(self.config, "trackers", []) or []
+        if "wandb" in trackers and self.accelerator.is_main_process:
+            wandb_dir = os.path.join(self.config.output_dir, "wandb")
+            os.makedirs(wandb_dir, exist_ok=True)
             wandb.init(
                 name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
-                group="vla-train",
+                dir=wandb_dir,
+                project=getattr(self.config, "wandb_project", "vla-jepa-carla"),
+                entity=getattr(self.config, "wandb_entity", None),
+                group="vjepa-pretrain",
+                config=OmegaConf.to_container(self.config, resolve=True),
             )
+            self.use_wandb = True
 
     def _init_checkpointing(self):
         """initialize checkpoint directory"""
@@ -253,7 +298,8 @@ class VLATrainer(TrainerUtils):
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                if getattr(self, "use_wandb", False):
+                    wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -394,7 +440,7 @@ class VLATrainer(TrainerUtils):
             self.optimizer.zero_grad()
 
             # VLA task forward propagation
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(AMP_DEVICE, dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
 
                 total_loss = sum(output_dict.values())
@@ -425,8 +471,8 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
-        #if self.accelerator.is_main_process:
-        #    wandb.finish()
+        if self.accelerator.is_main_process and getattr(self, "use_wandb", False):
+            wandb.finish()
 
         self.accelerator.wait_for_everyone()
 

@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=1:00:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_reencode_lerobot_256.out
+
+# Build a 256x256 copy of the LeRobot CARLA dataset so BOTH training stages decode
+# small videos (the shared data-I/O bottleneck was decoding 800x600 then shrinking).
+# meta is copied (info.json shapes patched to 256); parquet is symlinked (unchanged);
+# videos are re-encoded to 256x256 in lead.sif (ffmpeg), in parallel. Resumable.
+#   qsub scripts/aurora/reencode_lerobot_256.pbs
+set -eo pipefail
+
+REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
+LEAD_SIF=${LEAD_SIF:-${REPO_DIR}/containers/lead.sif}
+SRC=${SRC:-${REPO_DIR}/data/lerobot/carla_lerobot}
+DST=${DST:-${REPO_DIR}/data/lerobot_256/carla_lerobot}
+# NUM_PAR=32 is empirically safe (scripts/aurora/_diag_ffmpeg.*): 32-parallel ffmpeg
+# runs clean, while 64 hit EAGAIN. Combined with single-threaded encode (17 vs 234
+# threads/proc) this is doubly safe.
+NUM_PAR=${NUM_PAR:-32}
+
+cd "${REPO_DIR}"
+mkdir -p logs
+module use /soft/modulefiles || true
+module load apptainer
+
+echo "[$(date -u '+%FT%TZ')] Step 1: meta (patch info.json 256) + parquet symlink"
+python3 - "$SRC" "$DST" <<'EOF'
+import json, os, shutil, sys
+src, dst = sys.argv[1], sys.argv[2]
+os.makedirs(dst + "/meta", exist_ok=True)
+for f in os.listdir(src + "/meta"):
+    shutil.copy(src + "/meta/" + f, dst + "/meta/" + f)
+p = dst + "/meta/info.json"
+d = json.load(open(p))
+for k, v in d["features"].items():
+    if v.get("dtype") == "video":
+        v["shape"] = [256, 256, 3]
+json.dump(d, open(p, "w"), indent=2)
+os.makedirs(dst + "/data", exist_ok=True)
+link = dst + "/data/chunk-000"
+if not (os.path.exists(link) or os.path.islink(link)):
+    os.symlink(os.path.abspath(src + "/data/chunk-000"), link)
+print(f"meta copied + info.json shapes -> 256; parquet symlinked at {link}")
+EOF
+
+echo "[$(date -u '+%FT%TZ')] Step 2: re-encode videos 800x600 -> 256x256 (lead.sif, NUM_PAR=${NUM_PAR})"
+apptainer exec -B "${REPO_DIR}:${REPO_DIR}" "${LEAD_SIF}" \
+  env SRC_VIDEOS="${SRC}/videos" DST_VIDEOS="${DST}/videos" NUM_PAR="${NUM_PAR}" \
+  bash "${REPO_DIR}/scripts/aurora/_reencode_lerobot_256.sh"
+
+SRCN=$(find "${SRC}/videos" -name '*.mp4' | wc -l)
+DSTN=$(find "${DST}/videos" -name '*.mp4' | wc -l)
+echo "[$(date -u '+%FT%TZ')] === reencode done: ${DSTN}/${SRCN} videos; size: $(du -sh "${DST}/videos" 2>/dev/null | cut -f1) ==="

@@ -66,7 +66,12 @@ class _QWen3_VL_Interface(nn.Module):
             dtype=torch.bfloat16,
         )
         processor = AutoProcessor.from_pretrained(model_id)
-        processor.tokenizer.padding_side = "left"
+        # Right-padding for training: left-padding puts pad tokens at the start, where
+        # the first (padded) query attends only to masked keys -> softmax(all -inf) =
+        # NaN under SDPA (no flash-attn on XPU). That NaN poisons the whole batch at
+        # bs>1. Right-padding keeps every query attending to real tokens, so no NaN.
+        # (Left-padding is only needed for batched generation, which we don't do here.)
+        processor.tokenizer.padding_side = "right"
 
         self.model = model
         self.processor = processor

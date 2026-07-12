@@ -1,0 +1,7 @@
+_target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+chat_template_version: r1_5
+components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+components_prompt: ["traj_future"]
+label_components: ["traj_future"]
+include_camera_ids: true
+include_frame_nums: true

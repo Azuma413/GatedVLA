@@ -319,3 +319,138 @@ tail -f logs/aurora_coc_parallel.out
   - 起動時の注意: 12 サーバ同時起動は (a) rayon/OMP スレッドの枯渇（`EAGAIN`/panic）と (b) 12×16GB の同時
     Lustre 読みで失敗する。**スレッド上限**（`RAYON/OMP/MKL_NUM_THREADS`）＋**逐次起動**（1 台 ready→次）で回避。
   - タイル分離は `ONEAPI_DEVICE_SELECTOR` では効かず（2 台が同一タイルに載り KV OOM）、**`ZE_AFFINITY_MASK=i`** が必須。
+
+---
+
+# Aurora で Alpamayo 1.5 を追加学習（nav+CoC SFT）
+
+`data/carla_alpamayo_pai`（PAI データセット）＋ `outputs/coc_autolabel_aurora_full/coc_labels_8b`
+（上で付与した CoC ラベル）を使い、**Alpamayo 1.5**（`nvidia/Alpamayo-1.5-10B`）を Aurora の
+**1 計算ノード（12 XPU タイル）**上で 2 段 SFT します。使うのは **1.5 レシピ**
+（`3rd_party/alpamayo-recipes/recipes/alpamayo1_5_sft`, `alpamayo1_5_sft.train_hf`）で、
+旧 R1 レシピ（`3rd_party/alpamayo`, `finetune.sft`）とは別物です。
+
+```
+Stage 1 (VLM SFT):  画像 + 過去軌道 + navigation command  ->  CoC + 離散 trajectory token(128)
+Stage 2 (traj expert): VLM 凍結で trajectory diffusion expert を学習（教師は traj_future のみ）
+```
+
+- **分散は frameworks module + venv + mpiexec/xccl**（container は XPU 不可、torchrun は oneCCL で
+  segfault。VLA-JEPA / CoC と同じ。[[aurora-xpu-distributed]]）。1 rank / タイルで
+  `alpamayo15_xpu_entry.py` が xccl group を張ってから `train_hf` を起動する。
+- **実効 batch size は 12 タイルで割り切れる 36 / 12 に丸める**（当初指定の 32/8 は 12 で割り切れない）。
+  Stage 1 = 12 × micro 1 × accum 3 = **36**, 2 epoch。Stage 2 = 12 × 1 × 1 = **12**, 3 epoch。
+  **micro-batch 3（accum なし）は XPU OOM**（cross-entropy が大語彙で `UR_RESULT_ERROR_OUT_OF_RESOURCES`）
+  なので **micro 1 × accum 3** を使う。
+- W&B: `report_to=wandb`（`WANDB_PROJECT=alpamayo15-carla-sft`, key は `.env`）。
+
+## リポジトリ側の変更・追加
+
+| ファイル | 変更/役割 |
+| --- | --- |
+| `scripts/aurora/build_nav_coc_annotations.py`(新規) | PAI の `navigation_command`(command_text) と CoC yaml(`event_start_timestamp`→`t0_relative`, `effect_on_ego_behavior`→`cot`) を結合し、1.5 nav SFT が読む annotation JSON `{clip_id,t0_relative,nav_text,cot}` を生成。Alpamayo window(1.6s hist + 6.4s future) が clip に収まる segment のみ採用 |
+| `.../alpamayo-recipes/src/alpamayo/data/pai_nav.py` | annotation の `cot` を sample へ転送（`nav_cot` プロセッサが cot を教師化できるように） |
+| `.../recipes/alpamayo1_5_sft/configs/vla_processor/nav_cot.yaml`(新規) | Stage 1 用プロセッサ。`components_order=[image,traj_history,route,prompt,cot,traj_future]`, `label_components=[cot,traj_future]` |
+| `scripts/aurora/convert_features_csv_pai022.py`(新規) | 旧 export の `features.csv` を physical_ai_av **0.2.2** スキーマ(`directory`/`chunk_path`/template 化 `clip_files_in_zip`)へ変換（データ zip は不変、原本は `features.csv.oldschema` に退避） |
+| `scripts/aurora/setup_venv_alpamayo15.sh`(新規) | frameworks に 1.5 レシピの leaf 依存だけ足す venv(`outputs/alpamayo15_venv`)。torch/transformers/deepspeed は module。flash-attn は入れない(XPU は eager) |
+| `scripts/aurora/prepare_ckpt_alpamayo15.sh`(新規) | `nvidia/Alpamayo-1.5-10B` を DL → `convert_checkpoint.py to-a1` で A1 形式へ（symlink + config 書換のみ、CPU） |
+| `scripts/aurora/alpamayo15_xpu_entry.py`(新規) | mpiexec/xccl bootstrap → `alpamayo1_5_sft.train_hf`（R1 の `alpamayo_xpu_entry.py` と同型） |
+| `scripts/aurora/sft_alpamayo15.pbs`(新規) | 1 ノード 12 タイルで Stage1/Stage2 を実行。A1 ckpt の `-xpu` view(attn=eager, vlm_name_or_path=ローカル Qwen) を作り offline ロード |
+
+## 0. 事前準備（ログインノード, proxy 経由）
+
+```bash
+cd /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research
+# 1) venv（frameworks + 1.5 leaf 依存）
+bash scripts/aurora/setup_venv_alpamayo15.sh    # -> outputs/alpamayo15_venv
+# ※ import 検証はログインノードだと torch.xpu(デバイス0個)で SIGSEGV する。pip 導入自体は成功。
+#    実 import 検証は計算ノード（下の probe）で行う。
+# 2) checkpoint（gated, HF_TOKEN は .env）
+bash scripts/aurora/prepare_ckpt_alpamayo15.sh  # -> outputs/checkpoints/Alpamayo-1.5-10B-A1-format
+# 3) annotation JSON（CoC + nav）
+module use /soft/modulefiles; module load frameworks
+python scripts/aurora/build_nav_coc_annotations.py \
+  --pai-dir data/carla_alpamayo_pai \
+  --coc-dir outputs/coc_autolabel_aurora_full/coc_labels_8b \
+  --out data/carla_alpamayo_pai/nav_coc_annotations.json   # -> 11,076 sample / 3,076 clip
+# 4) features.csv を physical_ai_av 0.2.2 スキーマへ（1 回だけ。原本は .oldschema に退避）
+python scripts/aurora/convert_features_csv_pai022.py --pai-dir data/carla_alpamayo_pai
+```
+
+> **base VLM の注意**: A1 ckpt の config は `vlm_name_or_path=nvidia/Cosmos-Reason2-8B` だが、1.5 レシピは
+> processor/tokenizer に `Qwen/Qwen3-VL-8B-Instruct` を使う（Cosmos-Reason2-8B は Qwen3-VL-8B ベースで
+> 語彙互換）。`sft_alpamayo15.pbs` は `-xpu` view で `vlm_name_or_path` をローカル
+> `outputs/models/Qwen3-VL-8B-Instruct` に差し替え、offline でロードする（10B ロード成功を確認済み）。
+
+## 1. micro-batch の probe（debug キュー, 4 step）
+
+本番前に、1 ノードで実 10B・実データ・本番 config のまま数 step だけ回して OOM とパイプラインを確認する。
+
+```bash
+# micro 3（accum なし）… OOM するはず（記録用）
+qsub -q debug -l walltime=1:00:00 -o logs/aurora_sft_a15_probe_mb3.out \
+  -v STAGE=1,BS1=3,ACCUM1=1,MAX_STEPS=4,SAVE_STRATEGY=no,REPORT_TO=none \
+  scripts/aurora/sft_alpamayo15.pbs
+# micro 1（本番と同じ per-step メモリ）… 通る
+qsub -q debug -l walltime=1:00:00 -o logs/aurora_sft_a15_probe_mb1.out \
+  -v STAGE=1,BS1=1,ACCUM1=1,MAX_STEPS=4,SAVE_STRATEGY=no,REPORT_TO=none \
+  scripts/aurora/sft_alpamayo15.pbs
+```
+
+## 2. 本番（capacity キュー, Stage1 → Stage2）
+
+```bash
+qsub scripts/aurora/sft_alpamayo15.pbs            # STAGE=all（既定 eff bs 36/12, 2/3 epoch, wandb）
+tail -f logs/aurora_sft_alpamayo15.out
+# Stage 1 / Stage 2 だけ:
+qsub -v STAGE=1 scripts/aurora/sft_alpamayo15.pbs
+qsub -v STAGE=2 scripts/aurora/sft_alpamayo15.pbs # Stage1 の checkpoint-* を自動参照
+```
+
+既定値（`qsub -v KEY=VAL,...` で上書き可）:
+
+```bash
+STAGE=all  NPROC=12  PPN=12
+BS1=1 ACCUM1=3 EPOCHS1=2     # Stage1 eff bs = 12*1*3 = 36
+BS2=1 ACCUM2=1 EPOCHS2=3     # Stage2 eff bs = 12*1*1 = 12
+WARMUP1=50                    # stage1_nav 既定 500 は ~600 step には過大
+ATTN_IMPL=eager               # flash_attention_2 は CUDA 専用
+PAI_DIR=.../data/carla_alpamayo_pai
+ANNOTATIONS=.../data/carla_alpamayo_pai/nav_coc_annotations.json
+TRAIN_CHUNKS=0-48             # 全 48 chunk
+CKPT=.../outputs/checkpoints/Alpamayo-1.5-10B-A1-format
+QWEN_DIR=.../outputs/models/Qwen3-VL-8B-Instruct
+OUT_ROOT=.../outputs/alpamayo15_sft_aurora
+```
+
+出力:
+
+```text
+outputs/alpamayo15_sft_aurora/stage1/checkpoint-*/   (model.safetensors.index.json + shards)
+outputs/alpamayo15_sft_aurora/stage2/checkpoint-*/
+```
+
+## トラブルシュート
+
+- **`KeyError('directory')`（PAIDatasetWithNav instantiate 時）**: `features.csv` が旧スキーマ。
+  §0-4 の `convert_features_csv_pai022.py` を実行する。
+- **`UR_RESULT_ERROR_OUT_OF_RESOURCES`（forward の cross_entropy）**: micro-batch が大きすぎ。
+  `BS1=1` にして `ACCUM1` で実効 batch を稼ぐ。
+- **末尾の `|CCL_ERROR| internal_kvs_server ... Bad file descriptor`**: 学習完了後の xccl KVS
+  teardown ノイズ。`=== Alpamayo 1.5 SFT done ===` が出ていれば正常終了（mpiexec は 0 で返る）。
+- **ログインノードで import が SIGSEGV**: `torch.xpu`（デバイス 0 個）が原因。検証は計算ノードで。
+
+## 動作確認状況（2026-07-12）
+
+- [x] annotation JSON 生成: **11,076 sample / 3,076 clip**（58 segment は future window が clip 末尾を
+  超過してスキップ、label 欠損 0）。nav_text 分布 = Follow the lane 7702 / Turn left 1972 / …。
+- [x] `features.csv` を 0.2.2 スキーマへ変換し、CPU で interface + egomotion(Interpolator) +
+  camera(SeekVideoReader) + 1 sample の full load（image `(4,4,3,600,800)`, nav_text, cot）を確認。
+- [x] Hydra 合成をドライラン（torch 非依存）で検証。Stage1 は `label_components=[cot,traj_future]`,
+  Stage2 は `[traj_future]`。`save_strategy` は `+` 追記、Stage2 に `vlm_name_or_path` は無い、を修正。
+- [x] **10B checkpoint の XPU ロード成功**（eager attn, Cosmos/Qwen 語彙不整合なし）。12 rank xccl 初期化・
+  DeepSpeed ZeRO-2 も起動。
+- [x] **micro-batch probe**（debug, 4 step）: **mb3 は OOM**（cross_entropy）、**mb1 は成功**
+  （loss 5.5→6.9→6.5→6.7, ~9s/step @ eff bs 12, `=== Alpamayo 1.5 SFT done ===`）。
+- [ ] 本番 Stage1(eff bs 36, 2ep) → Stage2(eff bs 12, 3ep) を capacity へ投入（ジョブ `8668722`）。W&B
+  `alpamayo15-carla-sft` へログ。完走・checkpoint 生成を確認中。

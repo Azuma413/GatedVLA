@@ -16,6 +16,7 @@
 from dataclasses import dataclass
 from typing import Any, Mapping
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 import einops
@@ -363,6 +364,18 @@ class TrainableReasoningVLA(ReasoningVLA, TrajectoryFusionWithFutureMixin):
 
         # Replace the original loss
         outputs.loss = sum(losses.values())
+
+        if os.environ.get("ALPAMAYO_DEBUG_LOSS"):
+            import torch.distributed as _dist
+            _r = _dist.get_rank() if _dist.is_initialized() else 0
+            _lg = outputs.logits
+            print(
+                f"[DBG_LOSS rank{_r}] mask_all={int((labels_mask[:, 1:].sum()) if labels_mask is not None else -1)} "
+                f"traj_mask={int(traj_mask[:, 1:].sum())} "
+                f"future_traj={float(losses['future_traj']):.4f} others={float(losses['others']):.4f} "
+                f"logits_nan={int(torch.isnan(_lg).sum())} logits_finite_frac={float(torch.isfinite(_lg).float().mean()):.4f}",
+                flush=True,
+            )
 
         return ReasoningVLAOutput(
             loss=outputs.loss,

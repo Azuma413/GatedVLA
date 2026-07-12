@@ -1,0 +1,22 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=0:20:00
+#PBS -q debug
+#PBS -A RobustViT
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -o logs/aurora_diag_ffmpeg.out
+
+# Diagnose the re-encode EAGAIN: prove libx264 auto-threading x parallelism is the
+# cause and single-threading is the fix. Runs the A/B script inside lead.sif.
+set -eo pipefail
+REPO_DIR=/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research
+LEAD_SIF=${REPO_DIR}/containers/lead.sif
+cd "${REPO_DIR}"; mkdir -p logs
+module use /soft/modulefiles || true
+module load apptainer
+
+apptainer exec -B "${REPO_DIR}:${REPO_DIR}" "${LEAD_SIF}" \
+  env SRC_VIDEOS="${REPO_DIR}/data/lerobot/carla_lerobot/videos" \
+      OUT="${REPO_DIR}/logs/_diag_ffmpeg" \
+  bash "${REPO_DIR}/scripts/aurora/_diag_ffmpeg.sh"
