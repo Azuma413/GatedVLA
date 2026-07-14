@@ -259,6 +259,117 @@ CoCについては、形式としては対応しています。ただしCoCのme
 
 ---
 
+## 8. Alpamayo 1.5 checkpointのBench2Drive評価
+
+学習済みの Alpamayo **1.5**（navigation条件付き）checkpoint を、このサーバのローカルCARLAで Bench2Drive 評価する手順です。Alpamayo 1（`3rd_party/alpamayo` の `finetune.sft` 経路）とは構成が違うため、環境変数で1.5系のロード経路に切り替えます。
+
+対象例: `outputs/alpamayo15_sft_aurora/stage2/checkpoint-2769`
+
+### 8.1 何が1と違うか
+
+| 項目 | Alpamayo 1 | Alpamayo 1.5 |
+|------|-----------|--------------|
+| モデル/processor | `alpamayo_r1` + `finetune.sft`（`3rd_party/alpamayo`）| `alpamayo1_5_sft` + `alpamayo`（`3rd_party/alpamayo-recipes`）+ `alpamayo_r1` |
+| chat template | `r1` | `r1_5`（`route` component = `nav_text` でnavigation条件付け）|
+| VLMバックボーン | Qwen2.5-VL系 | **Qwen3-VL-8B-Instruct**（`vlm_backend=qwenvl3`）|
+| 切り替え | 既定 | `ALPAMAYO_CHAT_TEMPLATE_VERSION=r1_5` を付ける |
+
+LEAD側の対応は [lead/inference/alpamayo_inference.py](lead/inference/alpamayo_inference.py)（版の分岐・processor・VLMパス上書き）と [lead/inference/alpamayo_agent.py](lead/inference/alpamayo_agent.py)（`nav_text` 供給）に入っています。`ALPAMAYO_CHAT_TEMPLATE_VERSION` 未指定なら従来のAlpamayo 1経路のままです。
+
+### 8.2 Qwen3-VLのprocessor/configを用意（初回のみ）
+
+checkpointの `config.json` に記録された VLM パスは学習クラスタ（Aurora）のものでローカルには存在しません。processor/tokenizer/config だけをローカルに取得します（**VLM重みは不要**。checkpoint側に含まれます）。
+
+```bash
+cd /path/to/VLA4AD_Research
+uv run python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    "Qwen/Qwen3-VL-8B-Instruct",
+    local_dir="outputs/models/Qwen3-VL-8B-Instruct",
+    allow_patterns=["*.json", "*.txt", "tokenizer*", "*.jinja", "merges.txt", "vocab.json"],
+    ignore_patterns=["*.safetensors", "*.bin", "*.pth", "*.pt"],
+)
+PY
+```
+
+既定パスは `outputs/models/Qwen3-VL-8B-Instruct`。別の場所に置く場合は実行時に `ALPAMAYO_VLM_PATH=/path/to/Qwen3-VL-8B-Instruct` を指定します。
+
+### 8.3 CARLAを別GPUで起動
+
+10Bモデルの推論とCARLAレンダリングを同一GPUに載せると、scenarioの `spawn_parked_vehicles` 中にCARLA(UE4)が Signal 11（segfault）で落ちやすくなります。**CARLAはモデルと別GPU**（例: GPU1）で起動してください。
+
+```bash
+cd /path/to/VLA4AD_Research
+./3rd_party/CARLA_0915/CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port=2000 -graphicsadapter=1 &
+
+# 接続確認（Town が返ればOK）
+uv run python -c "import carla; c=carla.Client('127.0.0.1',2000); c.set_timeout(20.0); print(c.get_world().get_map().name)"
+```
+
+### 8.4 評価実行
+
+モデルは `cuda:0` 固定なので、`CUDA_VISIBLE_DEVICES=0` でGPU0に載せCARLA（GPU1）と分離します。
+
+```bash
+mkdir -p outputs/alpamayo15_b2d/2084
+LEAD_PROJECT_ROOT=$(pwd) \
+CUDA_VISIBLE_DEVICES=0 \
+ALPAMAYO_CHAT_TEMPLATE_VERSION=r1_5 \
+LEAD_CLOSED_LOOP_CONFIG='produce_input_video=true produce_frame_frequency=1' \
+ALPAMAYO_INFERENCE_INTERVAL=10 \
+uv run python -m lead \
+  --checkpoint outputs/alpamayo15_sft_aurora/stage2/checkpoint-2769 \
+  --routes data/benchmark_routes/bench2drive/2084.xml \
+  --bench2drive \
+  --alpamayo \
+  --port 2000 \
+  --traffic-manager-port 8000 \
+  --timeout 300 \
+  --output-dir outputs/alpamayo15_b2d/2084
+```
+
+主な環境変数:
+
+- `ALPAMAYO_CHAT_TEMPLATE_VERSION=r1_5`: 1.5系のロード経路に切り替える（必須）。
+- `ALPAMAYO_INFERENCE_INTERVAL=10`: 10 stepごとに推論（10Bモデルなので毎stepは重い）。
+- `--timeout 300`: watchdogのtick timeout。10Bモデルは低速なので120sより広めにする。
+
+### 8.5 出力とスコア
+
+```text
+outputs/alpamayo15_b2d/2084/
+  checkpoint_endpoint.json   # スコア（score_composed / score_route / score_penalty）
+  2084_input.mp4             # 4カメラ連結の入力動画
+  metric_info.json
+  infractions.json
+```
+
+スコア確認:
+
+```bash
+uv run python - <<'PY'
+import json
+d = json.load(open("outputs/alpamayo15_b2d/2084/checkpoint_endpoint.json"))
+r = d["_checkpoint"]["records"][0]
+s = r["scores"]
+print("status:", r["status"])
+print("Driving Score:", s["score_composed"])
+print("Route Completion:", s["score_route"])
+print("Infraction Penalty:", s["score_penalty"])
+PY
+```
+
+参考: `checkpoint-2769` × route `2084`（NonSignalizedJunctionLeftTurn）の実測は Driving Score 47.5 / Route Completion 47.5% / penalty 1.0（衝突・信号・一時停止違反ゼロ）。低速走行（min_speed違反）でシナリオtimeoutまでにルートの47.5%到達、という結果でした。
+
+### 8.6 注意（既知の不安定ルート）
+
+route `23687`（HighwayExit）は、GPUを分離しても**CARLA本体が `spawn_parked_vehicles` 中に Signal 11 で落ちる**既知の不安定ルートです（Alpamayo 1.5統合とは無関係。agent自体は毎回~66〜71秒正常走行してからCARLAがcrashする）。評価には別ルートを使ってください。
+
+終了後のクリーンアップは §4 と同様に `CarlaUE4` / `leaderboard_evaluator` / `python -m lead` プロセスを停止します。
+
+---
+
 ## スクリプト構成
 
 | ファイル | 役割 |

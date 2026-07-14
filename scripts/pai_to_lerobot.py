@@ -12,12 +12,15 @@ Output: a LeRobot v2.1 dataset (one episode per PAI clip) with the GR00T
     data/chunk-000/episode_XXXXXX.parquet
     videos/chunk-000/observation.images.<cam>/episode_XXXXXX.mp4
 
-Driving action representation (see USAGE_VLAJEPA.md):
-  Each frame stores ``action`` = the frame-to-frame ego motion expressed in the
-  ego frame at that frame: ``[dx, dy, dyaw]`` (metres, metres, radians). The VLA
-  future-action chunk of length H is therefore H consecutive local deltas, which
-  the eval client integrates (SE(2)) into ego-frame waypoints for LEAD's PID
-  controller. Deltas are O(1) so no normalization is applied to the action.
+Driving action representation (see USAGE_VLAJEPA.md), aligned with Alpamayo 1.5:
+  Each frame stores ``action`` = the unicycle control ``[accel, curvature]``
+  (m/s^2, 1/m) taking the ego from that frame to the next, computed with
+  Alpamayo 1.5's ``UnicycleAccelCurvatureActionSpace``. The VLA future-action
+  chunk of length H is H consecutive controls, which the eval client rolls out
+  (``action_to_traj``, seeded with the current speed) into ego-frame waypoints
+  for LEAD's PID controller. accel and curvature live on very different scales
+  (std ~3.5 vs ~0.02), so the dataloader normalizes each per-dim (mean/std);
+  the raw (unnormalized) controls are stored here and stats are computed later.
 
 Runtime: designed to run inside ``containers/lead.sif`` (numpy/pandas/pyarrow/cv2
 + system ffmpeg). GPU is not required.
@@ -77,8 +80,58 @@ def quat_to_yaw(qx: np.ndarray, qy: np.ndarray, qz: np.ndarray, qw: np.ndarray) 
     return np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
 
-def wrap_to_pi(angle: np.ndarray) -> np.ndarray:
-    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+# Alpamayo 1.5 unicycle action space (accel, curvature). Imported lazily so this
+# script still imports without alpamayo1.5 on the path (e.g. for --help).
+_ACTION_SPACE = None
+CURVATURE_BOUND = 0.2  # matches Alpamayo's curvature_bounds; clamp for stability
+
+
+def _action_space():
+    global _ACTION_SPACE
+    if _ACTION_SPACE is None:
+        import sys
+
+        alpamayo15 = Path(__file__).resolve().parents[1] / "3rd_party" / "alpamayo1.5" / "src"
+        if str(alpamayo15) not in sys.path:
+            sys.path.insert(0, str(alpamayo15))
+        from alpamayo1_5.action_space.unicycle_accel_curvature import (
+            UnicycleAccelCurvatureActionSpace,
+        )
+
+        # Raw (unnormalized) controls: mean=0, std=1. Normalization is applied in
+        # the dataloader from dataset_statistics. dt = 1/FPS (10 Hz -> 0.1 s).
+        _ACTION_SPACE = UnicycleAccelCurvatureActionSpace(dt=1.0 / FPS)
+    return _ACTION_SPACE
+
+
+def compute_accel_curvature(x: np.ndarray, y: np.ndarray, yaw: np.ndarray) -> np.ndarray:
+    """Per-frame unicycle control ``[accel, curvature]`` (last frame = 0).
+
+    Uses Alpamayo 1.5's inversion (``_v_to_a`` / ``_theta_v_a_to_kappa``), the exact
+    inverse of the eval-time ``action_to_traj`` rollout, so the stored controls
+    reconstruct the trajectory. Speed is derived from the ego positions.
+    """
+    import torch
+
+    n = len(x)
+    out = np.zeros((n, 2), dtype=np.float32)
+    if n < 3:
+        return out
+    dt = 1.0 / FPS
+    # Instantaneous speed per frame from position deltas (last frame padded).
+    speed = np.hypot(np.diff(x), np.diff(y)) / dt  # (n-1,)
+    speed = np.concatenate([speed, speed[-1:]])  # (n,)
+    yaw_unwrapped = np.unwrap(yaw)
+
+    u = _action_space()
+    v_t = torch.tensor(speed, dtype=torch.float64)
+    theta_t = torch.tensor(yaw_unwrapped, dtype=torch.float64)
+    accel = u._v_to_a(v_t)  # (n-1,)
+    kappa = u._theta_v_a_to_kappa(theta_t, v_t, accel)  # (n-1,)
+    kappa = torch.clamp(kappa, -CURVATURE_BOUND, CURVATURE_BOUND)
+    out[:-1, 0] = accel.numpy().astype(np.float32)
+    out[:-1, 1] = kappa.numpy().astype(np.float32)
+    return out
 
 
 def read_zip_member_parquet(zip_path: Path, member: str) -> pd.DataFrame:
@@ -104,22 +157,6 @@ def nearest_rows(source_ts: np.ndarray, query_ts: np.ndarray) -> np.ndarray:
     choose_left = (query_ts - left) <= (right - query_ts)
     idx = np.where(choose_left, pos - 1, pos)
     return order[idx]
-
-
-def compute_local_deltas(x: np.ndarray, y: np.ndarray, yaw: np.ndarray) -> np.ndarray:
-    """Frame-to-frame ego-local deltas [dx, dy, dyaw] per frame (last frame = 0)."""
-    n = len(x)
-    deltas = np.zeros((n, 3), dtype=np.float32)
-    if n < 2:
-        return deltas
-    dx_global = x[1:] - x[:-1]
-    dy_global = y[1:] - y[:-1]
-    cos_y = np.cos(-yaw[:-1])
-    sin_y = np.sin(-yaw[:-1])
-    deltas[:-1, 0] = cos_y * dx_global - sin_y * dy_global
-    deltas[:-1, 1] = sin_y * dx_global + cos_y * dy_global
-    deltas[:-1, 2] = wrap_to_pi(yaw[1:] - yaw[:-1])
-    return deltas
 
 
 def reencode_h264(src_mp4: Path, dst_mp4: Path) -> None:
@@ -201,7 +238,7 @@ def write_info_json(output_dir: Path, robot_type: str, total_episodes: int, tota
                     total_tasks: int, video_shape: tuple[int, int]) -> None:
     height, width = video_shape
     features: dict = {
-        "action": {"dtype": "float32", "shape": [3], "names": ["dx", "dy", "dyaw"]},
+        "action": {"dtype": "float32", "shape": [2], "names": ["accel", "curvature"]},
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
         "frame_index": {"dtype": "int64", "shape": [1], "names": None},
         "episode_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -244,9 +281,8 @@ def write_modality_json(output_dir: Path) -> None:
     modality = {
         "state": {},
         "action": {
-            "dx": {"start": 0, "end": 1, "original_key": "action"},
-            "dy": {"start": 1, "end": 2, "original_key": "action"},
-            "dyaw": {"start": 2, "end": 3, "original_key": "action"},
+            "accel": {"start": 0, "end": 1, "original_key": "action"},
+            "curvature": {"start": 1, "end": 2, "original_key": "action"},
         },
         "video": {
             new_name: {"original_key": f"observation.images.{new_name}"}
@@ -295,7 +331,7 @@ def main() -> None:
             table, cam_videos = build_clip_frame_table(args.pai_dir, str(clip_id), chunk, tmp)
             n = len(table)
 
-            deltas = compute_local_deltas(
+            actions = compute_accel_curvature(
                 table["x"].to_numpy(), table["y"].to_numpy(), table["yaw"].to_numpy()
             )
 
@@ -309,7 +345,7 @@ def main() -> None:
 
             frame_df = pd.DataFrame(
                 {
-                    "action": list(deltas.astype(np.float32)),
+                    "action": list(actions.astype(np.float32)),
                     "timestamp": (np.arange(n, dtype=np.float32) / FPS),
                     "frame_index": np.arange(n, dtype=np.int64),
                     "episode_index": np.full(n, ep_idx, dtype=np.int64),

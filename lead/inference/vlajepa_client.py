@@ -4,8 +4,9 @@ The VLA-JEPA model runs in its own process/environment (``vlajepa.sif`` or the
 on-prem inference server) behind ``deployment/model_server/server_policy.py``.
 This client (running inside ``lead.sif`` alongside CARLA) sends the current
 multi-view camera frames + navigation instruction and receives the predicted
-future ego-motion deltas ``[dx, dy, dyaw]`` per step. Waypoint integration and
-PID control stay on the LEAD side (see ``vlajepa_agent.py``).
+future unicycle controls ``[accel, curvature]`` per step (normalized). The agent
+un-normalizes with the server's ``norm_stats`` and rolls them out into ego-frame
+waypoints for LEAD's PID controller (see ``vlajepa_agent.py``).
 """
 
 import logging
@@ -37,8 +38,13 @@ class VLAJEPAClient:
         LOG.info("Connecting to VLA-JEPA policy server at %s:%d", host, port)
         self._client = WebsocketClientPolicy(host=host, port=port)
 
-    def predict_deltas(self, images_rgb: list[np.ndarray], instruction: str) -> np.ndarray:
-        """Return predicted ego-motion deltas of shape ``[chunk_len, 3]`` (dx, dy, dyaw).
+    def server_norm_stats(self) -> dict | None:
+        """Action normalization stats (dataset_statistics) announced by the server."""
+        return self._client.get_server_metadata().get("norm_stats")
+
+    def predict_actions(self, images_rgb: list[np.ndarray], instruction: str) -> np.ndarray:
+        """Return predicted normalized unicycle controls of shape ``[chunk_len, 2]``
+        (accel, curvature). The caller un-normalizes and rolls them out.
 
         Args:
             images_rgb: multi-view frames as HxWx3 uint8 RGB arrays, in the training
@@ -53,7 +59,7 @@ class VLAJEPAClient:
         if not response.get("ok", False):
             raise RuntimeError(f"VLA-JEPA server error: {response.get('error')}")
         normalized_actions = np.asarray(response["data"]["normalized_actions"], dtype=np.float32)
-        # [B, chunk_len, action_dim] -> [chunk_len, 3]
+        # [B, chunk_len, action_dim] -> [chunk_len, 2]
         return normalized_actions[0]
 
     def close(self) -> None:

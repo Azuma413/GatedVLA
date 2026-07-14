@@ -204,3 +204,4 @@ data/vjepa_video/
 .carla_wheels
 
 .env
+.claude/
