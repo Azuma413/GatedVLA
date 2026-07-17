@@ -31,6 +31,11 @@ export VLAJEPA_INFERENCE_INTERVAL=${VLAJEPA_INFERENCE_INTERVAL:-2}
 # 4-camera input video (front_wide|cross_left|front_tele|cross_right横連結) like Alpamayo.
 export LEAD_CLOSED_LOOP_CONFIG=${LEAD_CLOSED_LOOP_CONFIG:-'produce_input_video=true produce_frame_frequency=1'}
 
+# VLA-JEPA only consumes the 4 cameras. Disable LiDAR/radar (as in the light data
+# collection config, USAGE_LocalServer.md) so CARLA doesn't simulate them each
+# tick -- they are pure eval latency here. vlajepa_agent.sensors() reads these flags.
+export LEAD_EXPERT_CONFIG=${LEAD_EXPERT_CONFIG:-'py123d_disable_lidar=true use_radars=false'}
+
 python -m lead \
     --checkpoint vlajepa \
     --vlajepa \

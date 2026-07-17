@@ -18,7 +18,7 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from lead.common import common_utils
 from lead.common.base_agent import BaseAgent
 from lead.common.constants import TargetDataset
-from lead.common.pid_controller import PIDController
+from lead.common.pid_controller import ExpertLongitudinalController, PIDController
 from lead.common.route_planner import RoutePlanner
 from lead.common.sensor_setup import av_sensor_setup
 from lead.inference.alpamayo_inference import AlpamayoInference
@@ -71,7 +71,35 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             device=self.device,
         )
 
-        self.camera_frame_history: deque[dict[int, np.ndarray]] = deque(maxlen=4)
+        # Alpamayo SFT uses 16 history steps + 4 image frames at 0.1s spacing (matches the
+        # PAI export's 10fps videos and load_physical_aiavdataset time_step=0.1). CARLA ticks
+        # at carla_fps, so subsample every `frame_stride` ticks to hit 0.1s.
+        self.alpamayo_time_step = 0.1
+        self.num_history_steps = 16
+        self.num_image_frames = 4
+        self.frame_stride = max(1, round(self.alpamayo_time_step * self.training_config.carla_fps))
+        # Diagnostic toggle: whether to convert LEAD/CARLA ego frame <-> ISO 8855 (SFT export
+        # frame) by flipping y / yaw. Default off keeps the original (pre-fix) coordinate handling.
+        self.iso_frame_flip = os.getenv("ALPAMAYO_ISO_FRAME", "0") == "1"
+        # Diagnostic: log nav_text / route_command / raw+used waypoints / steer per inference.
+        self.debug_nav = os.getenv("ALPAMAYO_DEBUG_NAV", "0") == "1"
+        # Diagnostic: optionally enable the anti-stuck creep (disabled by default in
+        # ClosedLoopConfig) to test recovery from the zero-velocity deadlock.
+        if os.getenv("ALPAMAYO_CREEP", "0") == "1":
+            self.config_closed_loop.sensor_agent_creeping = True
+            self.config_closed_loop.sensor_agent_stuck_threshold = int(
+                os.getenv("ALPAMAYO_STUCK_THRESHOLD", "40"),
+            )
+        # Match data-collection longitudinal control: replace execute_waypoints' bang-bang
+        # throttle/brake with the expert's tuned ExpertLongitudinalController (the controller
+        # that produced the SFT speed profiles). Steering stays pure-pursuit (already turns
+        # correctly; the expert lateral PID assumes a different waypoint spacing). Target speed
+        # is derived from the model trajectory's near-term implied speed.
+        self.use_expert_long = os.getenv("ALPAMAYO_EXPERT_LONG", "0") == "1"
+        self.expert_long_controller = ExpertLongitudinalController(self.config_expert)
+        self.camera_frame_history: deque[dict[int, np.ndarray]] = deque(
+            maxlen=(self.num_image_frames - 1) * self.frame_stride + 1,
+        )
         self.last_pred_waypoints: torch.Tensor | None = None
         self.last_inference_step = -1
         self.inference_interval = int(os.getenv("ALPAMAYO_INFERENCE_INTERVAL", "2"))
@@ -147,8 +175,8 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
     def sensors(self) -> list[dict]:
         return av_sensor_setup(
             config=self.training_config,
-            lidar=True,
-            radar=True,
+            lidar=not self.config_expert.py123d_disable_lidar,
+            radar=self.config_expert.use_radars,
             sensor_agent=True,
             perturbate=False,
             perturbation_rotation=0.0,
@@ -231,21 +259,32 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         return frames
 
     def _ego_history_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # ego_past_positions/yaws are per-tick (carla_fps), oldest -> current, in the LEAD/CARLA
+        # ego frame (x forward, y right). Alpamayo trains on num_history_steps at 0.1s spacing in
+        # the ISO 8855 ego frame (x forward, y left, yaw CCW-positive), so subsample every
+        # frame_stride ticks and flip y / yaw to match the SFT export.
         positions = np.asarray(self.ego_past_positions, dtype=np.float32)
         yaws = np.asarray(self.ego_past_yaws, dtype=np.float32)
         if positions.shape[0] == 0:
             positions = np.zeros((1, 2), dtype=np.float32)
             yaws = np.zeros((1,), dtype=np.float32)
 
-        if positions.shape[0] < 16:
-            pad_count = 16 - positions.shape[0]
+        # newest-first every frame_stride ticks, keep num_history_steps, back to oldest -> current
+        positions = positions[::-1][:: self.frame_stride][: self.num_history_steps][::-1]
+        yaws = yaws[::-1][:: self.frame_stride][: self.num_history_steps][::-1]
+
+        if positions.shape[0] < self.num_history_steps:
+            pad_count = self.num_history_steps - positions.shape[0]
             positions = np.concatenate([np.repeat(positions[:1], pad_count, axis=0), positions])
             yaws = np.concatenate([np.repeat(yaws[:1], pad_count, axis=0), yaws])
-        else:
-            positions = positions[-16:]
-            yaws = yaws[-16:]
 
-        xyz = np.zeros((1, 16, 3), dtype=np.float32)
+        # CARLA (y right, yaw CW) -> ISO 8855 (y left, yaw CCW), matching the SFT export.
+        if self.iso_frame_flip:
+            positions = positions.copy()
+            positions[:, 1] *= -1.0
+            yaws = -yaws
+
+        xyz = np.zeros((1, self.num_history_steps, 3), dtype=np.float32)
         xyz[0, :, :2] = positions
         rot = Rotation.from_euler("z", yaws).as_matrix().astype(np.float32)[None]
         return torch.from_numpy(xyz), torch.from_numpy(rot)
@@ -264,21 +303,25 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
     def _build_alpamayo_sample(self, input_data: dict) -> dict:
         current_frames = self._current_camera_frames(input_data)
         self.camera_frame_history.append(current_frames)
-        while len(self.camera_frame_history) < 4:
-            self.camera_frame_history.appendleft(current_frames)
+        # Alpamayo trains on num_image_frames at 0.1s spacing (t0-0.3..t0). The buffer fills per
+        # tick, so subsample every frame_stride ticks (newest first), order oldest -> current,
+        # and pad by repeating the oldest during warm-up.
+        selected = list(self.camera_frame_history)[::-1][:: self.frame_stride][
+            : self.num_image_frames
+        ][::-1]
+        while len(selected) < self.num_image_frames:
+            selected.insert(0, selected[0])
 
         camera_tensors = []
         for camera_idx in range(1, 5):
-            frame_stack = [frames[camera_idx] for frames in self.camera_frame_history]
+            frame_stack = [frames[camera_idx] for frames in selected]
             frames_np = np.stack(frame_stack, axis=0)
             frames_np = np.transpose(frames_np, (0, 3, 1, 2))
             camera_tensors.append(torch.from_numpy(frames_np.copy()).to(torch.uint8))
 
         ego_history_xyz, ego_history_rot = self._ego_history_tensors()
-        relative_timestamps = torch.tensor(
-            [[0.0, 0.1, 0.2, 0.3]] * 4,
-            dtype=torch.float32,
-        )
+        rel_ts = [round(i * self.alpamayo_time_step, 3) for i in range(self.num_image_frames)]
+        relative_timestamps = torch.tensor([rel_ts] * 4, dtype=torch.float32)
         return {
             "image_frames": torch.stack(camera_tensors, dim=0),
             "camera_indices": torch.tensor([0, 1, 2, 6], dtype=torch.int64),
@@ -288,7 +331,22 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             "navigation_command_text": self._navigation_command_text(
                 input_data.get("route_command", 4),
             ),
+            # r1_5 route conditioning reads data["nav_text"]; matches the PAI
+            # navigation_command command_text used during 1.5 SFT.
+            "nav_text": self._navigation_command_text(
+                input_data.get("route_command", 4),
+            ),
         }
+
+    def _trajectory_target_speed(self) -> float:
+        # Near-term implied speed of the predicted trajectory: median per-step distance over the
+        # first ~1s (robust to noise) divided by the 0.1s step. Frame-independent (uses norms).
+        wp = self.last_pred_waypoints[0].detach().cpu().numpy()
+        n = min(11, wp.shape[0])
+        if n < 2:
+            return 0.0
+        steps = np.linalg.norm(np.diff(wp[:n], axis=0), axis=1)
+        return float(np.median(steps)) / self.alpamayo_time_step
 
     def check_infractions(self) -> None:
         self.infraction_recorder.check_infractions(
@@ -318,8 +376,23 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         )
         if should_infer:
             sample_data = self._build_alpamayo_sample(input_data)
-            self.last_pred_waypoints = self.alpamayo_inference.predict_waypoints(sample_data)
+            raw_pred = self.alpamayo_inference.predict_waypoints(sample_data)
+            # Model predicts in the ISO 8855 ego frame (y left); the LEAD controller expects the
+            # CARLA ego frame (y right). Flip y back before control.
+            if self.iso_frame_flip:
+                pred_waypoints = raw_pred.clone()
+                pred_waypoints[..., 1] *= -1.0
+            else:
+                pred_waypoints = raw_pred
+            self.last_pred_waypoints = pred_waypoints
             self.last_inference_step = self.step
+            if self.debug_nav:
+                self._dbg = {
+                    "route_command": input_data.get("route_command"),
+                    "nav_text": sample_data["nav_text"],
+                    "raw_wp": raw_pred[0, :6, :].tolist(),
+                    "used_wp": pred_waypoints[0, :6, :].tolist(),
+                }
         else:
             self._build_alpamayo_sample(input_data)
 
@@ -328,6 +401,19 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             self.last_pred_waypoints.to(self.device),
             ego_speed,
         )
+
+        model_throttle, model_brake = float(throttle), float(brake)
+
+        if self.use_expert_long:
+            # Keep pure-pursuit steer; replace throttle/brake with the expert's tuned
+            # longitudinal controller fed the model trajectory's implied target speed.
+            target_speed = self._trajectory_target_speed()
+            throttle_e, brake_bool = self.expert_long_controller.get_throttle_and_brake(
+                hazard_brake=False,
+                target_speed=target_speed,
+                current_speed=float(input_data["speed"]),
+            )
+            throttle, brake = float(throttle_e), (1.0 if brake_bool else 0.0)
 
         throttle, brake = self.force_move_post_processor.adjust(
             float(input_data["speed"]),
@@ -339,6 +425,21 @@ class AlpamayoAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             throttle,
             brake,
         )
+
+        if self.debug_nav and should_infer:
+            loc = self._vehicle.get_transform().location
+            fm = self.force_move_post_processor
+            LOG.info(
+                "NAVDBG step=%d pos=(%.1f,%.1f) yaw=%.1f spd=%.2f cmd=%s nav=%r steer=%.3f "
+                "model(thr=%.2f,brk=%.2f) final(thr=%.2f,brk=%.2f) stuck=%d force_move=%d used_wp=%s",
+                self.step, loc.x, loc.y,
+                self._vehicle.get_transform().rotation.yaw,
+                float(input_data["speed"]),
+                self._dbg["route_command"], self._dbg["nav_text"], float(steer),
+                model_throttle, model_brake, float(throttle), float(brake),
+                fm.stuck_detector, fm.force_move,
+                [[round(c, 2) for c in p] for p in self._dbg["used_wp"]],
+            )
         self.meters_travelled += float(input_data["speed"]) * self.config_closed_loop.carla_frame_rate
         input_data["meters_travelled"] = self.meters_travelled
 

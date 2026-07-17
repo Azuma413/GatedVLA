@@ -20,14 +20,15 @@ framework:
     hidden_size: 1024
     add_pos_embed: true
     max_seq_len: 1024
-    # Driving action = ego frame-to-frame local delta [dx, dy, dyaw].
-    action_dim: 3
+    # Driving action = unicycle control [accel, curvature] (Alpamayo 1.5).
+    action_dim: 2
     # No proprio state (with_state=false). Disables the state encoder.
     state_dim: 0
-    # chunk_len = future_action_window_size + 1 = 20 future deltas (~2s @ 10Hz).
-    # This is both the model action chunk and the dataloader action_horizon.
-    future_action_window_size: 19
-    action_horizon: 20
+    # chunk_len = future_action_window_size + 1 = 64 future controls (~6.4s @ 10Hz),
+    # matching Alpamayo 1.5. This is both the model action chunk and the
+    # dataloader action_horizon.
+    future_action_window_size: 63
+    action_horizon: 64
     past_action_window_size: 0
     repeated_diffusion_steps: 8
     noise_beta_alpha: 1.5

@@ -30,12 +30,13 @@ def main(args) -> None:
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
 
-    # start websocket server
+    # start websocket server. Expose the action normalization stats so the driving
+    # client can un-normalize [accel, curvature] before the unicycle rollout.
     server = WebsocketPolicyServer(
         policy=vla,
         host="0.0.0.0",
         port=args.port,
-        metadata={"env": "simpler_env"},
+        metadata={"env": "simpler_env", "norm_stats": getattr(vla, "norm_stats", None)},
     )
     logging.info("server running ...")
     server.serve_forever()

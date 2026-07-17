@@ -789,8 +789,10 @@ class CarlaEgoDataConfig:
 
     Four camera views are exposed to the VLM; the two front views (indices 0 and 2:
     front_wide, front_tele) are used as the V-JEPA world-model views. The action is
-    the ego frame-to-frame local delta [dx, dy, dyaw] (metres, metres, radians),
-    which is O(1) and left unnormalized (StateActionToTensor only). No proprio state.
+    the unicycle control [accel, curvature] (Alpamayo 1.5). accel and curvature
+    live on very different scales (std ~3.5 vs ~0.02), so each is normalized
+    per-dim (mean_std) -- otherwise curvature is drowned out of the flow-matching
+    loss and the model never learns to turn. No proprio state.
     """
 
     video_keys = [
@@ -801,9 +803,8 @@ class CarlaEgoDataConfig:
     ]
     state_keys: list = field(default_factory=list)
     action_keys = [
-        "action.dx",
-        "action.dy",
-        "action.dyaw",
+        "action.accel",
+        "action.curvature",
     ]
     language_keys = ["annotation.human.action.task_description"]
 
@@ -833,6 +834,16 @@ class CarlaEgoDataConfig:
     def transform(self):
         transforms = [
             StateActionToTensor(apply_to=self.action_keys),
+            # Per-dim mean/std normalization (stats come from dataset_statistics via
+            # set_metadata). Inference un-normalizes with the same stats before the
+            # unicycle rollout.
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.accel": "mean_std",
+                    "action.curvature": "mean_std",
+                },
+            ),
         ]
         return ComposedModalityTransform(transforms=transforms)
 

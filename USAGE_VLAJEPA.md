@@ -20,7 +20,7 @@
 
 [評価: オンプレ NVIDIA]
   CARLA(carla.sif) ── LEAD vlajepa_agent (lead.sif) ──websocket──> VLA-JEPA policy server
-                          ▲ SE(2)積分→ego waypoints → PID → 制御      │ 予測 ego デルタ [dx,dy,dyaw]×20
+                          ▲ unicycleロールアウト→ego waypoints → PID   │ 予測 [accel,curvature]×64 (正規化)
                           └────────────────────────────────────────────┘
 ```
 
@@ -50,13 +50,13 @@ accelerate はその既存プロセスグループを再利用します。
 | `starVLA/dataloader/__init__.py` | `delete_pause_frame` を config から渡す |
 | `starVLA/dataloader/gr00t_lerobot/{data_config,mixtures,embodiment_tags}.py` | `carla_ego` データ設定/mixture/embodiment を登録 |
 | `starVLA/config/aurora_xpu.yaml` | (参考)非DeepSpeed の XPU accelerate 設定 |
-| `scripts/config/vlajepa_carla_ft.yaml` | 運転用 config(action_dim=3, horizon=20, sdpa, with_state=false, delete_pause_frame=false) |
+| `scripts/config/vlajepa_carla_ft.yaml` | 運転用 config(action_dim=2, horizon=64, sdpa, with_state=false, delete_pause_frame=false) |
 
 ## リポジトリ側の追加ファイル
 
 | ファイル | 役割 |
 | --- | --- |
-| `scripts/pai_to_lerobot.py` | PAI → LeRobot v2.1(+modality.json)変換。行動=ego デルタ[dx,dy,dyaw] |
+| `scripts/pai_to_lerobot.py` | PAI → LeRobot v2.1(+modality.json)変換。行動=unicycle制御[accel,curvature](Alpamayo 1.5) |
 | `scripts/aurora/setup_venv_vlajepa.sh` | frameworks module 上に不足依存だけ重ねる venv 作成 |
 | `scripts/aurora/prepare_data_vlajepa.pbs` | 123D→PAI→LeRobot(lead.sif, 計算ノード) |
 | `scripts/aurora/train_vlajepa_carla_venv.pbs` | **Aurora XPU 学習(mpiexec+xccl DDP)** |
@@ -67,8 +67,12 @@ accelerate はその既存プロセスグループを再利用します。
 
 ## 設計上の決定
 
-- **行動表現**: 各フレームの `action` = 自車のフレーム間ローカルデルタ `[dx, dy, dyaw]`(m, m, rad)。未来 `H=20`(≈2秒
-  @10Hz)を予測し、評価時に LEAD 側で SE(2) 積分して自車 waypoint 列に戻す。デルタは O(1) なので正規化しない。
+- **行動表現(Alpamayo 1.5準拠)**: 各フレームの `action` = ユニサイクル制御 `[accel, curvature]`(m/s², 1/m)。
+  Alpamayo 1.5 の `UnicycleAccelCurvatureActionSpace`(`3rd_party/alpamayo1.5`)で軌道から算出する。未来 `H=64`
+  (≈6.4秒 @10Hz)を予測し、評価時に LEAD 側で `action_to_traj`(現在speedを初期値)にロールアウトして自車 waypoint
+  列に戻す。**accel と curvature はスケールが大きく異なる(std ≈3.5 対 ≈0.02)ため、各次元を mean/std 正規化する**
+  (未正規化だと curvature が flow-matching 損失で埋没し旋回を学習できない)。推論側は server の `norm_stats` で
+  un-normalize してからロールアウトする。
 - **カメラ**: LeRobot video_key 順は `[front_wide, cross_left, front_tele, cross_right]`。VLM に4枚、V-JEPA2 に
   index 0,2(front_wide, front_tele)。評価時 LEAD の `rgb_1..4=[cross_left,front_wide,cross_right,front_tele]` なので
   エージェントは `[rgb_2, rgb_1, rgb_4, rgb_3]` の順で送る。
@@ -111,7 +115,7 @@ tail -f logs/aurora_prepare_data_vlajepa.out
 ```
 
 出力 `data/lerobot/carla_lerobot/`: `meta/{info,modality,episodes,tasks}` と
-`data/chunk-000/episode_*.parquet`(action=[dx,dy,dyaw]) と `videos/chunk-000/observation.images.<cam>/episode_*.mp4`。
+`data/chunk-000/episode_*.parquet`(action=[accel,curvature]) と `videos/chunk-000/observation.images.<cam>/episode_*.mp4`。
 
 ## 4. 学習（Aurora XPU, mpiexec + xccl DDP）
 
@@ -166,14 +170,15 @@ ROUTE=data/benchmark_routes/bench2drive/23687.xml OUTPUT_ROOT=outputs/vlajepa_b2
 ```
 
 `python -m lead --checkpoint vlajepa --vlajepa --bench2drive --routes ...` を実行。`vlajepa_agent.py` が毎
-`VLAJEPA_INFERENCE_INTERVAL` ステップで4カメラ+nav命令を送り、返る `[dx,dy,dyaw]×20` を SE(2) 積分して
-`execute_waypoints`(LEAD PID)へ。出力: `23687_input.mp4`, `metric_info.json`, `infractions.json`。
+`VLAJEPA_INFERENCE_INTERVAL` ステップで4カメラ(各224²にリサイズ)+nav命令を送り、返る正規化 `[accel,curvature]×64`
+を server の `norm_stats` で un-normalize → `action_to_traj`(現在speed起点)でロールアウトして `execute_waypoints`
+(LEAD PID)へ。出力: `23687_input.mp4`, `metric_info.json`, `infractions.json`。
 
 ---
 
 ## 動作確認状況（2026-07-08）
 
-- [x] `py_compile` / ego デルタ↔SE(2)積分 往復(誤差0m) / 合成PAI→LeRobot 変換
+- [x] `py_compile` / `[accel,curvature]`↔`action_to_traj` 往復(実CARLAクリップで誤差≈0.44m/6.4s・40m, 旋回y符号一致) / PAI→LeRobot 変換
 - [x] Qwen3-VL-2B / V-JEPA2 ダウンロード
 - [x] データ変換(実データ8クリップ→8 episodes/2437 frames)
 - [x] frameworks venv 構築(XPU torch 維持)

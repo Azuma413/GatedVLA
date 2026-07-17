@@ -73,10 +73,16 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         server_host = os.getenv("VLAJEPA_SERVER_HOST", "127.0.0.1")
         server_port = int(os.getenv("VLAJEPA_SERVER_PORT", "10093"))
         self.vlajepa_client = VLAJEPAClient(host=server_host, port=server_port)
+        # Action normalization stats announced by the server (dataset_statistics),
+        # used to un-normalize [accel, curvature] before the unicycle rollout.
+        self._server_norm_stats = self.vlajepa_client.server_norm_stats()
+        self._action_space = None  # Alpamayo unicycle action space; built lazily
 
         self.last_pred_waypoints: torch.Tensor | None = None
         self.last_inference_step = -1
         self.inference_interval = int(os.getenv("VLAJEPA_INFERENCE_INTERVAL", "2"))
+        # Training resizes every VLM view to resolution_size x resolution_size (224).
+        self.vlajepa_image_size = int(os.getenv("VLAJEPA_IMAGE_SIZE", "224"))
 
         self.bb_buffer = deque(maxlen=1)
         self.stop_sign_post_processor = StopSignPostProcessor(
@@ -147,10 +153,14 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     @beartype
     def sensors(self) -> list[dict]:
+        # VLA-JEPA drives from the 4 cameras only; LiDAR/radar are unused by the
+        # policy and their per-tick simulation just adds latency. Gate them on the
+        # same expert-config flags as data collection (LEAD_EXPERT_CONFIG:
+        # py123d_disable_lidar / use_radars), matching AlpamayoAgent.
         return av_sensor_setup(
             config=self.training_config,
-            lidar=True,
-            radar=True,
+            lidar=not self.config_expert.py123d_disable_lidar,
+            radar=self.config_expert.use_radars,
             sensor_agent=True,
             perturbate=False,
             perturbation_rotation=0.0,
@@ -231,12 +241,21 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         Training video_keys order is [front_wide, cross_left, front_tele, cross_right].
         LEAD's rig maps rgb_1..4 -> [cross_left, front_wide, cross_right, front_tele],
         so the requested order is [rgb_2, rgb_1, rgb_4, rgb_3].
+
+        Each view is square-resized to ``resolution_size`` (224) to match training:
+        the dataloader feeds ``Image.fromarray(video[0]).resize((224, 224))`` to the
+        VLM. predict_action's own resize is gated on a non-existent ``image_size``
+        config key, so it never fires; we resize here so the VLM sees the same
+        resolution/aspect it was trained on.
         """
         order = [2, 1, 4, 3]
+        size = self.vlajepa_image_size
         images = []
         for camera_idx in order:
             bgr = input_data[f"rgb_{camera_idx}"]
-            images.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
+            images.append(rgb)
         return images
 
     def _navigation_command_text(self, route_command: int) -> str:
@@ -250,22 +269,56 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         }
         return command_map.get(int(route_command), "Follow the lane")
 
-    @staticmethod
-    def _integrate_deltas(deltas: np.ndarray) -> np.ndarray:
-        """Integrate per-step local ego deltas [N,3] (dx,dy,dyaw) into ego-frame
-        waypoints [N,2] via SE(2) dead reckoning (current pose = origin)."""
-        n = deltas.shape[0]
-        waypoints = np.zeros((n, 2), dtype=np.float32)
-        x = y = theta = 0.0
-        for k in range(n):
-            dx, dy, dyaw = float(deltas[k, 0]), float(deltas[k, 1]), float(deltas[k, 2])
-            cos_t, sin_t = np.cos(theta), np.sin(theta)
-            x += cos_t * dx - sin_t * dy
-            y += sin_t * dx + cos_t * dy
-            theta += dyaw
-            waypoints[k, 0] = x
-            waypoints[k, 1] = y
-        return waypoints
+    def _build_action_space(self, n_waypoints: int):
+        """Build Alpamayo 1.5's unicycle action space seeded with the server's
+        accel/curvature normalization stats (action_to_traj un-normalizes with them)."""
+        import sys
+        from pathlib import Path
+
+        stats = self._server_norm_stats
+        if not stats:
+            raise RuntimeError(
+                "Server announced no norm_stats; cannot un-normalize [accel, curvature]. "
+                "Ensure the policy server run dir has dataset_statistics.json."
+            )
+        action_stats = stats[next(iter(stats))]["action"]
+        mean = np.asarray(action_stats["mean"], dtype=np.float64)
+        std = np.asarray(action_stats["std"], dtype=np.float64)
+
+        alpamayo15 = Path(__file__).resolve().parents[2] / "3rd_party" / "alpamayo1.5" / "src"
+        if str(alpamayo15) not in sys.path:
+            sys.path.insert(0, str(alpamayo15))
+        from alpamayo1_5.action_space.unicycle_accel_curvature import (
+            UnicycleAccelCurvatureActionSpace,
+        )
+
+        return UnicycleAccelCurvatureActionSpace(
+            accel_mean=float(mean[0]),
+            accel_std=float(std[0]),
+            curvature_mean=float(mean[1]),
+            curvature_std=float(std[1]),
+            dt=1.0 / self.training_config.carla_fps * self.training_config.data_save_freq,
+            n_waypoints=n_waypoints,
+        )
+
+    def _rollout_actions(self, actions_norm: np.ndarray, ego_speed: float) -> np.ndarray:
+        """Roll out normalized unicycle controls [N,2] (accel, curvature) into
+        ego-frame waypoints [N,2] via Alpamayo's ``action_to_traj``, seeded with the
+        current speed. The action space un-normalizes internally. The resulting
+        frame is ISO 8855 (x forward, y LEFT), matching LEAD's PID convention.
+        """
+        if self._action_space is None or self._action_space.n_waypoints != actions_norm.shape[0]:
+            self._action_space = self._build_action_space(actions_norm.shape[0])
+        act = torch.from_numpy(actions_norm.astype(np.float64)).unsqueeze(0)  # (1,N,2)
+        hist = torch.zeros(1, 2, 3, dtype=torch.float64)
+        hist_rot = torch.eye(3, dtype=torch.float64)[None, None].repeat(1, 2, 1, 1)
+        future_xyz, _ = self._action_space.action_to_traj(
+            act,
+            hist,
+            hist_rot,
+            t0_states={"v": torch.tensor([float(ego_speed)], dtype=torch.float64)},
+        )
+        return future_xyz[0, :, :2].numpy().astype(np.float32)
 
     def check_infractions(self) -> None:
         self.infraction_recorder.check_infractions(
@@ -296,8 +349,8 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         if should_infer:
             images = self._vlajepa_images(input_data)
             instruction = self._navigation_command_text(input_data.get("route_command", 4))
-            deltas = self.vlajepa_client.predict_deltas(images, instruction)
-            waypoints = self._integrate_deltas(deltas)
+            actions = self.vlajepa_client.predict_actions(images, instruction)
+            waypoints = self._rollout_actions(actions, float(input_data["speed"]))
             self.last_pred_waypoints = torch.from_numpy(waypoints).unsqueeze(0).to(self.device)
             self.last_inference_step = self.step
 
