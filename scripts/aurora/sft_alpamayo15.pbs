@@ -93,6 +93,10 @@ export TOKENIZERS_PARALLELISM=false
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
+# alpamayo_r1 action-space geometry solves force fp32 via autocast guards written
+# for CUDA; on XPU those are no-ops (bf16 rhs vs fp32 Cholesky factor -> dtype
+# mismatch in cholesky_solve). Tell them to disable *XPU* autocast instead.
+export ALPAMAYO_AUTOCAST_DEVICE=${ALPAMAYO_AUTOCAST_DEVICE:-xpu}
 export PYTHONPATH="${REPO_DIR}/3rd_party/alpamayo/src:${RECIPES}/src:${RECIPES}/recipes:${PYTHONPATH:-}"
 # 12 ranks/node each spawn dataloader workers + BLAS threads; cap intra-op threads.
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}

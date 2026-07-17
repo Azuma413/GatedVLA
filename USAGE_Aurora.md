@@ -355,7 +355,8 @@ Stage 2 (traj expert): VLM 凍結で trajectory diffusion expert を学習（教
 | `scripts/aurora/setup_venv_alpamayo15.sh`(新規) | frameworks に 1.5 レシピの leaf 依存だけ足す venv(`outputs/alpamayo15_venv`)。torch/transformers/deepspeed は module。flash-attn は入れない(XPU は eager) |
 | `scripts/aurora/prepare_ckpt_alpamayo15.sh`(新規) | `nvidia/Alpamayo-1.5-10B` を DL → `convert_checkpoint.py to-a1` で A1 形式へ（symlink + config 書換のみ、CPU） |
 | `scripts/aurora/alpamayo15_xpu_entry.py`(新規) | mpiexec/xccl bootstrap → `alpamayo1_5_sft.train_hf`（R1 の `alpamayo_xpu_entry.py` と同型） |
-| `scripts/aurora/sft_alpamayo15.pbs`(新規) | 1 ノード 12 タイルで Stage1/Stage2 を実行。A1 ckpt の `-xpu` view(attn=eager, vlm_name_or_path=ローカル Qwen) を作り offline ロード |
+| `scripts/aurora/sft_alpamayo15.pbs`(新規) | 1 ノード 12 タイルで Stage1/Stage2 を実行。A1 ckpt の `-xpu` view(attn=eager, vlm_name_or_path=ローカル Qwen) を作り offline ロード。`ALPAMAYO_AUTOCAST_DEVICE=xpu` を設定 |
+| `.../alpamayo_r1/action_space/{utils.py,unicycle_accel_curvature.py}` | fp32 強制の autocast ガード `device_type="cuda"` を env `ALPAMAYO_AUTOCAST_DEVICE`(既定 cuda)で切替可能に。XPU では "cuda" 指定が無効で、Stage 2 の trajectory 復元(`cholesky_solve`)が bf16(rhs) vs fp32(L) で落ちるため `xpu` を指定して fp32 を復元 |
 
 ## 0. 事前準備（ログインノード, proxy 経由）
 
@@ -436,6 +437,9 @@ outputs/alpamayo15_sft_aurora/stage2/checkpoint-*/
   §0-4 の `convert_features_csv_pai022.py` を実行する。
 - **`UR_RESULT_ERROR_OUT_OF_RESOURCES`（forward の cross_entropy）**: micro-batch が大きすぎ。
   `BS1=1` にして `ACCUM1` で実効 batch を稼ぐ。
+- **Stage 2 で `RuntimeError: Expected b and A to have the same dtype ...`（`cholesky_solve`）**:
+  `ALPAMAYO_AUTOCAST_DEVICE=xpu` が効いていない（`sft_alpamayo15.pbs` が export 済み）。action_space の
+  autocast ガードが XPU autocast を無効化できず bf16 が混ざるのが原因。
 - **末尾の `|CCL_ERROR| internal_kvs_server ... Bad file descriptor`**: 学習完了後の xccl KVS
   teardown ノイズ。`=== Alpamayo 1.5 SFT done ===` が出ていれば正常終了（mpiexec は 0 で返る）。
 - **ログインノードで import が SIGSEGV**: `torch.xpu`（デバイス 0 個）が原因。検証は計算ノードで。
@@ -452,5 +456,15 @@ outputs/alpamayo15_sft_aurora/stage2/checkpoint-*/
   DeepSpeed ZeRO-2 も起動。
 - [x] **micro-batch probe**（debug, 4 step）: **mb3 は OOM**（cross_entropy）、**mb1 は成功**
   （loss 5.5→6.9→6.5→6.7, ~9s/step @ eff bs 12, `=== Alpamayo 1.5 SFT done ===`）。
-- [ ] 本番 Stage1(eff bs 36, 2ep) → Stage2(eff bs 12, 3ep) を capacity へ投入（ジョブ `8668722`）。W&B
-  `alpamayo15-carla-sft` へログ。完走・checkpoint 生成を確認中。
+- [x] **Stage 1 完走**（capacity, ジョブ `8668722`, eff bs 36, 2 epoch, 616 step, ~3h53m,
+  **train_loss 6.7→2.68**）。`outputs/alpamayo15_sft_aurora/stage1/checkpoint-616` 保存。W&B
+  `alpamayo15-carla-sft/alpamayo15_carla_stage1` へオンライン記録。
+- [x] **Stage 2 の XPU dtype バグを修正**: 初回 Stage 2 は `cholesky_solve`(bf16 rhs vs fp32 L) で全 rank
+  crash。`ALPAMAYO_AUTOCAST_DEVICE=xpu` で fp32 を復元。debug 4-step probe で loss が出て
+  `=== Alpamayo 1.5 SFT done ===`（~2.4s/step @ eff bs 12）を確認。
+- [x] **Stage 2 完走**（capacity, ジョブ `8669070`, `-l walltime=6:00:00`, eff bs 12, 3 epoch,
+  2769 step, **train_runtime ~1h17m**, train_loss ~5.76 の diffusion loss）。dtype 修正後は cholesky
+  エラーなし。`outputs/alpamayo15_sft_aurora/stage2/checkpoint-2769`（30GB, 5 shard + index）保存。W&B
+  `alpamayo15_carla_stage2`。**これで 2 段 SFT 完了**。
+  - メンテ枠（24h ジョブがブロックされる期間）では `-l walltime=6:00:00` 等で短く投げ直すと走る
+    （Stage 2 実測 ~1.3h + ロード/保存）。
