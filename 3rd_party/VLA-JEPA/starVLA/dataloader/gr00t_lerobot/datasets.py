@@ -124,6 +124,7 @@ class LeRobotSingleDataset(Dataset):
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         delete_pause_frame: bool = False,
+        frame_stride: int = 1,
     ):
         """
         Initialize the dataset.
@@ -142,6 +143,10 @@ class LeRobotSingleDataset(Dataset):
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
 
         self.delete_pause_frame = delete_pause_frame
+        # Keep every frame_stride-th frame as a sample start. At 10Hz with a 64-step
+        # action horizon, neighbouring starts share 63/64 of their labels, so a stride
+        # buys epoch time back at almost no cost in information.
+        self.frame_stride = max(int(frame_stride), 1)
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
@@ -348,11 +353,23 @@ class LeRobotSingleDataset(Dataset):
         except (FileNotFoundError, ValidationError) as e:
             print(f"Failed to load dataset statistics: {e}")
             print(f"Calculating dataset statistics for {self.dataset_name}")
-            # Get all parquet files in the dataset paths
-            parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
-            le_statistics = calculate_dataset_statistics(parquet_files)
-            with open(stats_path, "w") as f:
-                json.dump(le_statistics, f, indent=4)
+            # Every rank builds the dataset, so without a guard they all recompute this
+            # and interleave writes into the same path, leaving a corrupt stats file for
+            # the next run. These are the normalization stats, so a bad one is silent.
+            import torch.distributed as dist
+
+            distributed = dist.is_available() and dist.is_initialized()
+            if not distributed or dist.get_rank() == 0:
+                # Get all parquet files in the dataset paths
+                parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
+                le_statistics = calculate_dataset_statistics(parquet_files)
+                with open(stats_path, "w") as f:
+                    json.dump(le_statistics, f, indent=4)
+            if distributed:
+                dist.barrier()
+                if dist.get_rank() != 0:
+                    with open(stats_path, "r") as f:
+                        le_statistics = json.load(f)
         dataset_statistics = {}
         for our_modality in ["state", "action"]:
             dataset_statistics[our_modality] = {}
@@ -399,31 +416,18 @@ class LeRobotSingleDataset(Dataset):
         """
         # Create a hash key based on configuration to ensure cache validity
         config_key = self._get_steps_config_key()
-        
+
         # Create a unique filename based on config_key
         steps_filename = f"steps_{config_key}.pkl"
-        # @BUG
-        # fast get static steps @fangjing --> don't use hash to dynamic sample
-        steps_filename =  "steps_data_index.pkl"
-        steps_filename = "steps_332420bad1ab.pkl"
-
         steps_path = self.dataset_path / "meta" / steps_filename
-        
+
         # Try to load cached steps first
         try:
             if steps_path.exists():
                 with open(steps_path, "rb") as f:
                     cached_data = pickle.load(f)
+                print(f"Loaded {len(cached_data['steps'])} cached steps from {steps_path}")
                 return cached_data["steps"]
-            else:
-                steps_filename = "steps_2d5a34b904d2.pkl"
-                steps_path = self.dataset_path / "meta" / steps_filename
-        
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-
-
         except (FileNotFoundError, pickle.PickleError, KeyError) as e:
             print(f"Failed to load cached steps: {e}")
             print("Computing steps from scratch...")
@@ -458,6 +462,8 @@ class LeRobotSingleDataset(Dataset):
         config_dict = {
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
+            "frame_stride": self.frame_stride,
+            "num_trajectories": len(self.trajectory_ids),
         }
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
@@ -517,12 +523,20 @@ class LeRobotSingleDataset(Dataset):
                     if has_translation_change or has_gripper_change:
                         all_steps.append((trajectory_id, base_index))
             else:
-                for base_index in range(trajectory_length):
+                for base_index in range(0, trajectory_length, self.frame_stride):
                     all_steps.append((trajectory_id, base_index))
-                    
+
         # Print summary statistics
         print(f"Single-process summary: Processed {processed_trajectories} trajectories, skipped {skipped_trajectories} empty trajectories")
-        print(f"Total steps: {len(all_steps)} from {len(self.trajectory_ids)} trajectories")
+        print(f"Total steps: {len(all_steps)} from {len(self.trajectory_ids)} trajectories (frame_stride={self.frame_stride})")
+        if skipped_trajectories:
+            # Almost always a dataset layout problem rather than genuinely bad episodes
+            # (e.g. info.json chunks_size smaller than total_episodes sends lookups to
+            # chunk dirs that were never written), so refuse to train on the remainder.
+            raise RuntimeError(
+                f"{skipped_trajectories}/{len(self.trajectory_ids)} trajectories failed to load "
+                f"and would be silently dropped from training. See the errors above."
+            )
                    
         return all_steps
 

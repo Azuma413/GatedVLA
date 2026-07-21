@@ -19,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 # Standard Library
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Tuple
@@ -302,8 +303,15 @@ class VLATrainer(TrainerUtils):
                 # add learning rate
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
 
-                # add epoch info
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+                # add epoch info. completed_steps counts optimizer steps while the
+                # dataloader counts micro-batches, so an epoch is len()/grad_accum steps.
+                steps_per_epoch = max(
+                    math.ceil(
+                        len(self.vla_train_dataloader) / self.accelerator.gradient_accumulation_steps
+                    ),
+                    1,
+                )
+                metrics["epoch"] = round(self.completed_steps / steps_per_epoch, 2)
 
                 # record to W&B
                 if getattr(self, "use_wandb", False):
@@ -580,6 +588,18 @@ def main(cfg) -> None:
     vla = build_framework(cfg)
     # prepare data
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+
+    # Derive the step budget from the epoch count when asked, before the LR scheduler is
+    # built below (it needs the final max_train_steps for num_training_steps). The loader
+    # is not sharded yet, so len() here counts micro-batches across all ranks.
+    if cfg.trainer.get("train_by_epochs", False):
+        micro_per_rank = math.ceil(len(vla_train_dataloader) / accelerator.num_processes)
+        steps_per_epoch = math.ceil(micro_per_rank / _GRAD_ACCUM)
+        cfg.trainer.max_train_steps = steps_per_epoch * cfg.trainer.epochs
+        logger.info(
+            f"train_by_epochs: {cfg.trainer.epochs} epochs x {steps_per_epoch} steps/epoch "
+            f"= {cfg.trainer.max_train_steps} optimizer steps"
+        )
 
     # set optimizer and scheduler
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)

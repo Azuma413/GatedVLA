@@ -46,15 +46,23 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             action_horizon=cfg.framework.action_model.action_horizon,
             video_horizon=cfg.framework.vj2_model.num_frames,
             # Driving data has no gripper/position columns for pause-frame removal.
-            delete_pause_frame=vla_dataset_cfg.get("delete_pause_frame", True))
+            delete_pause_frame=vla_dataset_cfg.get("delete_pause_frame", True),
+            frame_stride=vla_dataset_cfg.get("frame_stride", 1))
         
+        # Preprocess the V-JEPA videos in the workers rather than in the training
+        # process. accelerate shards this loader, so shuffle=True is what decorrelates
+        # each batch: the dataset is ordered by episode, and without it a batch is N
+        # consecutive 10Hz frames of one episode.
+        from transformers import AutoVideoProcessor
+
+        vj_processor = AutoVideoProcessor.from_pretrained(cfg.framework.vj2_model.base_encoder)
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
-            collate_fn=collate_fn,
+            collate_fn=partial(collate_fn, vj_processor=vj_processor),
             num_workers=8,
-            # shuffle=True
-        )        
+            shuffle=True,
+        )
         if dist.get_rank() == 0: 
             
             output_dir = Path(cfg.output_dir)

@@ -11,7 +11,8 @@
 # native `frameworks` module (torch 2.10+xpu) + a venv of the extra deps. The
 # generic IPEX container cannot see Aurora's XPUs (driver mismatch), so we run
 # natively. Short smoke by default; override via qsub -v.
-#   qsub -v MAX_STEPS=30000,NPROC=12,BS=1 scripts/aurora/train_vlajepa_carla_venv.pbs
+#   qsub -v NPROC=12,PPN=12 scripts/aurora/train_vlajepa_carla_venv.pbs        # full: 3 epochs
+#   qsub -v NPROC=2,MAX_STEPS=5 scripts/aurora/train_vlajepa_carla_venv.pbs    # smoke
 # NB: no `set -u` (Aurora lmod init references unbound vars).
 set -eo pipefail
 
@@ -19,12 +20,19 @@ REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
 VENV=${VENV:-${REPO_DIR}/outputs/vlajepa_venv}
 NPROC=${NPROC:-1}          # total XPU ranks (tiles). 1 node has 12 tiles.
 PPN=${PPN:-${NPROC}}       # ranks per node (<=12)
-MAX_STEPS=${MAX_STEPS:-5}
-SAVE_INTERVAL=${SAVE_INTERVAL:-${MAX_STEPS}}   # smoke: save once at end; full: e.g. 5000
-WARMUP=${WARMUP:-0}                            # smoke: 0; full: 500 (paper)
-BS=${BS:-1}
+# The config trains for trainer.epochs and derives max_train_steps from the dataset.
+# Set MAX_STEPS to cap it instead (smoke tests): that also disables epoch mode.
+MAX_STEPS=${MAX_STEPS:-}
+EPOCHS=${EPOCHS:-}                                  # override config trainer.epochs
+SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
+WARMUP=${WARMUP:-500}                               # smoke: 0; full: 500 (paper)
+BS=${BS:-10}                                        # x12 tiles x GRAD_ACCUM = global batch
 GRAD_ACCUM=${GRAD_ACCUM:-1}                         # optimizer step every N micro-batches
-DATA_ROOT=${DATA_ROOT:-${REPO_DIR}/data/lerobot}   # use data/lerobot_256 for the 256^2 dataset
+DATA_ROOT=${DATA_ROOT:-${REPO_DIR}/data/lerobot_256}   # 256^2 videos; data/lerobot is the 800x600 source
+# Stage 1 (world-model pretrain, train_vjepa_video_carla_venv.pbs) output. Without it the
+# CARLA-pretrained vj_predictor is thrown away and retrained from random init. Pass
+# PRETRAINED_CKPT= (empty) to deliberately start from scratch.
+PRETRAINED_CKPT=${PRETRAINED_CKPT-${REPO_DIR}/outputs/vlajepa_carla_video_full/carla_vjepa_pretrain/final_model/pytorch_model.pt}
 CONFIG=${CONFIG:-scripts/config/vlajepa_carla_ft.yaml}
 
 module use /soft/modulefiles
@@ -78,7 +86,17 @@ CPU_BIND_ARG=""
 # Full state_dict load (same VLA_JEPA arch), so the trained vj_predictor + QwenVL
 # carry over and the action head is then trained on top.
 PRETRAINED_ARG=""
-[ -n "${PRETRAINED_CKPT:-}" ] && PRETRAINED_ARG="--trainer.pretrained_checkpoint=${PRETRAINED_CKPT}"
+if [ -n "${PRETRAINED_CKPT:-}" ]; then
+  # A missing path would otherwise train from random init and only show up as a worse
+  # policy hours later.
+  [ -f "${PRETRAINED_CKPT}" ] || { echo "ERROR: PRETRAINED_CKPT not found: ${PRETRAINED_CKPT}" >&2; exit 1; }
+  PRETRAINED_ARG="--trainer.pretrained_checkpoint=${PRETRAINED_CKPT}"
+fi
+
+# A fixed step budget overrides the config's epoch-derived one.
+STEPS_ARG=""
+[ -n "${MAX_STEPS}" ] && STEPS_ARG="--trainer.train_by_epochs=false --trainer.max_train_steps=${MAX_STEPS}"
+[ -n "${EPOCHS}" ] && STEPS_ARG="${STEPS_ARG} --trainer.epochs=${EPOCHS}"
 
 # shellcheck disable=SC2086
 mpiexec --pmi=pmix --envall -n "${NPROC}" -ppn "${PPN}" ${CPU_BIND_ARG} \
@@ -91,7 +109,7 @@ mpiexec --pmi=pmix --envall -n "${NPROC}" -ppn "${PPN}" ${CPU_BIND_ARG} \
   --datasets.vla_data.per_device_batch_size="${BS}" \
   ${PRETRAINED_ARG} \
   --trainer.gradient_accumulation_steps="${GRAD_ACCUM}" \
-  --trainer.max_train_steps="${MAX_STEPS}" \
+  ${STEPS_ARG} \
   --trainer.save_interval="${SAVE_INTERVAL}" \
   --trainer.num_warmup_steps="${WARMUP}"
 

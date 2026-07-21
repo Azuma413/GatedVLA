@@ -62,6 +62,23 @@ def main() -> None:
     ap.add_argument("--num-history-steps", type=int, default=16)
     ap.add_argument("--num-future-steps", type=int, default=64)
     ap.add_argument("--time-step", type=float, default=0.1)
+    ap.add_argument(
+        "--mode",
+        choices=["cot", "grid"],
+        default="cot",
+        help=(
+            "cot: one sample per CoC label (Stage-1 nav_cot, cot required). "
+            "grid: one sample per clip_index.event_t0s point (Stage-2 nav; cot attached "
+            "by nearest label within --cot-tol-us where available)."
+        ),
+    )
+    ap.add_argument(
+        "--cot-tol-us",
+        type=int,
+        default=600000,
+        help="grid mode: max |t0 - cot_t0| to attach a CoC label (default 0.6s).",
+    )
+    ap.add_argument("--max-clips", type=int, default=None, help="Cap clips for smoke tests.")
     args = ap.parse_args()
 
     hist_us = int(args.num_history_steps * args.time_step * 1e6)
@@ -94,54 +111,107 @@ def main() -> None:
         i = (df["timestamp_us"] - t0).abs().idxmin()
         return str(df.loc[i, "command_text"])
 
-    samples = []
-    stats = {
-        "coc_clips": 0, "clip_not_in_index": 0, "no_nav": 0,
-        "segments_total": 0, "window_skip": 0, "no_label": 0, "kept": 0,
-    }
-    navtext_counts: dict[str, int] = {}
-
-    for clip_id in sorted(os.listdir(args.coc_dir)):
+    def coc_labels_for_clip(clip_id: str) -> list[tuple[int, str]]:
+        """Return [(cot_t0_us, label), ...] for a clip, or [] if none/absent."""
         cdir = os.path.join(args.coc_dir, clip_id)
         if not os.path.isdir(cdir):
-            continue
-        stats["coc_clips"] += 1
-        if clip_id not in meta:
-            stats["clip_not_in_index"] += 1
-            continue
-        m = meta[clip_id]
-        chunk = int(m["chunk"])
-        start, end = int(m["start_timestamp"]), int(m["end_timestamp"])
-        df = nav_df(clip_id, chunk)
-        if df is None:
-            stats["no_nav"] += 1
-            continue
+            return []
+        out = []
         for fname in sorted(os.listdir(cdir)):
             mm = _COT_RE.match(fname)
             if not mm:
                 continue
-            stats["segments_total"] += 1
-            t0 = int(mm.group(1))
-            if not (start + hist_us <= t0 <= end - fut_us):
-                stats["window_skip"] += 1
-                continue
             label = load_label(os.path.join(cdir, fname))
-            if label is None:
-                stats["no_label"] += 1
+            if label is not None:
+                out.append((int(mm.group(1)), label))
+        return out
+
+    samples = []
+    navtext_counts: dict[str, int] = {}
+
+    if args.mode == "cot":
+        # One sample per CoC label (Stage-1 nav_cot; cot required). t0 = cot_t0.
+        stats = {
+            "coc_clips": 0, "clip_not_in_index": 0, "no_nav": 0,
+            "segments_total": 0, "window_skip": 0, "no_label": 0, "kept": 0,
+        }
+        for clip_id in sorted(os.listdir(args.coc_dir)):
+            cdir = os.path.join(args.coc_dir, clip_id)
+            if not os.path.isdir(cdir):
                 continue
-            nav_text = nav_text_at(df, t0)
-            navtext_counts[nav_text] = navtext_counts.get(nav_text, 0) + 1
-            samples.append(
-                {"clip_id": clip_id, "t0_relative": t0, "nav_text": nav_text, "cot": label}
-            )
-            stats["kept"] += 1
+            stats["coc_clips"] += 1
+            if clip_id not in meta:
+                stats["clip_not_in_index"] += 1
+                continue
+            m = meta[clip_id]
+            chunk = int(m["chunk"])
+            start, end = int(m["start_timestamp"]), int(m["end_timestamp"])
+            df = nav_df(clip_id, chunk)
+            if df is None:
+                stats["no_nav"] += 1
+                continue
+            for fname in sorted(os.listdir(cdir)):
+                mm = _COT_RE.match(fname)
+                if not mm:
+                    continue
+                stats["segments_total"] += 1
+                t0 = int(mm.group(1))
+                if not (start + hist_us <= t0 <= end - fut_us):
+                    stats["window_skip"] += 1
+                    continue
+                label = load_label(os.path.join(cdir, fname))
+                if label is None:
+                    stats["no_label"] += 1
+                    continue
+                nav_text = nav_text_at(df, t0)
+                navtext_counts[nav_text] = navtext_counts.get(nav_text, 0) + 1
+                samples.append(
+                    {"clip_id": clip_id, "t0_relative": t0, "nav_text": nav_text, "cot": label}
+                )
+                stats["kept"] += 1
+    else:
+        # One sample per clip_index.event_t0s point (Stage-2 nav; cot not required).
+        # A CoC label is attached when one falls within --cot-tol-us of the grid point.
+        stats = {
+            "clips": 0, "no_nav": 0, "grid_points": 0,
+            "window_skip": 0, "kept": 0, "kept_with_cot": 0,
+        }
+        clip_ids = sorted(meta.keys())
+        if args.max_clips is not None:
+            clip_ids = clip_ids[: args.max_clips]
+        for clip_id in clip_ids:
+            m = meta[clip_id]
+            chunk = int(m["chunk"])
+            start, end = int(m["start_timestamp"]), int(m["end_timestamp"])
+            df = nav_df(clip_id, chunk)
+            stats["clips"] += 1
+            if df is None:
+                stats["no_nav"] += 1
+                continue
+            cots = coc_labels_for_clip(clip_id)  # [(t0, label)] on the coarser CoC grid
+            for t0 in clip_index.loc[clip_id, "event_t0s"]:
+                t0 = int(t0)
+                stats["grid_points"] += 1
+                if not (start + hist_us <= t0 <= end - fut_us):
+                    stats["window_skip"] += 1
+                    continue
+                nav_text = nav_text_at(df, t0)
+                navtext_counts[nav_text] = navtext_counts.get(nav_text, 0) + 1
+                sample = {"clip_id": clip_id, "t0_relative": t0, "nav_text": nav_text}
+                if cots:
+                    ct0, label = min(cots, key=lambda cl: abs(cl[0] - t0))
+                    if abs(ct0 - t0) <= args.cot_tol_us:
+                        sample["cot"] = label
+                        stats["kept_with_cot"] += 1
+                samples.append(sample)
+                stats["kept"] += 1
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(samples, f, indent=1)
 
     n_clips = len({s["clip_id"] for s in samples})
-    print("=== nav+CoC annotation build ===")
+    print(f"=== nav+CoC annotation build (mode={args.mode}) ===")
     for k, v in stats.items():
         print(f"  {k}: {v}")
     print(f"  unique clips kept: {n_clips}")
