@@ -149,6 +149,14 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             step_counter=self.step,
             training_config=self.training_config,
         )
+        # Diagnostic: ground-truth traffic-light / vehicle logging (opt-in).
+        probe_path = os.getenv("LEAD_SIM_PROBE")
+        if probe_path:
+            from sim_probe import SimProbe
+
+            self._sim_probe = SimProbe(probe_path)
+        else:
+            self._sim_probe = None
         self.initialized = True
 
     @beartype
@@ -336,6 +344,9 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             self.control = carla.VehicleControl(steer=0.0, throttle=0.0, brake=1.0)
             self.tick(input_data)
             return self.control
+
+        if self._sim_probe is not None:
+            self._sim_probe.record(self._world, self._vehicle, self.step * 0.05)
 
         if hasattr(self, "video_recorder"):
             self.video_recorder.update_step(self.step)
