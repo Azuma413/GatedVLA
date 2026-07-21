@@ -7,7 +7,24 @@ from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG, EmbodimentTag
 
-def collate_fn(batch):
+def collate_fn(batch, vj_processor=None):
+    """Pass the examples through untouched, optionally preprocessing the V-JEPA videos.
+
+    With num_workers>0 the DataLoader runs this in the worker processes, so handing
+    `vj_processor` in moves the resize/normalize off the training process (where it
+    otherwise runs serially between forward passes and stalls the XPU).
+    """
+    if vj_processor is None:
+        return batch
+    import numpy as np
+
+    for example in batch:
+        video = np.asarray(example.pop("video"))  # [V, T, H, W, 3]
+        video = video.transpose(0, 1, 4, 2, 3)  # [V, T, 3, H, W]
+        # Rows stay ordered [v]; the model concatenates examples into [b*V + v].
+        example["pixel_values_videos"] = vj_processor(
+            videos=list(video), return_tensors="pt"
+        )["pixel_values_videos"]
     return batch
 
 def make_LeRobotSingleDataset(
@@ -17,6 +34,7 @@ def make_LeRobotSingleDataset(
     delete_pause_frame: bool = False,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    frame_stride: int = 1,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -47,6 +65,7 @@ def make_LeRobotSingleDataset(
         embodiment_tag=embodiment_tag,
         video_backend="torchvision_av",
         delete_pause_frame=delete_pause_frame,
+        frame_stride=frame_stride,
     )
 
 def get_vla_dataset(
@@ -58,6 +77,7 @@ def get_vla_dataset(
     delete_pause_frame: bool = True,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    frame_stride: int = 1,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
     """
@@ -81,9 +101,10 @@ def get_vla_dataset(
         dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), 
                                                           d_name, 
                                                           robot_type, 
-                                                          delete_pause_frame=delete_pause_frame, 
+                                                          delete_pause_frame=delete_pause_frame,
                                                           action_horizon=action_horizon,
-                                                          video_horizon=video_horizon), d_weight))
+                                                          video_horizon=video_horizon,
+                                                          frame_stride=frame_stride), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,

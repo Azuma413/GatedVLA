@@ -63,7 +63,6 @@ COMMAND_TEXT_BY_VALUE = {
 }
 
 FPS = 10.0
-CHUNKS_SIZE = 1000  # all episodes land in chunk 0 for our dataset sizes
 
 
 def parse_args() -> argparse.Namespace:
@@ -265,7 +264,11 @@ def write_info_json(output_dir: Path, robot_type: str, total_episodes: int, tota
         "total_tasks": total_tasks,
         "total_videos": total_episodes * len(CAMERA_MAP),
         "total_chunks": 1,
-        "chunks_size": CHUNKS_SIZE,
+        # Every episode is written to chunk-000, so chunks_size must cover them all:
+        # readers resolve a parquet/video path with episode_index // chunks_size, and
+        # a smaller value sends episodes >= chunks_size to chunk-001+, which we never
+        # write. GR00T's loader swallows the resulting open failure and drops them.
+        "chunks_size": max(total_episodes, 1),
         "fps": FPS,
         "splits": {"train": f"0:{total_episodes}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",

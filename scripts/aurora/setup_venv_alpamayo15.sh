@@ -44,7 +44,7 @@ python -m pip install --no-cache-dir \
     "einops>=0.8.1" \
     "physical-ai-av>=0.2.0" \
     "torchmetrics==1.8.2" \
-    "wandb>=0.25.0" \
+    "wandb==0.24.2" \
     "rich>=14.3.3" \
     "mediapy>=1.2.4" \
     "av>=16.0.1" \

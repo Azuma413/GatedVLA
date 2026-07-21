@@ -50,7 +50,7 @@ accelerate はその既存プロセスグループを再利用します。
 | `starVLA/dataloader/__init__.py` | `delete_pause_frame` を config から渡す |
 | `starVLA/dataloader/gr00t_lerobot/{data_config,mixtures,embodiment_tags}.py` | `carla_ego` データ設定/mixture/embodiment を登録 |
 | `starVLA/config/aurora_xpu.yaml` | (参考)非DeepSpeed の XPU accelerate 設定 |
-| `scripts/config/vlajepa_carla_ft.yaml` | 運転用 config(action_dim=2, horizon=64, sdpa, with_state=false, delete_pause_frame=false) |
+| `scripts/config/vlajepa_carla_ft.yaml` | 運転用 config(action_dim=2, horizon=64, sdpa, with_state=false, delete_pause_frame=false, frame_stride=12, train_by_epochs+epochs=3, per_device_batch_size=10, freeze_modules=vj_encoder) |
 
 ## リポジトリ側の追加ファイル
 
@@ -110,26 +110,64 @@ bash scripts/aurora/setup_venv_vlajepa.sh   # outputs/vlajepa_venv を作成
 `lead.sif`(CPU)で実行。検証時は少数クリップだけ変換(`MAX_LOGS`, 既定8; 全件は `MAX_LOGS=0`)。
 
 ```bash
-qsub scripts/aurora/prepare_data_vlajepa.pbs
+# PAI が既にある場合は SKIP_EXPORT=1 で Step 2 のみ。全4,459クリップで約3.5時間かかるので
+# debug キュー(walltime 1h)ではなく capacity で流す。--overwrite が出力先を rmtree する。
+qsub -q capacity -l walltime=6:00:00 -v SKIP_EXPORT=1 scripts/aurora/prepare_data_vlajepa.pbs
 tail -f logs/aurora_prepare_data_vlajepa.out
 ```
 
 出力 `data/lerobot/carla_lerobot/`: `meta/{info,modality,episodes,tasks}` と
 `data/chunk-000/episode_*.parquet`(action=[accel,curvature]) と `videos/chunk-000/observation.images.<cam>/episode_*.mp4`。
 
-## 4. 学習（Aurora XPU, mpiexec + xccl DDP）
+**学習が読むのは `data/lerobot` ではなく `data/lerobot_256`**(256²動画。800x600 をデコードしてから縮小するのが
+I/O ボトルネックだったため)。`data/lerobot` を作り直したら必ずこれも流す:
 
 ```bash
-# 短い動作確認(2タイル, 5ステップ)
-qsub -v NPROC=2 scripts/aurora/train_vlajepa_carla_venv.pbs
+qsub scripts/aurora/reencode_lerobot_256.pbs   # meta をコピー(info.json を256にパッチ)+ parquet を symlink
+```
+
+parquet は symlink なので action は自動で伝播するが、**`meta/` はコピーなので再実行しないと古いまま**。
+動画は不変なので resumable でスキップされる。`meta/steps_*.pkl`(step index キャッシュ)が残っていたら消す。
+
+## 4. 学習（Aurora XPU, mpiexec + xccl DDP）
+
+**2段階**。Stage 1 で world model(`vj_predictor` + QwenVL)を CARLA 動画に事前学習し、Stage 2 が
+その checkpoint を読んで action head を学習する。凍結された `vj_encoder`(facebook/vjepa2-vitl)自体は
+どちらの段でも学習しない。
+
+### 4.1 Stage 1: V-JEPA2 world model 事前学習 — **完了済み(2026-07-12)、再実行不要**
+
+```bash
+# 実行済み: carla_full_256/clips 全4,459クリップ, BS=1 x 12タイル, 30,000 steps, 7h20m
+qsub -v NPROC=12,PPN=12,MAX_STEPS=30000,VIDEO_DIR=... scripts/aurora/train_vjepa_video_carla_venv.pbs
+```
+
+成果物 `outputs/vlajepa_carla_video_full/carla_vjepa_pretrain/final_model/pytorch_model.pt` (6.4GB)。
+`action` を使わず `wm_loss` のみ・`video_datasets` 分岐(LeRobot 非経由・`DistributedSampler(shuffle=True)` あり)・
+`BS=1` で走ったため、**§6 のバグはいずれも Stage 1 には影響していない**(1 は LeRobot 非経由、2 は B>1 のみ、
+3 は sampler あり、4 は action 不使用)。
+
+### 4.2 Stage 2: action head の学習
+
+```bash
+# 短い動作確認(2タイル, 5ステップ)。MAX_STEPS を渡すと epoch モードが無効になる
+qsub -v NPROC=2,MAX_STEPS=5 scripts/aurora/train_vlajepa_carla_venv.pbs
 tail -f logs/aurora_train_vlajepa_carla_venv.out
 
-# 1ノードフル(12タイル)
-qsub -v NPROC=12,PPN=12,MAX_STEPS=30000 scripts/aurora/train_vlajepa_carla_venv.pbs
+# 1ノードフル(12タイル): config の trainer.epochs 分だけ回す
+qsub -q capacity -l walltime=12:00:00 -v NPROC=12,PPN=12 scripts/aurora/train_vlajepa_carla_venv.pbs
 
-# 複数ノード(例: 4ノード=48タイル)
-qsub -l select=4 -v NPROC=48,PPN=12,MAX_STEPS=30000 scripts/aurora/train_vlajepa_carla_venv.pbs
+# epoch 数を変える(例: 20 epoch)
+qsub -q capacity -l walltime=24:00:00 -v NPROC=12,PPN=12,EPOCHS=20 scripts/aurora/train_vlajepa_carla_venv.pbs
 ```
+
+**`PRETRAINED_CKPT` は §4.1 の Stage 1 checkpoint を既定で読む**(PBS 内で `${REPO_DIR}` から解決、
+存在しなければ即エラー終了)。これを渡し忘れると Stage 1 の `vj_predictor` を捨ててランダム初期化から
+学習してしまう(2026-07-13 の17時間の学習はこれをやっていた)。意図的にスクラッチから始める場合のみ
+`-v PRETRAINED_CKPT=` を空で渡す。
+
+`DATA_ROOT` の既定は **`data/lerobot_256`**(256²動画; §3 の `data/lerobot` はその生成元)。
+`BS`(既定10) x タイル数 x `GRAD_ACCUM`(既定1) = global batch。既定は 10x12x1 = **120**。
 
 内部は `mpiexec --pmi=pmix --envall -n ${NPROC} -ppn ${PPN} python -u train_starvla.py --config_yaml
 scripts/config/vlajepa_carla_ft.yaml --<overrides>`。`NPROC` は総タイル数、`PPN`(≤12)はノード内タイル数。
@@ -173,6 +211,31 @@ ROUTE=data/benchmark_routes/bench2drive/23687.xml OUTPUT_ROOT=outputs/vlajepa_b2
 `VLAJEPA_INFERENCE_INTERVAL` ステップで4カメラ(各224²にリサイズ)+nav命令を送り、返る正規化 `[accel,curvature]×64`
 を server の `norm_stats` で un-normalize → `action_to_traj`(現在speed起点)でロールアウトして `execute_waypoints`
 (LEAD PID)へ。出力: `23687_input.mp4`, `metric_info.json`, `infractions.json`。
+
+---
+
+## 6. 学習が壊れていた原因（2026-07-17 に発見・修正、実機検証はこれから）
+
+2026-07-13 の17時間の学習で Policy が学習できなかった原因は4つ重なっていた。いずれも無言で失敗する。
+
+| # | バグ | 症状 | 修正 |
+| --- | --- | --- | --- |
+| 1 | `pai_to_lerobot.py` が全4,459 episode を `chunk-000` に書くのに `info.json` に `chunks_size: 1000` と書いていた | ローダは `episode_index // chunks_size` でパス解決するため episode 1000 以降が存在しない `chunk-001`〜`004` を指し、例外を `except` が握り潰して **3,459 episode (77.6%) を無言で破棄**(step index の実測: 4,459 中 1,000 trajectory のみ) | `chunks_size: max(total_episodes, 1)`。取りこぼしは例外で落とすように変更 |
+| 2 | `VLA_JEPA.py` の `torch.chunk(video_embeddings, chunks=V, dim=0)` | 行は `[b*V+v]` 順なのに連続ブロックで分割するため**異なるサンプルの view を結合**。形状は正しいので無言。**B=1 でのみ正しい**が実際の学習は BS=10 だった → `wm_loss` がゴミ | `view(B,V,L,D).permute(0,2,1,3).reshape(B,L,V*D)` |
+| 3 | `dataloader/__init__.py` の `lerobot_datasets` 分岐だけ `shuffle=True` がコメントアウト・sampler 無し | バッチ10件が同一 episode の連続10フレーム(1秒)。相関の極めて高いバッチ | `shuffle=True`(accelerate が shard する) |
+| 4 | action が未正規化 | accel(std≈3.5) に対し curvature(std≈0.02) が flow-matching 損失に埋没し旋回を学習しない | `mean_std` 正規化(§設計上の決定) |
+
+その他、同時に判明した点:
+
+- `_get_all_steps` が step index キャッシュのファイル名をハードコードしており(上流が `# @BUG` と明記)、
+  config ハッシュを無視して壊れた index を無言でロードし続けていた → ハードコードを撤去し
+  `frame_stride`/`num_trajectories` を鍵に追加。
+- `repeated_diffusion_steps` を `framework.action_model.*` に置いていたが、コードは `trainer.*` を読むため
+  **既定値4が黙って使われていた** → `trainer.*` へ移動。
+- `freeze_modules` はオプティマイザから除外するだけで `requires_grad=False` にしない → `vj_encoder.requires_grad_(False)`
+  を明示。これで DDP の reducer バケットからも外れる。
+- Stage 2 が `PRETRAINED_CKPT` を渡しておらず Stage 1 を捨てていた → PBS の既定値にし、存在しなければエラー終了。
+- `epoch` メトリクスが optimizer step を micro-batch 数で割っており grad accum 分だけ膨張していた。
 
 ---
 

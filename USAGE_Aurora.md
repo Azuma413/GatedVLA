@@ -331,9 +331,14 @@ tail -f logs/aurora_coc_parallel.out
 旧 R1 レシピ（`3rd_party/alpamayo`, `finetune.sft`）とは別物です。
 
 ```
-Stage 1 (VLM SFT):  画像 + 過去軌道 + navigation command  ->  CoC + 離散 trajectory token(128)
-Stage 2 (traj expert): VLM 凍結で trajectory diffusion expert を学習（教師は traj_future のみ）
+Stage 1a (VLM SFT): 画像 + 過去軌道 + nav command -> 離散 trajectory token（nav processor, cot 無し, 全サンプル）
+Stage 1b (VLM SFT): 上に CoC を追加学習（nav_cot processor, cot+traj, CoC 付きサブセット, 1a から継続）
+Stage 2  (traj expert): VLM 凍結で trajectory diffusion expert を学習（nav processor, 教師は traj_future のみ）
 ```
+
+> CoC はレシピ上オプション（`sft_stage1_nav` の既定プロセッサは cot 無しの `nav`）。論文の Stage 1 は
+> 2 フェーズで、1a で全データの軌道トークン化を学習してから、1b で CoC 付きデータに cot+nav を上乗せする。
+> 1b は `model.checkpoint_path` で 1a の出力を読む（ローダが `vlm.` 接頭辞を剥がす）。fresh optimizer。
 
 - **分散は frameworks module + venv + mpiexec/xccl**（container は XPU 不可、torchrun は oneCCL で
   segfault。VLA-JEPA / CoC と同じ。[[aurora-xpu-distributed]]）。1 rank / タイルで
@@ -348,7 +353,7 @@ Stage 2 (traj expert): VLM 凍結で trajectory diffusion expert を学習（教
 
 | ファイル | 変更/役割 |
 | --- | --- |
-| `scripts/aurora/build_nav_coc_annotations.py`(新規) | PAI の `navigation_command`(command_text) と CoC yaml(`event_start_timestamp`→`t0_relative`, `effect_on_ego_behavior`→`cot`) を結合し、1.5 nav SFT が読む annotation JSON `{clip_id,t0_relative,nav_text,cot}` を生成。Alpamayo window(1.6s hist + 6.4s future) が clip に収まる segment のみ採用 |
+| `scripts/aurora/build_nav_coc_annotations.py`(新規) | 1.5 nav SFT が読む annotation JSON `{clip_id,t0_relative,nav_text,[cot]}` を生成。`--mode cot`: CoC ラベル起点（Stage 1, cot 必須, 11,076）。`--mode grid`: `clip_index.event_t0s` グリッド起点（Stage 2, 全サンプル ~194,923; cot は ±0.6s 以内にあれば付与）。Alpamayo window(1.6s hist + 6.4s future) が clip に収まる segment のみ採用 |
 | `.../alpamayo-recipes/src/alpamayo/data/pai_nav.py` | annotation の `cot` を sample へ転送（`nav_cot` プロセッサが cot を教師化できるように） |
 | `.../recipes/alpamayo1_5_sft/configs/vla_processor/nav_cot.yaml`(新規) | Stage 1 用プロセッサ。`components_order=[image,traj_history,route,prompt,cot,traj_future]`, `label_components=[cot,traj_future]` |
 | `scripts/aurora/convert_features_csv_pai022.py`(新規) | 旧 export の `features.csv` を physical_ai_av **0.2.2** スキーマ(`directory`/`chunk_path`/template 化 `clip_files_in_zip`)へ変換（データ zip は不変、原本は `features.csv.oldschema` に退避） |
@@ -368,12 +373,19 @@ bash scripts/aurora/setup_venv_alpamayo15.sh    # -> outputs/alpamayo15_venv
 #    実 import 検証は計算ノード（下の probe）で行う。
 # 2) checkpoint（gated, HF_TOKEN は .env）
 bash scripts/aurora/prepare_ckpt_alpamayo15.sh  # -> outputs/checkpoints/Alpamayo-1.5-10B-A1-format
-# 3) annotation JSON（CoC + nav）
+# 3) annotation JSON（2 種。Stage 1=cot 必須、Stage 2=cot 不要のため別ファイル）
 module use /soft/modulefiles; module load frameworks
-python scripts/aurora/build_nav_coc_annotations.py \
+#  Stage 1b (nav_cot): CoC ラベル 1 個 = 1 サンプル。cot が教師なので cot 必須
+python scripts/aurora/build_nav_coc_annotations.py --mode cot \
   --pai-dir data/carla_alpamayo_pai \
   --coc-dir outputs/coc_autolabel_aurora_full/coc_labels_8b \
   --out data/carla_alpamayo_pai/nav_coc_annotations.json   # -> 11,076 sample / 3,076 clip
+#  Stage 1a / Stage 2 (nav): clip_index.event_t0s グリッド 1 点 = 1 サンプル。全クリップ・全サンプル。
+#  cot はグリッド点の ±0.6s 以内に CoC ラベルがあれば付与（nav processor は無視、provenance 用）
+python scripts/aurora/build_nav_coc_annotations.py --mode grid \
+  --pai-dir data/carla_alpamayo_pai \
+  --coc-dir outputs/coc_autolabel_aurora_full/coc_labels_8b \
+  --out data/carla_alpamayo_pai/nav_grid_annotations.json   # -> ~194,923 sample / 4,459 clip
 # 4) features.csv を physical_ai_av 0.2.2 スキーマへ（1 回だけ。原本は .oldschema に退避）
 python scripts/aurora/convert_features_csv_pai022.py --pai-dir data/carla_alpamayo_pai
 ```
@@ -398,26 +410,35 @@ qsub -q debug -l walltime=1:00:00 -o logs/aurora_sft_a15_probe_mb1.out \
   scripts/aurora/sft_alpamayo15.pbs
 ```
 
-## 2. 本番（capacity キュー, Stage1 → Stage2）
+## 2. 本番（capacity キュー, Stage1a → Stage1b → Stage2）
 
 ```bash
-qsub scripts/aurora/sft_alpamayo15.pbs            # STAGE=all（既定 eff bs 36/12, 2/3 epoch, wandb）
+qsub scripts/aurora/sft_alpamayo15.pbs            # STAGE=all（1a,1b,2 を順に）
 tail -f logs/aurora_sft_alpamayo15.out
-# Stage 1 / Stage 2 だけ:
-qsub -v STAGE=1 scripts/aurora/sft_alpamayo15.pbs
-qsub -v STAGE=2 scripts/aurora/sft_alpamayo15.pbs # Stage1 の checkpoint-* を自動参照
+# 個別: 1a/1b/2。1b は 1a の checkpoint-*、2 は 1b の checkpoint-* を自動参照
+qsub -v STAGE=1  scripts/aurora/sft_alpamayo15.pbs   # 1a→1b
+qsub -v STAGE=1a scripts/aurora/sft_alpamayo15.pbs
+qsub -v STAGE=1b scripts/aurora/sft_alpamayo15.pbs
+qsub -v STAGE=2  scripts/aurora/sft_alpamayo15.pbs
+# 連鎖の smoke（各フェーズ 4 step, checkpoint を保存して 1a→1b→2 の受け渡しを検証）:
+qsub -q debug -l walltime=1:00:00 \
+  -v MAX_STEPS=4,SAVE_STRATEGY=steps,SAVE_STEPS=4,REPORT_TO=none \
+  scripts/aurora/sft_alpamayo15.pbs
 ```
 
 既定値（`qsub -v KEY=VAL,...` で上書き可）:
 
 ```bash
 STAGE=all  NPROC=12  PPN=12
-BS1=1 ACCUM1=3 EPOCHS1=2     # Stage1 eff bs = 12*1*3 = 36
+BS1=1 ACCUM1=3 EPOCHS1A=2 EPOCHS1B=2   # Stage1 eff bs = 12*1*3 = 36
 BS2=1 ACCUM2=1 EPOCHS2=3     # Stage2 eff bs = 12*1*1 = 12
-WARMUP1=50                    # stage1_nav 既定 500 は ~600 step には過大
+WARMUP1A=500 WARMUP1B=50       # 1a は ~10k step, 1b は ~600 step
 ATTN_IMPL=eager               # flash_attention_2 は CUDA 専用
 PAI_DIR=.../data/carla_alpamayo_pai
-ANNOTATIONS=.../data/carla_alpamayo_pai/nav_coc_annotations.json
+NAV_ANNOTATIONS=.../data/carla_alpamayo_pai/nav_grid_annotations.json  # grid, ~194,923 (Stage 1a & 2)
+COT_ANNOTATIONS=.../data/carla_alpamayo_pai/nav_coc_annotations.json   # cot,  11,076    (Stage 1b)
+# ANNOTATIONS=... を明示すると両方を上書き（後方互換）
+# ANNOTATIONS=... を明示すると両ステージ共通で上書き（後方互換）
 TRAIN_CHUNKS=0-48             # 全 48 chunk
 CKPT=.../outputs/checkpoints/Alpamayo-1.5-10B-A1-format
 QWEN_DIR=.../outputs/models/Qwen3-VL-8B-Instruct

@@ -83,6 +83,10 @@ class VLA_JEPA(baseframework):
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
         self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        # The encoder only ever runs under no_grad, so it never produces grads. Left
+        # with requires_grad=True, DDP still puts its params in the reducer buckets and
+        # needs find_unused_parameters=True to walk them every backward.
+        self.vj_encoder.requires_grad_(False)
         self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
 
         tubelet_size = self.vj_encoder.config.tubelet_size
@@ -141,7 +145,9 @@ class VLA_JEPA(baseframework):
 
         """
         batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
-        batch_videos = [example["video"] for example in examples]  #  [B, V, T, H, W, 3]
+        # "video" is absent when the collate_fn already produced "pixel_values_videos"
+        # (worker-side preprocessing); that path is handled below.
+        batch_videos = [example["video"] for example in examples] if "video" in examples[0] else None  #  [B, V, T, H, W, 3]
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
         
@@ -175,9 +181,17 @@ class VLA_JEPA(baseframework):
         
         
 
-        #[print(each.shape, end=";") for each in batch_videos]
-        batch_videos = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
-        batch_videos = batch_videos.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
+        # The collate_fn preprocesses the videos in the dataloader workers when it can,
+        # in which case "video" is already dropped and there is nothing to stack here.
+        pixel_values_videos = (
+            [example["pixel_values_videos"] for example in examples]
+            if "pixel_values_videos" in examples[0]
+            else None
+        )
+        if pixel_values_videos is None:
+            #[print(each.shape, end=";") for each in batch_videos]
+            batch_videos = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
+            batch_videos = batch_videos.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
 
         # Step 1: QWenVL input format
         if actions is not None:
@@ -217,17 +231,27 @@ class VLA_JEPA(baseframework):
             #exit()
         
             # Step 2: JEPA Encoder
-            B, V, T, C, H, W = batch_videos.shape
-            batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
-            input_videos = []
-            for i in range(B*V):
-                input_videos.append(self.vj_processor(
-                    videos=batch_videos[i], return_tensors="pt"
-                )["pixel_values_videos"].to(self.vj_encoder.device))
-            input_videos = torch.cat(input_videos, dim=0)  # [B*V, T, C, H, W]
+            if pixel_values_videos is not None:
+                # per-example pixel_values are [V, T, C, H, W]; T (frame count) is used
+                # below to split the embeddings into temporal chunks for the predictor.
+                V, T = pixel_values_videos[0].shape[0], pixel_values_videos[0].shape[1]
+                input_videos = torch.cat(pixel_values_videos, dim=0).to(self.vj_encoder.device)
+            else:
+                B_, V, T, C, H, W = batch_videos.shape
+                batch_videos = batch_videos.reshape(B_*V, T, C, H, W)  # [B*V, T, C, H, W]
+                input_videos = self.vj_processor(
+                    videos=list(batch_videos), return_tensors="pt"
+                )["pixel_values_videos"].to(self.vj_encoder.device)
             with torch.no_grad():
                 video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
-                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
+                # input_videos rows are ordered [b*V + v]. Regroup the per-view embeddings
+                # onto the feature axis -> [B, L, V*embed_dim]. torch.chunk(dim=0) here
+                # splits into contiguous row blocks instead, which silently pairs view
+                # embeddings across *different* samples whenever B > 1 (correct only at B=1).
+                L, D = video_embeddings.shape[1], video_embeddings.shape[2]
+                video_embeddings = (
+                    video_embeddings.view(B, V, L, D).permute(0, 2, 1, 3).reshape(B, L, V * D)
+                )
             #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
         
             # Step 3: VJ Predictor
