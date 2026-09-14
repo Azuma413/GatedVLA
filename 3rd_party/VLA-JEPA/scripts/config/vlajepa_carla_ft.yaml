@@ -22,8 +22,9 @@ framework:
     max_seq_len: 1024
     # Driving action = unicycle control [accel, curvature] (Alpamayo 1.5).
     action_dim: 2
-    # No proprio state (with_state=false). Disables the state encoder.
-    state_dim: 0
+    # Proprio state = ego speed (1-dim). Conditions the action head on current speed so
+    # it can accelerate from a standstill instead of predicting the near-zero mean accel.
+    state_dim: 1
     # chunk_len = future_action_window_size + 1 = 64 future controls (~6.4s @ 10Hz),
     # matching Alpamayo 1.5. This is both the model action chunk and the
     # dataloader action_horizon.
@@ -69,7 +70,7 @@ datasets:
     per_device_batch_size: 10
     video_resolution_size: 256
     load_all_data_for_training: true
-    with_state: false
+    with_state: true
     # Driving data has no gripper/position columns, so disable pause-frame removal.
     delete_pause_frame: false
     # Keep every 12th frame as a sample start (~1.2s at 10Hz). Consecutive starts share

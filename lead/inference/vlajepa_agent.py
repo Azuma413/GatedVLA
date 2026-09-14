@@ -77,6 +77,9 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         # used to un-normalize [accel, curvature] before the unicycle rollout.
         self._server_norm_stats = self.vlajepa_client.server_norm_stats()
         self._action_space = None  # Alpamayo unicycle action space; built lazily
+        # Ego-speed proprio (state) normalization stats, if the model was trained
+        # with_state. None -> state-less model, send no state.
+        self._state_mean, self._state_std = self._load_state_stats()
 
         self.last_pred_waypoints: torch.Tensor | None = None
         self.last_inference_step = -1
@@ -277,6 +280,30 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         }
         return command_map.get(int(route_command), "Follow the lane")
 
+    def _load_state_stats(self):
+        """Return (mean, std) arrays for the proprio ``state`` (ego speed) from the
+        server's norm_stats, or (None, None) if the model was trained state-less."""
+        stats = self._server_norm_stats
+        if not stats:
+            return None, None
+        emb = stats[next(iter(stats))]
+        state_stats = emb.get("state")
+        if not state_stats or "mean" not in state_stats:
+            return None, None
+        return (
+            np.asarray(state_stats["mean"], dtype=np.float32),
+            np.asarray(state_stats["std"], dtype=np.float32),
+        )
+
+    def _normalized_state(self, ego_speed: float) -> np.ndarray | None:
+        """Standardize the current ego speed with the state norm_stats, shaped
+        ``[1, state_dim]`` for predict_action. None if the model is state-less."""
+        if self._state_mean is None:
+            return None
+        raw = np.asarray([ego_speed], dtype=np.float32)
+        norm = (raw - self._state_mean) / self._state_std
+        return norm.reshape(1, -1)
+
     def _build_action_space(self, n_waypoints: int):
         """Build Alpamayo 1.5's unicycle action space seeded with the server's
         accel/curvature normalization stats (action_to_traj un-normalizes with them)."""
@@ -360,7 +387,8 @@ class VLAJEPAAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         if should_infer:
             images = self._vlajepa_images(input_data)
             instruction = self._navigation_command_text(input_data.get("route_command", 4))
-            actions = self.vlajepa_client.predict_actions(images, instruction)
+            state = self._normalized_state(float(input_data["speed"]))
+            actions = self.vlajepa_client.predict_actions(images, instruction, state=state)
             waypoints = self._rollout_actions(actions, float(input_data["speed"]))
             self.last_pred_waypoints = torch.from_numpy(waypoints).unsqueeze(0).to(self.device)
             self.last_inference_step = self.step

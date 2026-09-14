@@ -133,6 +133,23 @@ def compute_accel_curvature(x: np.ndarray, y: np.ndarray, yaw: np.ndarray) -> np
     return out
 
 
+def compute_speed(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Per-frame instantaneous ego speed (m/s), shape (n, 1).
+
+    Stored as ``observation.state`` so the policy is conditioned on how fast the ego is
+    currently moving. Without it the model cannot tell a standstill from cruising and
+    predicts the near-zero mean acceleration, so the car never pulls away from a stop.
+    Matches the speed used inside ``compute_accel_curvature`` and the eval rollout seed.
+    """
+    n = len(x)
+    if n < 2:
+        return np.zeros((n, 1), dtype=np.float32)
+    dt = 1.0 / FPS
+    speed = np.hypot(np.diff(x), np.diff(y)) / dt  # (n-1,)
+    speed = np.concatenate([speed, speed[-1:]])  # (n,) last frame padded
+    return speed.astype(np.float32).reshape(n, 1)
+
+
 def read_zip_member_parquet(zip_path: Path, member: str) -> pd.DataFrame:
     with zipfile.ZipFile(zip_path, "r") as zf:
         with zf.open(member) as fh:
@@ -238,6 +255,7 @@ def write_info_json(output_dir: Path, robot_type: str, total_episodes: int, tota
     height, width = video_shape
     features: dict = {
         "action": {"dtype": "float32", "shape": [2], "names": ["accel", "curvature"]},
+        "observation.state": {"dtype": "float32", "shape": [1], "names": ["speed"]},
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
         "frame_index": {"dtype": "int64", "shape": [1], "names": None},
         "episode_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -282,7 +300,9 @@ def write_info_json(output_dir: Path, robot_type: str, total_episodes: int, tota
 
 def write_modality_json(output_dir: Path) -> None:
     modality = {
-        "state": {},
+        "state": {
+            "speed": {"start": 0, "end": 1, "original_key": "observation.state"},
+        },
         "action": {
             "accel": {"start": 0, "end": 1, "original_key": "action"},
             "curvature": {"start": 1, "end": 2, "original_key": "action"},
@@ -337,6 +357,7 @@ def main() -> None:
             actions = compute_accel_curvature(
                 table["x"].to_numpy(), table["y"].to_numpy(), table["yaw"].to_numpy()
             )
+            state = compute_speed(table["x"].to_numpy(), table["y"].to_numpy())  # (n, 1) ego speed
 
             # task indices
             task_indices = []
@@ -349,6 +370,7 @@ def main() -> None:
             frame_df = pd.DataFrame(
                 {
                     "action": list(actions.astype(np.float32)),
+                    "observation.state": list(state.astype(np.float32)),
                     "timestamp": (np.arange(n, dtype=np.float32) / FPS),
                     "frame_index": np.arange(n, dtype=np.int64),
                     "episode_index": np.full(n, ep_idx, dtype=np.int64),

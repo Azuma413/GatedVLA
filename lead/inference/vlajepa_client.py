@@ -42,7 +42,12 @@ class VLAJEPAClient:
         """Action normalization stats (dataset_statistics) announced by the server."""
         return self._client.get_server_metadata().get("norm_stats")
 
-    def predict_actions(self, images_rgb: list[np.ndarray], instruction: str) -> np.ndarray:
+    def predict_actions(
+        self,
+        images_rgb: list[np.ndarray],
+        instruction: str,
+        state: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Return predicted normalized unicycle controls of shape ``[chunk_len, 2]``
         (accel, curvature). The caller un-normalizes and rolls them out.
 
@@ -50,11 +55,16 @@ class VLAJEPAClient:
             images_rgb: multi-view frames as HxWx3 uint8 RGB arrays, in the training
                 video-key order [front_wide, cross_left, front_tele, cross_right].
             instruction: navigation command text.
+            state: optional normalized proprio state of shape ``[1, state_dim]`` (ego
+                speed), already standardized with the server's ``state`` norm_stats.
+                Forwarded to ``predict_action(state=...)``; ignored by state-less models.
         """
         obs = {
             "batch_images": [images_rgb],  # batch of 1, list of views
             "instructions": [instruction],
         }
+        if state is not None:
+            obs["state"] = [np.asarray(state, dtype=np.float32)]  # batch of 1 -> [B,1,state_dim]
         response = self._client.infer(obs)
         if not response.get("ok", False):
             raise RuntimeError(f"VLA-JEPA server error: {response.get('error')}")

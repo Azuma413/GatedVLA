@@ -801,7 +801,7 @@ class CarlaEgoDataConfig:
         "video.front_tele",
         "video.cross_right",
     ]
-    state_keys: list = field(default_factory=list)
+    state_keys = ["state.speed"]  # ego speed (m/s); enabled by with_state/state_dim=1
     action_keys = [
         "action.accel",
         "action.curvature",
@@ -821,18 +821,29 @@ class CarlaEgoDataConfig:
             delta_indices=self.action_indices,
             modality_keys=self.action_keys,
         )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
         language_modality = ModalityConfig(
             delta_indices=self.observation_indices,
             modality_keys=self.language_keys,
         )
         return {
             "video": video_modality,
+            "state": state_modality,
             "action": action_modality,
             "language": language_modality,
         }
 
     def transform(self):
         transforms = [
+            # State (ego speed): mean/std normalized like the actions.
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={"state.speed": "mean_std"},
+            ),
             StateActionToTensor(apply_to=self.action_keys),
             # Per-dim mean/std normalization (stats come from dataset_statistics via
             # set_metadata). Inference un-normalizes with the same stats before the
