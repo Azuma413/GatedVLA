@@ -1,0 +1,6 @@
+[submodule "3rd_party/alpamayo-recipes"]
+	path = 3rd_party/alpamayo-recipes
+	url = https://github.com/NVlabs/alpamayo-recipes.git
+[submodule "3rd_party/py123d_garage"]
+	path = 3rd_party/py123d_garage
+	url = https://github.com/kesai-labs/py123d_garage.git

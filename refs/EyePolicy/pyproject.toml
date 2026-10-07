@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eyepolicy"
+version = "0.1.0"
+description = "Gaze-aware robot policies built on LeRobot"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot[pi,libero]==0.6.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lerobot_policy_register", "src/eye_policy"]
+
+[tool.uv.sources]
+lerobot = { path = "libs/lerobot", editable = true }
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true

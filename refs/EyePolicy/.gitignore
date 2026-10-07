@@ -1,0 +1,12 @@
+datasets/
+outputs/
+uv.lock
+__pycache__/
+.env
+.cache/
+.claude/
+.pytest_cache/
+.venv/
+.github/
+.claude/
+libs/RoboTwin/
