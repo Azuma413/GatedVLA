@@ -57,7 +57,7 @@ Port of `lib/EyePolicy` (π0.5 `eye` policy) to the layer-wise DiT expert:
 | | EyePolicy (π0.5) | QwenDrivePI |
 |---|---|---|
 | gate input | final-layer hidden of each image token `h_p`, mean text hidden `q` | same (Qwen3.5 final layer; `q` = mean over all non-visual, non-pad tokens) |
-| gate head | per camera `W2·swish(W1·[h_p, q, h_p⊙q])`, RMSNorm, init keep 0.99, τ = 1, no floor | same, per frame (t0 - 0.1 s / t0) |
+| gate head | per camera `W2·swish(W1·[h_p, q, h_p⊙q])`, RMSNorm, init keep 0.99, τ = 1, no floor | same, one head shared by both frames (same camera); budget still per frame |
 | where it acts | `log m` on action-expert → image-token attention logits, every layer | `log m` on DiT cross-attention logits to visual tokens, every cross-attention block |
 | text-token path | not blocked | not blocked |
 | loss | `L_gated + λ_full·L_full + λ_b·Σ_cam (mean m − ρ)²`, shared noise / t | same (ρ = 0.2, λ_b = 0.1, λ_full = 1) |

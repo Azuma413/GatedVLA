@@ -82,13 +82,15 @@ def plot_bev(
         axes[0].set_axis_off()
         axes[0].set_title("front camera (t0)", fontsize=9)
     if image is not None and keep_map is not None:
-        # each merged token's patch scaled by its keep value (bright = attended by the action expert)
-        mask = Image.fromarray((np.clip(keep_map, 0, 1) * 255).astype(np.uint8)).resize(image.size, Image.NEAREST)
-        gated = (np.asarray(image, dtype=np.float32) * (np.asarray(mask, dtype=np.float32)[..., None] / 255.0))
+        # each merged token's patch scaled by its min-max normalised keep value (bright = attended most)
+        lo, hi = float(np.min(keep_map)), float(np.max(keep_map))
+        norm = (keep_map - lo) / (hi - lo) if hi > lo else np.ones_like(keep_map)
+        mask = Image.fromarray((norm * 255).astype(np.uint8)).resize(image.size, Image.NEAREST)
+        gated = np.asarray(image, dtype=np.float32) * (np.asarray(mask, dtype=np.float32)[..., None] / 255.0)
         axes[1].imshow(gated.astype(np.uint8))
         axes[1].set_axis_off()
-        axes[1].set_title(f"gated view (mean keep {float(np.mean(keep_map)):.2f}, max {float(np.max(keep_map)):.2f})",
-                          fontsize=9)
+        axes[1].set_title(f"mask on current frame, min-max normalised (m: min {lo:.2f} / mean "
+                          f"{float(np.mean(keep_map)):.2f} / max {hi:.2f})", fontsize=9)
     ax = axes[-1]
 
     def _plot(xy, **kw):

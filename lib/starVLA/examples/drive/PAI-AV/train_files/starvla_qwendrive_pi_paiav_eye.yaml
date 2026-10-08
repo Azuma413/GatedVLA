@@ -68,7 +68,7 @@ trainer:
     base: 5.0e-05
     qwen_vl_interface: 5.0e-05
     action_model: 5.0e-05
-    eye_gates: 1.0e-04    # gate heads are trained from scratch (EyePolicy gate_lr)
+    eye_gate: 1.0e-04     # gate head is trained from scratch (EyePolicy gate_lr)
   scheduler_specific_kwargs:
     min_lr: 1.0e-08
   freeze_modules: ''

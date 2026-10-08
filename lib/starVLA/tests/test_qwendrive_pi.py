@@ -152,7 +152,7 @@ def test_eye_gate(tiny_qwen_drive_dir):
     # gate starts almost fully open (init_keep 0.99)
     assert abs(out["keep_view0"].item() - 0.99) < 1e-3 and abs(out["keep_view1"].item() - 0.99) < 1e-3
     out["action_loss"].backward()
-    assert all(p.grad is not None for p in model.eye_gates.parameters())
+    assert all(p.grad is not None for p in model.eye_gate.parameters())
 
     # keep maps are split per frame following the image grids (history frame has the smaller pixel budget)
     model.eval()
