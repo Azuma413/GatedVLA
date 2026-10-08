@@ -125,9 +125,10 @@ def test_forward_and_predict(tiny_qwen_drive_dir):
     loss = model(batch)["action_loss"]
     assert torch.isfinite(loss)
     loss.backward()
-    # proj_out_* belong to the DiT output path that the layer-wise head bypasses (return_pre_output),
-    # lm_head / mtp are LM-only; everything else, incl. the last VLM layer, must receive gradients.
-    allowed = ("action_model.model.proj_out_", "qwen_vl_interface.model.lm_head", "qwen_vl_interface.model.mtp")
+    # proj_out_* (unused DiT output path) are frozen; lm_head / mtp are LM-only.
+    # Everything else, incl. the last VLM layer, must receive gradients.
+    assert not any(p.requires_grad for n, p in model.named_parameters() if ".proj_out_" in n)
+    allowed = ("qwen_vl_interface.model.lm_head", "qwen_vl_interface.model.mtp")
     unused = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
     assert not [n for n in unused if not n.startswith(allowed)], unused
 

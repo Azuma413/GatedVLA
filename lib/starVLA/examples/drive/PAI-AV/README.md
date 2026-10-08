@@ -1,0 +1,51 @@
+# QwenDrivePI on PAI-AV (front camera)
+
+Qwen-Drive-1.0-4B VLM + pi-style flow-matching action expert (`QwenDrivePI`), trained on the raw
+`nvidia/PhysicalAI-Autonomous-Vehicles` release (front wide camera + egomotion only, no LiDAR / radar).
+
+| | |
+|---|---|
+| image | front wide camera at t0 - 0.1 s (544x288) and t0 (1280x704) |
+| state (5, 10) | ego history t0-0.4 .. t0 @10 Hz: speed, accel xyz, ang. vel xyz (ego frame), heading rel. to t0, target point xy |
+| action (10, 2) | ego-frame (x fwd, y left) positions t0 .. t0+0.9 s @10 Hz |
+| target point | first future ego position >= 25 m away (PAI-AV has no route) |
+| normalisation | per-dim q01/q99 -> [-1, 1] (`norm_stats.json`) |
+
+Code: `starVLA/dataloader/pai_av_drive.py` (dataset), `starVLA/training/train_drive.py` (trainer),
+`starVLA/training/drive_openloop.py` (metrics + BEV plots), `starVLA/model/framework/VLM4A/QwenDrivePI.py`.
+
+## 1. Prepare (once, login node is fine)
+
+```bash
+module use /soft/modulefiles && module load frameworks
+source ../../outputs/starvla_venv/bin/activate          # from lib/starVLA
+python examples/drive/PAI-AV/prepare_paiav.py \
+  --data_root /lus/flare/projects/RobustViT/hiratsuka/datasets/PhysicalAI-Autonomous-Vehicles \
+  --out_dir ../../outputs/qwendrive_pi/meta
+```
+
+Writes `norm_stats.json` (6000 train clips x 8 t0) and `eval_samples_val.json`
+(240 fixed val samples: 80 left / 80 right / 80 straight, by heading change over the next 3 s, +-15 deg).
+
+## 2. Train (Aurora, 1 node = 12 XPU tiles)
+
+```bash
+cd lib/starVLA
+# smoke test (debug queue)
+qsub -v MAX_STEPS=20,EVAL_INTERVAL=10,RUN_ID=qdpi_smoke examples/drive/PAI-AV/train_files/train_qwendrive_pi_aurora.pbs
+# full run; re-submit the same command to resume (optimizer state + same W&B run)
+qsub -q capacity -l walltime=24:00:00 -v TIME_LIMIT_HOURS=23.3 examples/drive/PAI-AV/train_files/train_qwendrive_pi_aurora.pbs
+```
+
+Live log: `logs/<RUN_ID>.log`. Outputs in `outputs/qwendrive_pi/<RUN_ID>/`:
+`checkpoints/step_*/model.safetensors` (bf16 weights, last 2), `resume/` (sharded model + optimizer, latest only),
+`eval/step_*/*.png` (BEV plots), `wandb/`.
+
+## 3. What is logged to W&B (project `starVLA_drive`)
+
+- `train/action_loss`, `train/grad_norm`, `train/lr_*`, `train/samples_per_s`, `train/data_wait_frac` every `logging_frequency` steps.
+- every `eval_interval` steps (and at step 0), open-loop on the fixed val set:
+  `eval/ADE`, `eval/FDE`, `eval/L2@0.5s`, `eval/L2@1.0s`, `eval/lat_err_final`, `eval/lon_err_final`, `eval/miss_rate_2m`,
+  each also per maneuver (`eval/left/*`, `eval/right/*`, `eval/straight/*`).
+- `eval_bev/{left,right,straight}`: front image + bird's-eye view with past (2 s), GT future (5 s, dashed),
+  GT horizon, prediction and target point, for the same samples at every eval.

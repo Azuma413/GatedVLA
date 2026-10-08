@@ -31,7 +31,7 @@ Proprio / output design (follows DriveMoE DrivePi0, Thinklab-SJTU/DriveMoE)
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -125,9 +125,9 @@ class StateTokenEncoder(nn.Module):
 
 
 def resize_to_pixel_budget(image: Image.Image, max_pixels: int, factor: int) -> Image.Image:
-    """Aspect-preserving resize so that both sides are multiples of ``factor`` and H*W <= max_pixels."""
+    """Aspect-preserving downscale so that both sides are multiples of ``factor`` and H*W <= max_pixels."""
     w, h = image.size
-    scale = math.sqrt(max_pixels / float(w * h))
+    scale = min(1.0, math.sqrt(max_pixels / float(w * h)))
     new_w = max(factor, int(w * scale // factor) * factor)
     new_h = max(factor, int(h * scale // factor) * factor)
     if (new_w, new_h) == (w, h):
@@ -170,6 +170,12 @@ class Qwen_Drive_PI(baseframework):
 
         self.action_model: LayerwiseFlowmatchingActionHead = get_action_model(config=self.config)
         self.num_action_dit_layers = len(self.action_model.model.transformer_blocks)
+        # The layer-wise head decodes the DiT pre-output (return_pre_output=True); the DiT's own output
+        # projection is never used, so keep it out of the optimizer.
+        for name in ("proj_out_1", "proj_out_2"):
+            module = getattr(self.action_model.model, name, None)
+            if module is not None:
+                module.requires_grad_(False)
 
         action_cfg = self.config.framework.action_model
         self.action_horizon = int(action_cfg.action_horizon)
@@ -242,8 +248,10 @@ class Qwen_Drive_PI(baseframework):
         """
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         attention_mask = qwen_inputs.get("attention_mask", None)
-        qwenvl_outputs = self.qwen_vl_interface(
+        # Call the inner Qwen3.5 model (no LM head): only hidden states are needed.
+        qwenvl_outputs = self.qwen_vl_interface.model.model(
             **qwen_inputs,
+            use_cache=False,
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
@@ -264,7 +272,15 @@ class Qwen_Drive_PI(baseframework):
     # ------------------------------------------------------------------
     # Training / inference
     # ------------------------------------------------------------------
-    def forward(self, examples: List[dict] = None, **kwargs) -> Tuple:
+    def forward(self, examples: List[dict] = None, predict: bool = False, **kwargs) -> dict:
+        """Training loss, or (``predict=True``) sampled actions.
+
+        Prediction is routed through ``forward`` so that parameter-sharding wrappers (FSDP2) that hook the
+        root ``forward`` gather the parameters for inference as well.
+        """
+        if predict:
+            with torch.no_grad():
+                return self._predict(examples)
         batch_images, instructions, state = self._prepare_inputs(examples)
         vl_embs_list, attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
 
@@ -292,11 +308,7 @@ class Qwen_Drive_PI(baseframework):
         )
         return {"action_loss": action_loss}
 
-    @torch.inference_mode()
-    def predict_action(self, examples: List[dict] = None, **kwargs) -> dict:
-        """Returns ``normalized_actions`` (B, action_horizon, action_dim) in [-action_clip, action_clip]."""
-        if type(examples) is not list:
-            examples = [examples]
+    def _predict(self, examples: List[dict]) -> dict:
         batch_images, instructions, state = self._prepare_inputs(examples)
         vl_embs_list, attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
 
@@ -308,3 +320,10 @@ class Qwen_Drive_PI(baseframework):
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         return {"normalized_actions": pred_actions.float().cpu().numpy()}
+
+    @torch.inference_mode()
+    def predict_action(self, examples: List[dict] = None, **kwargs) -> dict:
+        """Returns ``normalized_actions`` (B, action_horizon, action_dim) in [-action_clip, action_clip]."""
+        if type(examples) is not list:
+            examples = [examples]
+        return self._predict(examples)
