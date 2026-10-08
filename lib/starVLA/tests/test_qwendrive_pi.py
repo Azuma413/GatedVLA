@@ -76,13 +76,14 @@ def tiny_qwen_drive_dir(tmp_path_factory):
     return out, model
 
 
-def _make_cfg(base_vlm: str):
+def _make_cfg(base_vlm: str, eye_gate: dict = None):
     return OmegaConf.create(
         {
             "framework": {
                 "name": "QwenDrivePI",
                 "qwenvl": {"base_vlm": base_vlm, "attn_implementation": "sdpa"},
                 "drive": {"current_image_pixels": 128 * 64, "history_image_pixels": 64 * 32},
+                "eye_gate": eye_gate or {"enabled": False},
             },
             "datasets": {"vla_data": {}},
             "trainer": {"repeated_diffusion_steps": 2},
@@ -136,3 +137,49 @@ def test_forward_and_predict(tiny_qwen_drive_dir):
     out = model.predict_action([_sample(rng)])["normalized_actions"]
     assert out.shape == (1, 10, 2)
     assert np.all(np.abs(out) <= 1.0)
+
+
+def test_eye_gate(tiny_qwen_drive_dir):
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    model = build_framework(_make_cfg(str(path), {"enabled": True, "mode": "learned"})).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng), _sample(rng)]
+    out = model(batch)
+    for key in ("loss_gated", "loss_full", "loss_budget", "keep_view0", "keep_view1"):
+        assert key in out, key
+    # gate starts almost fully open (init_keep 0.99)
+    assert abs(out["keep_view0"].item() - 0.99) < 1e-3 and abs(out["keep_view1"].item() - 0.99) < 1e-3
+    out["action_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gates.parameters())
+
+    # keep maps are split per frame following the image grids (history frame has the smaller pixel budget)
+    model.eval()
+    pred = model.predict_action([_sample(rng)])
+    maps = pred["keep_maps"][0]
+    assert len(maps) == 2 and maps[0].size < maps[1].size
+    assert np.allclose(maps[1], 0.99, atol=1e-3)
+
+
+def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
+    """A gate fixed fully open (uniform, keep = 1 -> bias 0) must reproduce the ungated model exactly."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    torch.manual_seed(0)
+    plain = build_framework(_make_cfg(str(path))).float().eval()
+    gated = build_framework(_make_cfg(str(path), {"enabled": True, "mode": "uniform", "budget": 1.0})).float().eval()
+    gated.load_state_dict(plain.state_dict())
+    sample = _sample(np.random.default_rng(1))
+    torch.manual_seed(123)
+    a = plain.predict_action([sample])["normalized_actions"]
+    torch.manual_seed(123)
+    b = gated.predict_action([sample])["normalized_actions"]
+    assert np.allclose(a, b, atol=1e-5)
+    # and closing it changes the prediction
+    closed = build_framework(_make_cfg(str(path), {"enabled": True, "mode": "uniform", "budget": 1e-6})).float().eval()
+    closed.load_state_dict(plain.state_dict())
+    torch.manual_seed(123)
+    c = closed.predict_action([sample])["normalized_actions"]
+    assert not np.allclose(a, c, atol=1e-3)

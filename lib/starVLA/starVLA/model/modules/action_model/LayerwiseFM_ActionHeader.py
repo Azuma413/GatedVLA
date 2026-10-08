@@ -291,18 +291,24 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        noise: torch.Tensor = None,
+        t: torch.Tensor = None,
     ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
         actions: shape (B, action_horizon, D_action)
-        encoder_attention_mask: optional (B, seq_length) bool/int
+        encoder_attention_mask: optional (B, seq_length) bool/int, or float additive bias
+        noise, t: optional (B, action_horizon, D_action) / (B,) to reuse the same flow-matching sample
+            across several calls (sampled here when None)
         """
         device = actions.device
         num_layers = len(vl_embs_list)
         B, L, D = vl_embs_list[0].shape
         # Embed noised action trajectory.
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        if noise is None:
+            noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        if t is None:
+            t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
         noisy_trajectory = (1 - t) * noise + t * actions

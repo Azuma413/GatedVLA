@@ -27,6 +27,14 @@ Proprio / output design (follows DriveMoE DrivePi0, Thinklab-SJTU/DriveMoE)
 - Both are min-max normalised to [-1, 1] with 1st/99th percentiles (starVLA ``q01/q99`` stats);
   sampled actions are clamped to [-1, 1].
 - Flow matching: Beta(1.5, 1) time sampling with s=0.999, MSE on velocity, 10 Euler steps at inference.
+
+Optional visual evidence gate (``framework.eye_gate``, EyePolicy / See Less style)
+─────────────────────────────────────────────────────────────────────────────────
+Per frame, a gate MLP reads the VLM final-layer hidden of each visual token ``h_p`` and the mean of the
+text-token hidden states ``q`` and predicts ``m_p = σ(MLP([h_p, q, h_p ⊙ q]) / τ)``. ``log m_p`` is added to the
+action expert's cross-attention logits on that visual token in every cross-attention block (the VLM itself is
+unchanged; text tokens stay visible). Loss: ``L_gated + λ_full·L_full + λ_budget·Σ_v (mean_p m_p − ρ)²`` with
+``L_full`` the same flow-matching sample without the gate. Inference uses the gated path.
 """
 
 import math
@@ -36,6 +44,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
@@ -75,6 +84,22 @@ class QwenDrivePIDefaultConfig:
             "image_factor": 32,
             # Sampled (normalised) actions are clamped to [-action_clip, action_clip].
             "action_clip": 1.0,
+        }
+    )
+
+    # === Visual evidence gate on the action expert's view of the VLM visual tokens (EyePolicy) ===
+    eye_gate: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            # "learned": gate MLP. Controls with the same keep ratio `budget`:
+            # "uniform": m = budget for every token; "random": m ~ Bernoulli(budget) per token.
+            "mode": "learned",
+            "hidden_dim": 256,
+            "temperature": 1.0,
+            "init_keep": 0.99,  # initial σ(ℓ): training starts close to the ungated model
+            "budget": 0.2,  # ρ, target mean of m per frame
+            "budget_loss_weight": 0.1,
+            "full_loss_weight": 1.0,  # weight of the ungated loss; 0 skips it
         }
     )
 
@@ -122,6 +147,27 @@ class StateTokenEncoder(nn.Module):
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         x = self.mlp(state)  # (B, T_state, D)
         return x + self.step_embedding[:, -x.shape[1] :].to(x.dtype)
+
+
+class ViewGate(nn.Module):
+    """Per-frame gate head: ``ℓ_p = W2·swish(W1·[h_p, q, h_p⊙q])`` over RMS-normalised hidden states
+    (same as EyePolicy's ``ViewGate``)."""
+
+    def __init__(self, width: int, hidden_dim: int, init_keep: float):
+        super().__init__()
+        self.norm_h = nn.RMSNorm(width)
+        self.norm_q = nn.RMSNorm(width)
+        self.fc1 = nn.Linear(3 * width, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.constant_(self.fc2.bias, math.log(init_keep / (1 - init_keep)))
+
+    def forward(self, h: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        """h: (N, W) visual-token hidden of one frame, q: (W,) pooled text hidden -> logits (N,)."""
+        dtype = self.fc1.weight.dtype
+        h = self.norm_h(h.to(dtype))
+        q = self.norm_q(q.to(dtype))[None].expand_as(h)
+        return self.fc2(F.silu(self.fc1(torch.cat([h, q, h * q], dim=-1)))).squeeze(-1).float()
 
 
 def resize_to_pixel_budget(image: Image.Image, max_pixels: int, factor: int) -> Image.Image:
@@ -210,6 +256,18 @@ class Qwen_Drive_PI(baseframework):
             ]
         )
 
+        gate_cfg = self.config.framework.eye_gate
+        self.gate_enabled = bool(gate_cfg.get("enabled", False))
+        self.gate_mode = str(gate_cfg.get("mode", "learned"))
+        if self.gate_mode not in ("learned", "uniform", "random"):
+            raise ValueError(f"eye_gate.mode must be learned / uniform / random, got {self.gate_mode}")
+        self.num_views = int(self.config.framework.drive.get("num_views", 2))
+        if self.gate_enabled and self.gate_mode == "learned":
+            self.eye_gates = nn.ModuleList(
+                ViewGate(llm_hidden_size, int(gate_cfg.hidden_dim), float(gate_cfg.init_keep))
+                for _ in range(self.num_views)
+            )
+
         drive_cfg = self.config.framework.drive
         self.prompt = str(drive_cfg.get("prompt", "predict trajectory"))
         self.current_image_pixels = int(drive_cfg.get("current_image_pixels", 921600))
@@ -256,7 +314,8 @@ class Qwen_Drive_PI(baseframework):
             output_hidden_states=True,
             return_dict=True,
         )
-        hidden_states = qwenvl_outputs.hidden_states[-self.num_action_dit_layers :]
+        all_hidden = qwenvl_outputs.hidden_states
+        hidden_states = all_hidden[-self.num_action_dit_layers :]
         proj_dtype = next(self.project_layers.parameters(), torch.empty(0, dtype=self._head_dtype())).dtype
         projected = {
             i: proj(hidden_states[j].to(proj_dtype))
@@ -267,7 +326,69 @@ class Qwen_Drive_PI(baseframework):
             vl_embs_list.append(projected[i] if i in projected else vl_embs_list[-1])
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
-        return vl_embs_list, attention_mask
+        else:
+            attention_mask = torch.ones(qwen_inputs["input_ids"].shape, dtype=torch.bool, device=all_hidden[-1].device)
+        gate_inputs = {
+            "final_hidden": all_hidden[-1],
+            "view_ids": self._visual_view_ids(qwen_inputs),
+            "image_grid_thw": qwen_inputs.get("image_grid_thw"),
+        }
+        return vl_embs_list, attention_mask, gate_inputs
+
+    # ------------------------------------------------------------------
+    # Visual evidence gate
+    # ------------------------------------------------------------------
+    def _visual_view_ids(self, qwen_inputs) -> torch.Tensor:
+        """(B, L) long: index of the frame each visual token belongs to, -1 for non-visual tokens."""
+        input_ids = qwen_inputs["input_ids"]
+        is_visual = input_ids == self.qwen_vl_interface.model.config.image_token_id
+        merge = int(self.qwen_vl_interface.processor.image_processor.merge_size)
+        per_image = (qwen_inputs["image_grid_thw"].prod(-1) // merge**2).view(input_ids.shape[0], -1)  # (B, V)
+        order = torch.cumsum(is_visual.long(), dim=1) - 1  # rank of each visual token within its sample
+        bounds = torch.cumsum(per_image, dim=1)  # (B, V) exclusive upper bounds per frame
+        view = torch.searchsorted(bounds, order.clamp(min=0), right=True)
+        return torch.where(is_visual, view, torch.full_like(view, -1))
+
+    def _gate_keep(self, gate_inputs: dict, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Keep values m (B, L) in [0, 1] for visual tokens, 1 elsewhere."""
+        view_ids = gate_inputs["view_ids"]
+        keep = torch.ones(view_ids.shape, dtype=torch.float32, device=view_ids.device)
+        visual = view_ids >= 0
+        budget = float(self.config.framework.eye_gate.budget)
+        if self.gate_mode == "uniform":
+            return torch.where(visual, torch.full_like(keep, budget), keep)
+        if self.gate_mode == "random":
+            return torch.where(visual, torch.bernoulli(torch.full_like(keep, budget)), keep)
+
+        hidden = gate_inputs["final_hidden"]
+        text = (~visual) & attention_mask
+        tau = float(self.config.framework.eye_gate.get("temperature", 1.0))
+        rows = []
+        for b in range(hidden.shape[0]):
+            q = hidden[b][text[b]].float().mean(0)
+            row = keep[b].clone()
+            for v, gate in enumerate(self.eye_gates):
+                idx = view_ids[b] == v
+                row[idx] = torch.sigmoid(gate(hidden[b][idx], q) / tau)
+            rows.append(row)
+        return torch.stack(rows)
+
+    @staticmethod
+    def _cross_attention_bias(attention_mask: torch.Tensor, keep: Optional[torch.Tensor], dtype) -> torch.Tensor:
+        """Additive cross-attention bias: log m on visual tokens (0 when keep is None), -inf on padding."""
+        bias = torch.zeros(attention_mask.shape, dtype=torch.float32, device=attention_mask.device)
+        if keep is not None:
+            bias = torch.log(keep.clamp(min=0.0))  # log 0 = -inf for fully dropped tokens (random mode)
+        bias = bias.masked_fill(~attention_mask, float("-inf"))
+        return bias.to(dtype)
+
+    def _keep_stats(self, keep: torch.Tensor, view_ids: torch.Tensor) -> torch.Tensor:
+        """(B, V) mean keep per frame."""
+        means = []
+        for v in range(self.num_views):
+            idx = (view_ids == v).float()
+            means.append((keep * idx).sum(1) / idx.sum(1).clamp(min=1.0))
+        return torch.stack(means, dim=1)
 
     # ------------------------------------------------------------------
     # Training / inference
@@ -282,7 +403,7 @@ class Qwen_Drive_PI(baseframework):
             with torch.no_grad():
                 return self._predict(examples)
         batch_images, instructions, state = self._prepare_inputs(examples)
-        vl_embs_list, attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
+        vl_embs_list, attention_mask, gate_inputs = self._encode_vl_hidden_states(batch_images, instructions)
 
         device, dtype = vl_embs_list[-1].device, self._head_dtype()
         vl_embs_list = [h.to(dtype) for h in vl_embs_list]
@@ -294,32 +415,78 @@ class Qwen_Drive_PI(baseframework):
 
         actions_target = actions_target.repeat(repeat, 1, 1)
         vl_embs_list = [h.repeat(repeat, 1, 1) for h in vl_embs_list]
-        if attention_mask is not None:
-            attention_mask = attention_mask.repeat(repeat, 1)
         state_t = None
         if state is not None:
             state_t = torch.as_tensor(state, device=device, dtype=dtype).repeat(repeat, 1, 1)
 
-        action_loss = self.action_model(
-            vl_embs_list,
-            actions_target,
-            state_t,
-            encoder_attention_mask=attention_mask,
-        )
-        return {"action_loss": action_loss}
+        if not self.gate_enabled:
+            action_loss = self.action_model(
+                vl_embs_list, actions_target, state_t, encoder_attention_mask=attention_mask.repeat(repeat, 1)
+            )
+            return {"action_loss": action_loss}
+
+        # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
+        gate_cfg = self.config.framework.eye_gate
+        keep = self._gate_keep(gate_inputs, attention_mask)
+        noise = torch.randn(actions_target.shape, device=device, dtype=dtype)
+        t = self.action_model.sample_time(actions_target.shape[0], device=device, dtype=dtype)
+
+        def flow_loss(keep_or_none):
+            bias = self._cross_attention_bias(attention_mask, keep_or_none, dtype).repeat(repeat, 1)
+            return self.action_model(
+                vl_embs_list, actions_target, state_t, encoder_attention_mask=bias, noise=noise, t=t
+            )
+
+        loss_gated = flow_loss(keep)
+        out = {"loss_gated": loss_gated.detach()}
+        total = loss_gated
+        keep_mean = self._keep_stats(keep, gate_inputs["view_ids"])  # (B, V)
+        for v in range(self.num_views):
+            out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
+        if self.gate_mode == "learned":
+            if float(gate_cfg.full_loss_weight) > 0:
+                loss_full = flow_loss(None)
+                total = total + float(gate_cfg.full_loss_weight) * loss_full
+                out["loss_full"] = loss_full.detach()
+            loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
+            total = total + float(gate_cfg.budget_loss_weight) * loss_budget
+            out["loss_budget"] = loss_budget.detach()
+        out["action_loss"] = total
+        return out
 
     def _predict(self, examples: List[dict]) -> dict:
         batch_images, instructions, state = self._prepare_inputs(examples)
-        vl_embs_list, attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
+        vl_embs_list, attention_mask, gate_inputs = self._encode_vl_hidden_states(batch_images, instructions)
 
         device, dtype = vl_embs_list[-1].device, self._head_dtype()
         vl_embs_list = [h.to(dtype) for h in vl_embs_list]
         state_t = torch.as_tensor(state, device=device, dtype=dtype) if state is not None else None
 
-        pred_actions = self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=attention_mask)
+        out = {}
+        encoder_mask = attention_mask
+        if self.gate_enabled:
+            keep = self._gate_keep(gate_inputs, attention_mask)
+            encoder_mask = self._cross_attention_bias(attention_mask, keep, dtype)
+            out["keep_maps"] = self._keep_maps(keep, gate_inputs)
+        pred_actions = self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=encoder_mask)
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
-        return {"normalized_actions": pred_actions.float().cpu().numpy()}
+        out["normalized_actions"] = pred_actions.float().cpu().numpy()
+        return out
+
+    def _keep_maps(self, keep: torch.Tensor, gate_inputs: dict) -> List[List[np.ndarray]]:
+        """Per sample, per frame keep map of shape (h, w) in merged-token units (for visualisation)."""
+        merge = int(self.qwen_vl_interface.processor.image_processor.merge_size)
+        grids = gate_inputs["image_grid_thw"].view(keep.shape[0], -1, 3)
+        maps = []
+        for b in range(keep.shape[0]):
+            frames = []
+            for v in range(grids.shape[1]):
+                _, h, w = (int(x) for x in grids[b, v])
+                values = keep[b][gate_inputs["view_ids"][b] == v]
+                frames.append(values.float().cpu().numpy().reshape(h // merge, w // merge))
+            maps.append(frames)
+        return maps
 
     @torch.inference_mode()
     def predict_action(self, examples: List[dict] = None, **kwargs) -> dict:

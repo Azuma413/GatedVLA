@@ -22,7 +22,7 @@ set -eo pipefail
 
 REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
 STARVLA_DIR=${REPO_DIR}/lib/starVLA
-VENV=${VENV:-${REPO_DIR}/outputs/starvla_venv}
+VENV=${VENV:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/starvla_venv}
 ENV_FILE=${ENV_FILE:-/lus/flare/projects/RobustViT/hiratsuka/.env}   # WANDB_API_KEY, HF_TOKEN
 CONFIG=${CONFIG:-examples/drive/PAI-AV/train_files/starvla_qwendrive_pi_paiav.yaml}
 NPROC=${NPROC:-12}

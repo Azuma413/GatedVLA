@@ -274,8 +274,10 @@ def main():
                 ids = [shard[0] if shard else 0]
             items = [eval_ds[i] for i in ids]
             with autocast():
-                pred = model(items, predict=True)["normalized_actions"][:real]
-            for i, item, p in zip(ids[:real], items, pred):
+                pred_out = model(items, predict=True)
+            pred = pred_out["normalized_actions"][:real]
+            keep_maps = pred_out.get("keep_maps", [None] * len(items))
+            for i, item, p, kmaps in zip(ids[:real], items, pred, keep_maps):
                 meta = item["meta"]
                 rec = {
                     "idx": i,
@@ -283,10 +285,12 @@ def main():
                     "gt_xy": meta["action_xy"],
                     "maneuver": meta["maneuver"],
                 }
+                if kmaps is not None:
+                    rec["keep_mean"] = [float(k.mean()) for k in kmaps]
                 if i in plot_ids:
                     thumb = item["image"][-1].copy()
                     thumb.thumbnail((640, 360))
-                    rec.update(meta=meta, image=thumb)
+                    rec.update(meta=meta, image=thumb, keep_map=None if kmaps is None else kmaps[-1])
                 records.append(rec)
         if distributed:
             gathered = [None] * world
@@ -302,6 +306,10 @@ def main():
             [r["maneuver"] for r in records],
             dt=sampler_cfg.dt,
         )
+        if "keep_mean" in records[0]:
+            keep_means = np.array([r["keep_mean"] for r in records])
+            for v in range(keep_means.shape[1]):
+                metrics[f"keep_view{v}"] = float(keep_means[:, v].mean())
         metrics["eval_time_s"] = time.time() - t_start
         log("eval step {}: ADE {:.3f} FDE {:.3f} (left {:.3f} / right {:.3f} / straight {:.3f})".format(
             step, metrics["ADE"], metrics["FDE"], metrics.get("left/ADE", float("nan")),
@@ -317,7 +325,7 @@ def main():
                 continue
             meta = r["meta"]
             title = f"{r['maneuver']} | {meta['clip_id'][:8]} t0={meta['t0'] * 1e-6:.1f}s | step {step}"
-            fig = plot_bev(meta, r["pred_xy"], image=r["image"], title=title)
+            fig = plot_bev(meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"))
             image = fig_to_image(fig)
             plt.close(fig)
             image.save(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.png")
@@ -404,7 +412,7 @@ def main():
 
     train_sampler.set_epoch(epoch)
     data_iter = iter(train_loader)
-    window = {"loss": 0.0, "n": 0, "data_time": 0.0, "step_time": 0.0, "samples": 0}
+    window = {"loss": 0.0, "n": 0, "data_time": 0.0, "step_time": 0.0, "samples": 0, "extra": {}}
     t_last = time.time()
     while step < max_steps:
         t_step = time.time()
@@ -422,9 +430,13 @@ def main():
             if distributed:
                 model.set_requires_gradient_sync(micro == accum - 1)
             with autocast():
-                loss = model(batch)["action_loss"]
+                out = model(batch)
+            loss = out["action_loss"]
             (loss / accum).backward()
             loss_sum += loss.detach().float().item()
+            for key, value in out.items():  # extra scalars (e.g. gate losses / keep ratios)
+                if key != "action_loss" and torch.is_tensor(value) and value.numel() == 1:
+                    window["extra"][key] = window["extra"].get(key, 0.0) + value.float().item() / accum
             window["samples"] += len(batch)
         grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         if hasattr(grad_norm, "full_tensor"):
@@ -452,13 +464,20 @@ def main():
                 "train/step_time_s": window["step_time"] / window["n"],
                 "train/data_wait_frac": window["data_time"] / max(window["step_time"], 1e-6),
             }
+            if window["extra"]:
+                keys = sorted(window["extra"])
+                extra = torch.tensor([window["extra"][k] for k in keys], dtype=torch.float64, device=device)
+                if distributed:
+                    dist.all_reduce(extra)
+                for k, v in zip(keys, (extra / stats[1]).tolist()):
+                    payload[f"train/{k}"] = v
             for g in optimizer.param_groups:
                 payload[f"train/lr_{g['name']}"] = g["lr"]
             log(f"step {step}/{max_steps} loss {mean_loss:.4f} gnorm {float(grad_norm):.3f} "
                 f"{payload['train/samples_per_s']:.1f} samples/s data-wait {payload['train/data_wait_frac']:.0%}")
             if wandb is not None:
                 wandb.log(payload)
-            window = {"loss": 0.0, "n": 0, "data_time": 0.0, "step_time": 0.0, "samples": 0}
+            window = {"loss": 0.0, "n": 0, "data_time": 0.0, "step_time": 0.0, "samples": 0, "extra": {}}
             t_last = time.time()
 
         if step % eval_every == 0 or step == max_steps:
