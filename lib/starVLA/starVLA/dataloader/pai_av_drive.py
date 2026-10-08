@@ -17,6 +17,7 @@ Sample layout (DriveMoE DrivePi0 design, 10 Hz):
     action : (action_horizon=10, 2) ego-frame (x forward, y left) positions at t0 + 0 .. t0 + 0.9 s.
 PAI-AV has no route, so the target point is the first future ego position >= ``target_distance`` m
 (Euclidean) from the current position, or the last recorded position if the clip ends earlier.
+Only the dense part of the egomotion (the ~20 s around the camera window, see ``EgoTrack``) is used.
 state / action are normalised to [-1, 1] with per-dimension q01/q99 statistics (see ``compute_norm_stats``).
 """
 
@@ -134,8 +135,14 @@ class ClipStore:
 class EgoTrack:
     """Egomotion of one clip with ego-frame quantities, interpolable at arbitrary timestamps (µs)."""
 
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, max_gap_s: float = 0.25):
         df = df.sort_values("timestamp").drop_duplicates("timestamp")
+        # Egomotion is dense (~100 Hz) only around the ~20 s camera window; it continues sparsely (gaps of
+        # seconds to a minute) up to ~140 s. Keep only the dense prefix so that nothing is interpolated
+        # across a gap.
+        gaps = np.nonzero(np.diff(df["timestamp"].to_numpy()) * US > max_gap_s)[0]
+        if len(gaps):
+            df = df.iloc[: gaps[0] + 1]
         self.t = df["timestamp"].to_numpy(dtype=np.float64)
         self.xy = df[["x", "y"]].to_numpy(dtype=np.float64)
         rot = Rotation.from_quat(df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64))
