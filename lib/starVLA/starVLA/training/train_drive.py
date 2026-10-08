@@ -207,7 +207,13 @@ def main():
         eps=float(opt_cfg.get("eps", 1e-8)),
         weight_decay=float(tcfg.get("weight_decay", 0.0)),
     )
-    max_steps = int(tcfg.max_train_steps)
+    accum = int(tcfg.get("gradient_accumulation_steps", 1))
+    steps_per_epoch = len(train_loader) // accum
+    if tcfg.get("num_epochs"):  # epoch budget wins over max_train_steps
+        max_steps = int(float(tcfg.num_epochs) * steps_per_epoch)
+    else:
+        max_steps = int(tcfg.max_train_steps)
+    log(f"{steps_per_epoch} optimizer steps per epoch, max_steps {max_steps} ({max_steps / steps_per_epoch:.2f} epochs)")
     warmup = int(tcfg.get("num_warmup_steps", 0))
     min_lr = float(tcfg.get("scheduler_specific_kwargs", {}).get("min_lr", 0.0))
 
@@ -384,7 +390,6 @@ def main():
         return int(trainer_state["step"]), int(trainer_state["epoch"])
 
     # ── training loop ─────────────────────────────────────────────────
-    accum = int(tcfg.get("gradient_accumulation_steps", 1))
     max_grad_norm = float(tcfg.get("max_grad_norm", 1.0))
     log_every = int(tcfg.get("logging_frequency", 10))
     eval_every = int(tcfg.get("eval_interval", 1000))

@@ -29,6 +29,7 @@ NPROC=${NPROC:-12}
 PPN=${PPN:-${NPROC}}
 RUN_ID=${RUN_ID:-starvla_qwendrive_pi_paiav}
 MAX_STEPS=${MAX_STEPS:-}
+NUM_EPOCHS=${NUM_EPOCHS:-}     # epoch budget (overrides MAX_STEPS); 1 epoch = every train clip once at a random t0
 EVAL_INTERVAL=${EVAL_INTERVAL:-}
 SAVE_INTERVAL=${SAVE_INTERVAL:-}
 TIME_LIMIT_HOURS=${TIME_LIMIT_HOURS:-}
@@ -58,6 +59,7 @@ export MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
 
 ARGS="run_id=${RUN_ID}"
 [ -n "${MAX_STEPS}" ] && ARGS="${ARGS} trainer.max_train_steps=${MAX_STEPS}"
+[ -n "${NUM_EPOCHS}" ] && ARGS="${ARGS} trainer.num_epochs=${NUM_EPOCHS}"
 [ -n "${EVAL_INTERVAL}" ] && ARGS="${ARGS} trainer.eval_interval=${EVAL_INTERVAL}"
 [ -n "${SAVE_INTERVAL}" ] && ARGS="${ARGS} trainer.save_interval=${SAVE_INTERVAL}"
 [ -n "${TIME_LIMIT_HOURS}" ] && ARGS="${ARGS} trainer.time_limit_hours=${TIME_LIMIT_HOURS}"
