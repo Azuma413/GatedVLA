@@ -34,8 +34,13 @@ A gate MLP (shared by the frames, which all come from the front camera) reads th
 of each visual token ``h_p`` and the mean of the
 text-token hidden states ``q`` and predicts ``m_p = σ(MLP([h_p, q, h_p ⊙ q]) / τ)``. ``log m_p`` is added to the
 action expert's cross-attention logits on that visual token in every cross-attention block (the VLM itself is
-unchanged; text tokens stay visible). Loss: ``L_gated + λ_full·L_full + λ_budget·Σ_v (mean_p m_p − ρ)²`` with
-``L_full`` the same flow-matching sample without the gate. Inference uses the gated path.
+unchanged; text tokens stay visible). Loss: ``L_gated + λ_full·L_full + λ_budget·Σ_v (mean_p m_p − ρ)² − λ_MI·Σ_v I_v``
+with ``L_full`` the same flow-matching sample without the gate. Inference uses the gated path.
+
+``I_v = mean_p [H(E_x m_p) − E_x H(m_p)]`` (binary entropy H, expectation over the global batch) is the mutual
+information between the observation and a keep decision b_p ~ Bernoulli(m_p). It is 0 for any mask that does not
+depend on the input (uniform, or a fixed spatial pattern), which ``log m`` biases leave free under the softmax.
+The gate output layer is randomly initialised: at an input-independent mask the gradient of I is exactly 0.
 """
 
 import math
@@ -97,10 +102,13 @@ class QwenDrivePIDefaultConfig:
             "mode": "learned",
             "hidden_dim": 256,
             "temperature": 1.0,
-            "init_keep": 0.99,  # initial σ(ℓ): training starts close to the ungated model
+            # Initial σ(ℓ) (bias of the gate output). Under log m attention biases a uniform m is, up to the
+            # text tokens, the ungated model for any value, so start at the budget where σ' is larger.
+            "init_keep": 0.2,
             "budget": 0.2,  # ρ, target mean of m per frame
             "budget_loss_weight": 0.1,
             "full_loss_weight": 1.0,  # weight of the ungated loss; 0 skips it
+            "mi_loss_weight": 0.0,  # λ_MI, weight of −I(m; x)
         }
     )
 
@@ -160,7 +168,7 @@ class ViewGate(nn.Module):
         self.norm_q = nn.RMSNorm(width)
         self.fc1 = nn.Linear(3 * width, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
-        nn.init.zeros_(self.fc2.weight)
+        # fc2.weight keeps its default random init so that the initial mask depends on the input.
         nn.init.constant_(self.fc2.bias, math.log(init_keep / (1 - init_keep)))
 
     def forward(self, h: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
@@ -386,6 +394,40 @@ class Qwen_Drive_PI(baseframework):
             means.append((keep * idx).sum(1) / idx.sum(1).clamp(min=1.0))
         return torch.stack(means, dim=1)
 
+    def _mask_mutual_information(self, keep: torch.Tensor, view_ids: torch.Tensor) -> tuple:
+        """Σ_v I_v with I_v = mean_p [H(m̄_p) − mean_x H(m_p(x))] over the global batch.
+
+        Every frame of a view has the same token grid (fixed camera resolution), so token p is the same image
+        location in every sample. Returns (I, marginal entropy, conditional entropy), each summed over views.
+        """
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        world = torch.distributed.get_world_size() if distributed else 1
+
+        def entropy(p):
+            p = p.clamp(1e-6, 1 - 1e-6)
+            return -(p * p.log() + (1 - p) * (1 - p).log())
+
+        mi, h_marg, h_cond = 0.0, 0.0, 0.0
+        for v in range(self.num_views):
+            m = torch.stack([keep[b][view_ids[b] == v] for b in range(keep.shape[0])])  # (B, P)
+            local_sum = m.sum(0)
+            total = local_sum.detach().clone()
+            n = torch.tensor([float(m.shape[0])], device=m.device)
+            if distributed:
+                sizes = torch.tensor([m.shape[1], -m.shape[1]], device=m.device)
+                torch.distributed.all_reduce(sizes, op=torch.distributed.ReduceOp.MAX)
+                if int(sizes[0]) != -int(sizes[1]):
+                    raise ValueError(f"view {v}: token grids differ across ranks; the mask MI needs a fixed grid")
+                torch.distributed.all_reduce(total)
+                torch.distributed.all_reduce(n)
+            # Value: the global mean. Gradient: scaled by the world size, because the gradient reduction averages
+            # over ranks while the samples of every rank enter the marginal.
+            marginal = (total + world * (local_sum - local_sum.detach())) / n
+            hm = entropy(marginal).mean()
+            hc = entropy(m).mean()
+            mi, h_marg, h_cond = mi + hm - hc, h_marg + hm.detach(), h_cond + hc.detach()
+        return mi, h_marg, h_cond
+
     # ------------------------------------------------------------------
     # Training / inference
     # ------------------------------------------------------------------
@@ -447,6 +489,12 @@ class Qwen_Drive_PI(baseframework):
             loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
             total = total + float(gate_cfg.budget_loss_weight) * loss_budget
             out["loss_budget"] = loss_budget.detach()
+            if float(gate_cfg.get("mi_loss_weight", 0.0)) > 0:
+                mi, h_marg, h_cond = self._mask_mutual_information(keep, gate_inputs["view_ids"])
+                total = total - float(gate_cfg.mi_loss_weight) * mi
+                out["mask_mi"] = mi.detach()
+                out["mask_marginal_entropy"] = h_marg
+                out["mask_cond_entropy"] = h_cond
         out["action_loss"] = total
         return out
 

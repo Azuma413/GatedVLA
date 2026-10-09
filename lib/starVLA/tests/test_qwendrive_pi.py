@@ -149,8 +149,9 @@ def test_eye_gate(tiny_qwen_drive_dir):
     out = model(batch)
     for key in ("loss_gated", "loss_full", "loss_budget", "keep_view0", "keep_view1"):
         assert key in out, key
-    # gate starts almost fully open (init_keep 0.99)
-    assert abs(out["keep_view0"].item() - 0.99) < 1e-3 and abs(out["keep_view1"].item() - 0.99) < 1e-3
+    # gate starts around init_keep (0.2) and, with a random output layer, already depends on the input
+    assert abs(out["keep_view0"].item() - 0.2) < 0.1 and abs(out["keep_view1"].item() - 0.2) < 0.1
+    assert "mask_mi" not in out  # mi_loss_weight defaults to 0
     out["action_loss"].backward()
     assert all(p.grad is not None for p in model.eye_gate.parameters())
 
@@ -159,7 +160,35 @@ def test_eye_gate(tiny_qwen_drive_dir):
     pred = model.predict_action([_sample(rng)])
     maps = pred["keep_maps"][0]
     assert len(maps) == 2 and maps[0].size < maps[1].size
-    assert np.allclose(maps[1], 0.99, atol=1e-3)
+    assert maps[1].std() > 0
+
+
+def test_eye_gate_mutual_information(tiny_qwen_drive_dir):
+    """I(m; x) = H(mean m) − mean H(m): ≥ 0, 0 for input-independent masks, and its gradient reaches the gate."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    model = build_framework(
+        _make_cfg(str(path), {"enabled": True, "mode": "learned", "mi_loss_weight": 0.1})
+    ).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng) for _ in range(3)])
+    for key in ("mask_mi", "mask_marginal_entropy", "mask_cond_entropy"):
+        assert key in out, key
+    assert out["mask_mi"].item() >= 0
+    assert torch.isclose(out["mask_mi"], out["mask_marginal_entropy"] - out["mask_cond_entropy"], atol=1e-6)
+
+    # input-independent masks (uniform, or a fixed spatial pattern) give I = 0 with a zero gradient
+    view_ids = torch.tensor([[-1, 0, 0, 1, 1, 1]] * 4)
+    pattern = torch.tensor([1.0, 0.3, 0.9, 0.2, 0.5, 0.7])
+    for fixed in (torch.full((4, 6), 0.2), pattern.repeat(4, 1)):
+        keep = fixed.clone().requires_grad_(True)
+        mi, _, _ = model._mask_mutual_information(keep, view_ids)
+        mi.backward()
+        assert abs(mi.item()) < 1e-6 and keep.grad.abs().max().item() < 1e-6
+    # an input-dependent mask has I > 0
+    keep = torch.tensor([[1.0, 0.1, 0.9, 0.9, 0.1, 0.5], [1.0, 0.9, 0.1, 0.1, 0.9, 0.5]] * 2)
+    assert model._mask_mutual_information(keep, view_ids)[0].item() > 0.5
 
 
 def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
