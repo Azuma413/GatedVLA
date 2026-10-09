@@ -34,8 +34,9 @@ A gate MLP (shared by the frames, which all come from the front camera) reads th
 of each visual token ``h_p`` and the mean of the
 text-token hidden states ``q`` and predicts ``m_p = σ(MLP([h_p, q, h_p ⊙ q]) / τ)``. ``log m_p`` is added to the
 action expert's cross-attention logits on that visual token in every cross-attention block (the VLM itself is
-unchanged; text tokens stay visible). Loss: ``L_gated + λ_full·L_full + λ_budget·Σ_v (mean_p m_p − ρ)² − λ_MI·Σ_v I_v``
-with ``L_full`` the same flow-matching sample without the gate. Inference uses the gated path.
+unchanged; text tokens stay visible). Loss: ``L_gated + λ_full·L_full + λ_budget·Σ_v (mean_p m_p − ρ)² − λ_MI·Σ_v I_v
++ β·mean_p ℓ_p²`` with ``L_full`` the same flow-matching sample without the gate (each term optional).
+Inference uses the gated path.
 
 ``I_v = mean_p [H(E_x m_p) − E_x H(m_p)]`` (binary entropy H, expectation over the global batch) is the mutual
 information between the observation and a keep decision b_p ~ Bernoulli(m_p). It is 0 for any mask that does not
@@ -109,6 +110,7 @@ class QwenDrivePIDefaultConfig:
             "budget_loss_weight": 0.1,
             "full_loss_weight": 1.0,  # weight of the ungated loss; 0 skips it
             "mi_loss_weight": 0.0,  # λ_MI, weight of −I(m; x)
+            "logit_l2_weight": 0.0,  # β, weight of mean ℓ² over the visual tokens' gate logits
         }
     )
 
@@ -355,27 +357,35 @@ class Qwen_Drive_PI(baseframework):
         view = torch.searchsorted(bounds, order.clamp(min=0), right=True)
         return torch.where(is_visual, view, torch.full_like(view, -1))
 
-    def _gate_keep(self, gate_inputs: dict, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Keep values m (B, L) in [0, 1] for visual tokens, 1 elsewhere."""
+    def _gate_keep(self, gate_inputs: dict, attention_mask: torch.Tensor, return_logits: bool = False):
+        """Keep values m (B, L) in [0, 1] for visual tokens, 1 elsewhere.
+
+        With ``return_logits`` (learned mode) also returns the pre-sigmoid gate logits ℓ of the visual tokens
+        (concatenated over the batch)."""
         view_ids = gate_inputs["view_ids"]
         keep = torch.ones(view_ids.shape, dtype=torch.float32, device=view_ids.device)
         visual = view_ids >= 0
         budget = float(self.config.framework.eye_gate.budget)
         if self.gate_mode == "uniform":
-            return torch.where(visual, torch.full_like(keep, budget), keep)
+            keep = torch.where(visual, torch.full_like(keep, budget), keep)
+            return (keep, None) if return_logits else keep
         if self.gate_mode == "random":
-            return torch.where(visual, torch.bernoulli(torch.full_like(keep, budget)), keep)
+            keep = torch.where(visual, torch.bernoulli(torch.full_like(keep, budget)), keep)
+            return (keep, None) if return_logits else keep
 
         hidden = gate_inputs["final_hidden"]
         text = (~visual) & attention_mask
         tau = float(self.config.framework.eye_gate.get("temperature", 1.0))
-        rows = []
+        rows, logits = [], []
         for b in range(hidden.shape[0]):
             q = hidden[b][text[b]].float().mean(0)
             row = keep[b].clone()
-            row[visual[b]] = torch.sigmoid(self.eye_gate(hidden[b][visual[b]], q) / tau)
+            logit = self.eye_gate(hidden[b][visual[b]], q)
+            row[visual[b]] = torch.sigmoid(logit / tau)
             rows.append(row)
-        return torch.stack(rows)
+            logits.append(logit)
+        keep = torch.stack(rows)
+        return (keep, torch.cat(logits)) if return_logits else keep
 
     @staticmethod
     def _cross_attention_bias(attention_mask: torch.Tensor, keep: Optional[torch.Tensor], dtype) -> torch.Tensor:
@@ -465,7 +475,7 @@ class Qwen_Drive_PI(baseframework):
 
         # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
         gate_cfg = self.config.framework.eye_gate
-        keep = self._gate_keep(gate_inputs, attention_mask)
+        keep, gate_logits = self._gate_keep(gate_inputs, attention_mask, return_logits=True)
         noise = torch.randn(actions_target.shape, device=device, dtype=dtype)
         t = self.action_model.sample_time(actions_target.shape[0], device=device, dtype=dtype)
 
@@ -486,9 +496,16 @@ class Qwen_Drive_PI(baseframework):
                 loss_full = flow_loss(None)
                 total = total + float(gate_cfg.full_loss_weight) * loss_full
                 out["loss_full"] = loss_full.detach()
-            loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
-            total = total + float(gate_cfg.budget_loss_weight) * loss_budget
-            out["loss_budget"] = loss_budget.detach()
+            if float(gate_cfg.budget_loss_weight) > 0:
+                loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
+                total = total + float(gate_cfg.budget_loss_weight) * loss_budget
+                out["loss_budget"] = loss_budget.detach()
+            if float(gate_cfg.get("logit_l2_weight", 0.0)) > 0:
+                # β·mean ℓ²: a finite optimum for the MI term (which grows as m -> 0/1) and a gradient on ℓ that
+                # does not pass through the sigmoid, so saturated tokens are pulled back.
+                logit_sq = (gate_logits**2).mean()
+                total = total + float(gate_cfg.logit_l2_weight) * logit_sq
+                out["gate_logit_rms"] = logit_sq.detach().sqrt()
             if float(gate_cfg.get("mi_loss_weight", 0.0)) > 0:
                 mi, h_marg, h_cond = self._mask_mutual_information(keep, gate_inputs["view_ids"])
                 total = total - float(gate_cfg.mi_loss_weight) * mi

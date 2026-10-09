@@ -191,6 +191,28 @@ def test_eye_gate_mutual_information(tiny_qwen_drive_dir):
     assert model._mask_mutual_information(keep, view_ids)[0].item() > 0.5
 
 
+def test_eye_gate_logit_l2_without_budget(tiny_qwen_drive_dir):
+    """Budget loss off, β·mean ℓ² on: the L2 gradient reaches a saturated gate (it bypasses the sigmoid)."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = {"enabled": True, "mode": "learned", "budget_loss_weight": 0.0, "mi_loss_weight": 0.1, "logit_l2_weight": 1e-3}
+    model = build_framework(_make_cfg(str(path), cfg)).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng) for _ in range(2)]
+    out = model(batch)
+    assert "loss_budget" not in out and "gate_logit_rms" in out and "mask_mi" in out
+
+    # saturate the gate fully closed (ℓ ≈ -30): only the L2 term still moves the output bias
+    with torch.no_grad():
+        model.eye_gate.fc2.weight.zero_()
+        model.eye_gate.fc2.bias.fill_(-30.0)
+    out = model(batch)
+    assert abs(out["gate_logit_rms"].item() - 30.0) < 1e-3
+    out["action_loss"].backward()
+    assert model.eye_gate.fc2.bias.grad.item() < -1e-3  # descent raises the bias back towards 0
+
+
 def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
     """A gate fixed fully open (uniform, keep = 1 -> bias 0) must reproduce the ungated model exactly."""
     from starVLA.model.framework.base_framework import build_framework
