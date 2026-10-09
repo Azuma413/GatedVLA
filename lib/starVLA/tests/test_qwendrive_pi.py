@@ -76,7 +76,7 @@ def tiny_qwen_drive_dir(tmp_path_factory):
     return out, model
 
 
-def _make_cfg(base_vlm: str, eye_gate: dict = None):
+def _make_cfg(base_vlm: str, eye_gate: dict = None, anchor: dict = None):
     return OmegaConf.create(
         {
             "framework": {
@@ -84,6 +84,7 @@ def _make_cfg(base_vlm: str, eye_gate: dict = None):
                 "qwenvl": {"base_vlm": base_vlm, "attn_implementation": "sdpa"},
                 "drive": {"current_image_pixels": 128 * 64, "history_image_pixels": 64 * 32},
                 "eye_gate": eye_gate or {"enabled": False},
+                "anchor": anchor or {"enabled": False},
             },
             "datasets": {"vla_data": {}},
             "trainer": {"repeated_diffusion_steps": 2},
@@ -183,3 +184,79 @@ def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
     torch.manual_seed(123)
     c = closed.predict_action([sample])["normalized_actions"]
     assert not np.allclose(a, c, atol=1e-3)
+
+
+@pytest.fixture(scope="module")
+def tiny_anchors(tmp_path_factory):
+    rng = np.random.default_rng(0)
+    steps = np.arange(10)[:, None] * 0.1
+    anchors = np.stack([np.concatenate([v * steps, c * (v * steps) ** 2], 1) for v in (2, 8, 15) for c in (-0.05, 0, 0.05)])
+    path = tmp_path_factory.mktemp("anchors") / "anchors.npz"
+    np.savez(path, anchors=anchors.astype(np.float32) + rng.normal(0, 0.01, anchors.shape).astype(np.float32),
+             residual_std=np.full((10, 2), 0.3, np.float32),
+             action_q01=np.array([0.0, -1.0], np.float32), action_q99=np.array([15.0, 1.0], np.float32))
+    return str(path)
+
+
+def _anchor_cfg(path, **kw):
+    cfg = {"enabled": True, "path": path, "stage": 2, "reference_top_n": 3, "target_top_n": 3}
+    cfg.update(kw)
+    return cfg
+
+
+def test_anchor_stage1(tiny_qwen_drive_dir, tiny_anchors):
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    model = build_framework(_make_cfg(str(path), anchor=_anchor_cfg(tiny_anchors, stage=1))).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng), _sample(rng)])
+    assert {"loss_anchor_cls", "anchor_top1_acc", "anchor_topn_recall"} <= set(out) and "loss_flow" not in out
+    out["action_loss"].backward()
+    assert model.anchor_query.grad is not None and model.anchor_classifier[-1].weight.grad is not None
+    assert all(p.grad is None for p in model.action_model.parameters())
+    model.eval()
+    pred = model.predict_action([_sample(rng)])
+    # stage 1 predicts the reference itself
+    ref = pred["anchor_reference"][0]
+    norm = 2 * (ref - np.array([0.0, -1.0])) / np.array([15.0, 2.0]) - 1
+    assert np.allclose(pred["normalized_actions"][0], np.clip(norm, -1, 1), atol=1e-5)
+
+
+@pytest.mark.parametrize("reference", ["soft", "hard"])
+def test_anchor_stage2_gradient_to_logits(tiny_qwen_drive_dir, tiny_anchors, reference):
+    """With the classification loss off, only the soft reference passes the flow loss gradient to the logits."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = _make_cfg(str(path), anchor=_anchor_cfg(tiny_anchors, reference=reference, cls_loss_weight=0.0))
+    model = build_framework(cfg).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng), _sample(rng)])
+    assert "loss_flow" in out and "anchor_weight_entropy" in out
+    out["action_loss"].backward()
+    grad = model.anchor_classifier[-1].weight.grad
+    if reference == "soft":
+        assert grad is not None and grad.abs().sum() > 0
+    else:
+        assert grad is None or grad.abs().sum() == 0
+    assert model.anchor_embed[0].weight.grad is not None
+    model.eval()
+    pred = model.predict_action([_sample(rng)])
+    assert pred["normalized_actions"].shape == (1, 10, 2) and pred["anchor_ids"].shape[1] == (3 if reference == "soft" else 1)
+
+
+def test_anchor_with_eye_gate(tiny_qwen_drive_dir, tiny_anchors):
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = _make_cfg(str(path), eye_gate={"enabled": True, "mode": "learned"}, anchor=_anchor_cfg(tiny_anchors))
+    model = build_framework(cfg).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng), _sample(rng)])
+    assert {"loss_anchor_cls", "loss_gated", "loss_full", "loss_budget"} <= set(out)
+    out["action_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.parameters())
+    model.eval()
+    pred = model.predict_action([_sample(rng)])
+    assert "keep_maps" in pred and "anchor_reference" in pred

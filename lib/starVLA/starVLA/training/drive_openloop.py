@@ -46,6 +46,49 @@ def displacement_metrics(
     return metrics
 
 
+def anchor_headings(anchors: np.ndarray) -> np.ndarray:
+    """Final heading (deg, left +) of each anchor (K, H, 2), from its last three steps."""
+    d = anchors[:, -1] - anchors[:, -4]
+    return np.degrees(np.arctan2(d[:, 1], d[:, 0]))
+
+
+def anchor_classes(anchors: np.ndarray, turn_deg: float = 15.0, stop_m: float = 1.0) -> np.ndarray:
+    """left / right / straight / stop label of each anchor (same ±15° rule as the eval maneuvers)."""
+    heading = anchor_headings(anchors)
+    dist = np.linalg.norm(anchors[:, -1], axis=-1)
+    return np.where(dist < stop_m, "stop", np.where(heading > turn_deg, "left",
+                                                    np.where(heading < -turn_deg, "right", "straight")))
+
+
+def anchor_metrics(anchors: np.ndarray, gt_xy: np.ndarray, ids: np.ndarray, weights: np.ndarray,
+                   top1: np.ndarray, reference: np.ndarray, maneuvers: Sequence[str]) -> Dict[str, float]:
+    """Decision-anchor diagnostics: classification vs. the GT-nearest anchor, how mixed the top-N anchors are,
+    and the error of the reference trajectory alone (before the residual flow)."""
+    nearest = np.linalg.norm(gt_xy[:, None] - anchors[None], axis=-1).mean(-1).argmin(1)
+    classes, heading = anchor_classes(anchors), anchor_headings(anchors)
+    top_classes = classes[ids]  # (N, top_n)
+    entropy = -(weights * np.log(np.clip(weights, 1e-12, None))).sum(-1)
+    ref_err = np.linalg.norm(reference - gt_xy, axis=-1)
+    out = {
+        "anchor/top1_acc": float((top1 == nearest).mean()),
+        "anchor/topn_recall": float((ids == nearest[:, None]).any(-1).mean()),
+        "anchor/topn_mixed_class_frac": float(np.mean([len(set(c)) > 1 for c in top_classes])),
+        "anchor/topn_left_and_right_frac": float(np.mean([("left" in c) and ("right" in c) for c in top_classes])),
+        "anchor/topn_heading_spread_deg": float((heading[ids].max(-1) - heading[ids].min(-1)).mean()),
+        "anchor/weight_top1": float(weights[:, 0].mean()),
+        "anchor/weight_entropy": float(entropy.mean()),
+        "anchor/reference_ADE": float(ref_err.mean()),
+        "anchor/reference_FDE": float(ref_err[:, -1].mean()),
+    }
+    maneuvers = np.asarray(maneuvers)
+    for m in MANEUVERS:
+        mask = maneuvers == m
+        if mask.any():
+            out[f"anchor/{m}/top1_acc"] = float((top1[mask] == nearest[mask]).mean())
+            out[f"anchor/{m}/reference_ADE"] = float(ref_err[mask].mean())
+    return out
+
+
 def fig_to_image(fig, dpi: int = 90, canvas: tuple = (1700, 520)) -> Image.Image:
     """Render a matplotlib figure to PIL with a tight bounding box (multi-line titles are not clipped), then
     fit it onto a fixed white canvas so that every logged image has the same size."""
@@ -68,6 +111,8 @@ def plot_bev(
     extra_preds: Optional[List[np.ndarray]] = None,
     title: str = "",
     keep_map: Optional[np.ndarray] = None,
+    reference: Optional[np.ndarray] = None,
+    candidate_anchors: Optional[np.ndarray] = None,
 ):
     """Front image (left), optionally the image weighted by the visual gate's keep map (middle), and the
     bird's-eye view (right) with past / GT / predicted ego trajectories.
@@ -100,6 +145,10 @@ def plot_bev(
 
     _plot(meta["past_xy"], color="0.55", lw=1.5, label="past (2 s)")
     _plot(meta["future_xy"], color="tab:green", lw=1.0, ls="--", alpha=0.6, label="GT future (5 s)")
+    for k, xy in enumerate(candidate_anchors if candidate_anchors is not None else []):
+        _plot(xy, color="tab:purple", lw=0.8, alpha=0.3, label="top-N anchors" if k == 0 else None)
+    if reference is not None:
+        _plot(reference, color="tab:purple", lw=1.8, ls="--", label="anchor reference")
     for k, xy in enumerate(extra_preds or []):
         _plot(xy, color="tab:red", lw=0.8, alpha=0.25, label="pred samples" if k == 0 else None)
     _plot(meta["action_xy"], color="tab:green", lw=2.5, marker="o", ms=3, label="GT (horizon)")
@@ -110,7 +159,8 @@ def plot_bev(
     ax.add_patch(plt.Rectangle((-0.95, -1.0), 1.9, 4.8, fill=False, color="k", lw=1.2))
 
     pts = np.concatenate([np.asarray(meta["past_xy"]).reshape(-1, 2), np.asarray(meta["future_xy"]).reshape(-1, 2),
-                          np.asarray(pred_xy).reshape(-1, 2), tgt[None]], axis=0)
+                          np.asarray(pred_xy).reshape(-1, 2), tgt[None]]
+                         + ([np.asarray(reference).reshape(-1, 2)] if reference is not None else []), axis=0)
     span = max(15.0, float(np.abs(pts).max()) * 1.1)
     xs, ys = -pts[:, 1], pts[:, 0]
     cx, cy = (xs.max() + xs.min()) / 2, (ys.max() + ys.min()) / 2

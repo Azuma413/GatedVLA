@@ -70,3 +70,19 @@ Planned combination with AnchorVLA (not implemented): the anchor classifier woul
 (query-based DAAR) and the DiT would generate the residual to the selected anchor (DARF). The gate's context `q`
 is the hook for the combination (e.g. `[q, anchor embedding]`), so the gate can depend on the chosen maneuver.
 Note the current 0.9 s horizon is likely too short for maneuver-level anchors.
+
+## 5. Decision anchors (AnchorVLA, modified) — `starvla_qwendrive_pi_paiav_anchor_*_h25.yaml`
+
+- Codebook: `prepare_paiav.py --action_horizon 26 --num_anchors 100` -> `meta_h25_anchor/anchors.npz`
+  (k-means of 2.5 s train trajectories in metres; per-step std of the residual to the nearest anchor).
+- DAAR (query-based): `<|quad_start|>` is appended to the prompt and its embedding replaced by a learned query;
+  an MLP on its final hidden gives K logits, trained with the soft target over the 8 nearest anchors (γ = 1 m).
+- Reference: softmax-weighted mean of the top-6 anchors (differentiable; `reference: hard` = top-1, no gradient).
+- DARF: the DiT generates `(τ − reference) / σ_r` (L1 flow loss); the reference is a per-step query bias in
+  every DiT block (query only). No top-M candidates / confidence branch.
+- Stage 1 (6 epochs, `anchor_s1`): VLM + query + classifier; the flow expert is frozen. Prediction = reference.
+- Stage 2 (12 epochs, `anchor_s2` / `anchor_eye_s2`): from the stage-1 weights, classifier + residual flow
+  (+ eye gate). `trainer.pretrained_checkpoint` points to the stage-1 final checkpoint (`step_0019200`).
+- Eval: `eval/anchor/*` — top-1 accuracy / top-6 recall vs. the GT-nearest anchor, how mixed the top-6 are
+  (`topn_mixed_class_frac`, `topn_left_and_right_frac`, `topn_heading_spread_deg`), softmax weight entropy, and
+  the ADE/FDE of the reference alone. BEV plots show the top-6 anchors and the reference.

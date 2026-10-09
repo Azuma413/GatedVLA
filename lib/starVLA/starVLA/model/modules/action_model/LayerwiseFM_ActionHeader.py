@@ -293,6 +293,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         encoder_attention_mask=None,
         noise: torch.Tensor = None,
         t: torch.Tensor = None,
+        query_bias: torch.Tensor = None,
+        loss_type: str = "mse",
     ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
@@ -300,6 +302,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         encoder_attention_mask: optional (B, seq_length) bool/int, or float additive bias
         noise, t: optional (B, action_horizon, D_action) / (B,) to reuse the same flow-matching sample
             across several calls (sampled here when None)
+        query_bias: optional (B, action_horizon, D) added to the attention queries of the action tokens in
+            every DiT block
+        loss_type: "mse" (default) or "l1" on the velocity
         """
         device = actions.device
         num_layers = len(vl_embs_list)
@@ -342,6 +347,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             timestep=t_discretized,
             encoder_attention_mask=encoder_attention_mask,
             return_pre_output=True,
+            query_bias=self._pad_query_bias(query_bias, sa_embs),
         )
 
         # Decode only the action-token positions.
@@ -349,8 +355,18 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
+        if loss_type == "l1":
+            return (pred_actions - velocity).abs().mean()
         loss = ((pred_actions - velocity) ** 2).mean()
         return loss
+
+    @staticmethod
+    def _pad_query_bias(query_bias, sa_embs):
+        """Action-token query bias (B, T_action, D) -> full-sequence bias, zero on the state / future tokens."""
+        if query_bias is None:
+            return None
+        pad = sa_embs.new_zeros(sa_embs.shape[0], sa_embs.shape[1] - query_bias.shape[1], sa_embs.shape[2])
+        return torch.cat([pad, query_bias.to(sa_embs.dtype)], dim=1)
 
     @torch.no_grad()
     def predict_action(
@@ -358,6 +374,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         vl_embs_list: list,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        query_bias: torch.Tensor = None,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
@@ -404,6 +421,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 timestep=timesteps_tensor,
                 encoder_attention_mask=encoder_attention_mask,
                 return_pre_output=True,
+                query_bias=self._pad_query_bias(query_bias, sa_embs),
             )
             # Decode only the action-token positions.
             pred = self.action_decoder(model_output)
