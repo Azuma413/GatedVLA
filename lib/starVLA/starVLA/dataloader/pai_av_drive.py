@@ -111,7 +111,10 @@ class ClipStore:
         out: List[Optional[Image.Image]] = [None] * len(frame_indices)
         with zf.open(f"{clip_id}.{FRONT_CAMERA}.mp4") as fh, av.open(fh) as container:
             stream = container.streams.video[0]
+            # FFmpeg's auto thread count adds up to ~30 threads per open file; with 96 loader workers per node
+            # that exceeds the node's 8192-task cgroup limit (pthread_create EAGAIN). Two threads are enough.
             stream.thread_type = "AUTO"
+            stream.thread_count = 2
             fps = float(stream.average_rate)
             sizes = [budget_size(stream.width, stream.height, b, factor) for b in pixel_budgets]
             first = min(wanted)
