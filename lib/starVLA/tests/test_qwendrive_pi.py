@@ -135,4 +135,4 @@ def test_forward_and_predict(tiny_qwen_drive_dir):
     model.eval()
     out = model.predict_action([_sample(rng)])["normalized_actions"]
     assert out.shape == (1, 10, 2)
-    assert np.all(np.abs(out) <= 1.0)
+    assert np.all(np.isfinite(out))

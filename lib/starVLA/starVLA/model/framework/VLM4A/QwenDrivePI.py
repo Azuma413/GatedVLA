@@ -25,7 +25,7 @@ Proprio / output design (follows DriveMoE DrivePi0, Thinklab-SJTU/DriveMoE)
 - action : (action_horizon=10, action_dim=2) ego-frame (x forward, y lateral) waypoints at 10 Hz,
            ``t+0 .. t+9``, absolute positions in the current ego frame (not deltas).
 - Both are min-max normalised to [-1, 1] with 1st/99th percentiles (starVLA ``q01/q99`` stats);
-  sampled actions are clamped to [-1, 1].
+  sampled actions are not clamped (turns and fast driving exceed the 1st/99th percentiles).
 - Flow matching: Beta(1.5, 1) time sampling with s=0.999, MSE on velocity, 10 Euler steps at inference.
 """
 
@@ -73,8 +73,9 @@ class QwenDrivePIDefaultConfig:
             "history_image_pixels": 174080,
             # Qwen3.5 vision: patch 16 x spatial merge 2 -> one token per 32x32 pixels.
             "image_factor": 32,
-            # Sampled (normalised) actions are clamped to [-action_clip, action_clip].
-            "action_clip": 1.0,
+            # Optional clamp of sampled (normalised) actions to [-action_clip, action_clip]. Off: q01/q99 are
+            # pooled over all waypoints, so a clamp at 1 cuts lateral offsets beyond ~3 m and forward beyond ~69 m.
+            "action_clip": None,
         }
     )
 
@@ -215,7 +216,7 @@ class Qwen_Drive_PI(baseframework):
         self.current_image_pixels = int(drive_cfg.get("current_image_pixels", 921600))
         self.history_image_pixels = int(drive_cfg.get("history_image_pixels", 174080))
         self.image_factor = int(drive_cfg.get("image_factor", 32))
-        self.action_clip = drive_cfg.get("action_clip", 1.0)
+        self.action_clip = drive_cfg.get("action_clip", None)
 
     # ------------------------------------------------------------------
     # Inputs
@@ -323,7 +324,7 @@ class Qwen_Drive_PI(baseframework):
 
     @torch.inference_mode()
     def predict_action(self, examples: List[dict] = None, **kwargs) -> dict:
-        """Returns ``normalized_actions`` (B, action_horizon, action_dim) in [-action_clip, action_clip]."""
+        """Returns ``normalized_actions`` (B, action_horizon, action_dim), clamped only if ``action_clip`` is set."""
         if type(examples) is not list:
             examples = [examples]
         return self._predict(examples)
