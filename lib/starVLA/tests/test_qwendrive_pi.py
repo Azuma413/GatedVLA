@@ -137,7 +137,7 @@ def test_forward_and_predict(tiny_qwen_drive_dir):
     model.eval()
     out = model.predict_action([_sample(rng)])["normalized_actions"]
     assert out.shape == (1, 10, 2)
-    assert np.all(np.abs(out) <= 1.0)
+    assert np.all(np.isfinite(out))
 
 
 def test_eye_gate(tiny_qwen_drive_dir):
@@ -220,7 +220,7 @@ def test_anchor_stage1(tiny_qwen_drive_dir, tiny_anchors):
     # stage 1 predicts the reference itself
     ref = pred["anchor_reference"][0]
     norm = 2 * (ref - np.array([0.0, -1.0])) / np.array([15.0, 2.0]) - 1
-    assert np.allclose(pred["normalized_actions"][0], np.clip(norm, -1, 1), atol=1e-5)
+    assert np.allclose(pred["normalized_actions"][0], norm, atol=1e-5)  # no clamp (action_clip off)
 
 
 @pytest.mark.parametrize("reference", ["soft", "hard"])
