@@ -265,3 +265,33 @@ def test_gate_input_standardization():
     gate.eval()
     gate(tokens(50), text)
     assert torch.equal(gate.std_h.mean, mean_before)
+
+
+def test_budgeted_keep():
+    """Budget and contrast fixed by construction: exact mean, invariant to the score scale, soft, differentiable."""
+    from starVLA.model.framework.VLM4A.QwenDrivePI import budgeted_keep
+
+    torch.manual_seed(0)
+    s = torch.randn(900, requires_grad=True)
+    m = budgeted_keep(s, 0.2, 2.0)
+    assert abs(m.mean().item() - 0.2) < 1e-4
+    # scaling the scores (what saturates a plain sigmoid gate) does not change the mask
+    assert torch.allclose(budgeted_keep(100 * s.detach(), 0.2, 2.0), m.detach(), atol=1e-5)
+    # soft: the bulk of the tokens (|z| <= 2) stays away from 0/1; only the far tails approach it
+    assert ((m > 0.005) & (m < 0.995)).float().mean().item() > 0.9
+    (m * torch.randn(900)).sum().backward()
+    assert (s.grad != 0).all()
+
+
+def test_eye_gate_budgeted(tiny_qwen_drive_dir):
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "contrast": 2.0, "budget_loss_weight": 0.0}
+    model = build_framework(_make_cfg(str(path), cfg)).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng), _sample(rng)])
+    assert "loss_budget" not in out
+    assert abs(out["keep_view0"].item() - 0.2) < 1e-3 and abs(out["keep_view1"].item() - 0.2) < 1e-3
+    out["action_loss"].backward()
+    assert model.eye_gate.fc1.weight.grad.abs().sum() > 0

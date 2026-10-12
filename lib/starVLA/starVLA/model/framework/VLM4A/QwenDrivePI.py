@@ -114,6 +114,10 @@ class QwenDrivePIDefaultConfig:
             "logit_l2_weight": 0.0,  # β, weight of mean ℓ² over the visual tokens' gate logits
             # Per-channel standardisation of the gate inputs (removes the VLM's massive-activation channels).
             "standardize_inputs": True,
+            # "sigmoid": m = σ(ℓ/τ) (EyePolicy). "budgeted": m = σ(b + contrast·z), z = ℓ standardised per frame and b
+            # set so that mean m = budget (see budgeted_keep); use with budget_loss_weight 0.
+            "parameterization": "sigmoid",
+            "contrast": 2.0,
         }
     )
 
@@ -227,6 +231,26 @@ class ViewGate(nn.Module):
         h = self.norm_h(h.to(dtype))
         q = self.norm_q(q.to(dtype))[None].expand_as(h)
         return self.fc2(F.silu(self.fc1(torch.cat([h, q, h * q], dim=-1)))).squeeze(-1).float()
+
+
+def budgeted_keep(scores: torch.Tensor, budget: float, contrast: float, iters: int = 40) -> torch.Tensor:
+    """Soft keep values of one frame with the budget and the contrast fixed by construction.
+
+    ``m_p = σ(b + α·z_p)`` with ``z`` the scores standardised over the frame's tokens, ``α = contrast`` and ``b``
+    (no gradient) found by bisection so that ``mean_p m_p = budget``. The gate only decides which tokens are kept
+    relatively more: a uniform mask is impossible (z is standardised) and the spread of m is set by α, so the mask
+    cannot binarise and no budget loss is needed.
+    """
+    z = (scores - scores.mean()) / (scores.std() + 1e-6)
+    with torch.no_grad():
+        lo = torch.full((), -30.0, device=z.device)
+        hi = torch.full((), 30.0, device=z.device)
+        for _ in range(iters):
+            mid = (lo + hi) / 2
+            above = torch.sigmoid(mid + contrast * z).mean() > budget
+            lo, hi = torch.where(above, lo, mid), torch.where(above, mid, hi)
+        bias = (lo + hi) / 2
+    return torch.sigmoid(bias + contrast * z)
 
 
 def resize_to_pixel_budget(image: Image.Image, max_pixels: int, factor: int) -> Image.Image:
@@ -426,12 +450,22 @@ class Qwen_Drive_PI(baseframework):
 
         hidden = gate_inputs["final_hidden"]
         text = (~visual) & attention_mask
-        tau = float(self.config.framework.eye_gate.get("temperature", 1.0))
+        gate_cfg = self.config.framework.eye_gate
+        tau = float(gate_cfg.get("temperature", 1.0))
+        budgeted = str(gate_cfg.get("parameterization", "sigmoid")) == "budgeted"
         rows, logits = [], []
         for b in range(hidden.shape[0]):
             row = keep[b].clone()
             logit = self.eye_gate(hidden[b][visual[b]], hidden[b][text[b]])
-            row[visual[b]] = torch.sigmoid(logit / tau)
+            if budgeted:
+                frames = view_ids[b][visual[b]]
+                m = torch.empty_like(logit)
+                for v in frames.unique():
+                    sel = frames == v
+                    m[sel] = budgeted_keep(logit[sel], budget, float(gate_cfg.get("contrast", 2.0)))
+                row[visual[b]] = m
+            else:
+                row[visual[b]] = torch.sigmoid(logit / tau)
             rows.append(row)
             logits.append(logit)
         keep = torch.stack(rows)
