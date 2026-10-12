@@ -112,6 +112,8 @@ class QwenDrivePIDefaultConfig:
             "full_loss_weight": 1.0,  # weight of the ungated loss; 0 skips it
             "mi_loss_weight": 0.0,  # λ_MI, weight of −I(m; x)
             "logit_l2_weight": 0.0,  # β, weight of mean ℓ² over the visual tokens' gate logits
+            # Per-channel standardisation of the gate inputs (removes the VLM's massive-activation channels).
+            "standardize_inputs": True,
         }
     )
 
@@ -161,12 +163,53 @@ class StateTokenEncoder(nn.Module):
         return x + self.step_embedding[:, -x.shape[1] :].to(x.dtype)
 
 
+class ChannelStandardizer(nn.Module):
+    """Per-channel (x − μ_c) / σ_c with running statistics (no affine, no gradient through the statistics).
+
+    The VLM's final hidden has a few near-constant "massive activation" channels (e.g. channel 0 ≈ 45× the RMS,
+    shared by visual and text tokens). Under RMSNorm alone they dominate the gate input (and h⊙q squares them),
+    so the gate output is input-independent. Standardising each channel removes their constant part and puts the
+    token-varying part of every channel on the same scale. The statistics are an EMA updated in training and used in
+    both training and eval; before the first update the current input's statistics are used.
+    """
+
+    def __init__(self, width: int, momentum: float = 0.01, eps: float = 1e-5):
+        super().__init__()
+        self.momentum, self.eps = momentum, eps
+        self.register_buffer("mean", torch.zeros(width))
+        self.register_buffer("var", torch.ones(width))
+        self.register_buffer("initialized", torch.zeros((), dtype=torch.bool))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, W) tokens."""
+        x = x.float()
+        with torch.no_grad():
+            mean, var = x.mean(0), x.var(0, unbiased=False)
+            if self.training:
+                if bool(self.initialized):
+                    self.mean.lerp_(mean, self.momentum)
+                    self.var.lerp_(var, self.momentum)
+                else:
+                    self.mean.copy_(mean)
+                    self.var.copy_(var)
+                    self.initialized.fill_(True)
+            if bool(self.initialized):
+                mean, var = self.mean, self.var
+        return (x - mean) / torch.sqrt(var + self.eps)
+
+
 class ViewGate(nn.Module):
     """Gate head ``ℓ_p = W2·swish(W1·[h_p, q, h_p⊙q])`` over RMS-normalised hidden states (EyePolicy's
-    ``ViewGate``). EyePolicy uses one per camera; here all frames come from the same camera and share one."""
+    ``ViewGate``). EyePolicy uses one per camera; here all frames come from the same camera and share one.
 
-    def __init__(self, width: int, hidden_dim: int, init_keep: float):
+    With ``standardize`` the visual-token hidden h and each text-token hidden are first standardised per channel
+    (``ChannelStandardizer``, separate statistics for visual and text tokens); q is the mean of the standardised
+    text tokens."""
+
+    def __init__(self, width: int, hidden_dim: int, init_keep: float, standardize: bool = True):
         super().__init__()
+        self.std_h = ChannelStandardizer(width) if standardize else None
+        self.std_t = ChannelStandardizer(width) if standardize else None
         self.norm_h = nn.RMSNorm(width)
         self.norm_q = nn.RMSNorm(width)
         self.fc1 = nn.Linear(3 * width, hidden_dim)
@@ -174,9 +217,13 @@ class ViewGate(nn.Module):
         # fc2.weight keeps its default random init so that the initial mask depends on the input.
         nn.init.constant_(self.fc2.bias, math.log(init_keep / (1 - init_keep)))
 
-    def forward(self, h: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-        """h: (N, W) visual-token hidden of one frame, q: (W,) pooled text hidden -> logits (N,)."""
+    def forward(self, h: torch.Tensor, text: torch.Tensor) -> torch.Tensor:
+        """h: (N, W) visual-token hidden of one frame, text: (T, W) text-token hidden -> logits (N,)."""
         dtype = self.fc1.weight.dtype
+        if self.std_h is not None:
+            h, q = self.std_h(h), self.std_t(text).mean(0)
+        else:
+            q = text.float().mean(0)
         h = self.norm_h(h.to(dtype))
         q = self.norm_q(q.to(dtype))[None].expand_as(h)
         return self.fc2(F.silu(self.fc1(torch.cat([h, q, h * q], dim=-1)))).squeeze(-1).float()
@@ -275,7 +322,10 @@ class Qwen_Drive_PI(baseframework):
             raise ValueError(f"eye_gate.mode must be learned / uniform / random, got {self.gate_mode}")
         self.num_views = int(self.config.framework.drive.get("num_views", 2))
         if self.gate_enabled and self.gate_mode == "learned":
-            self.eye_gate = ViewGate(llm_hidden_size, int(gate_cfg.hidden_dim), float(gate_cfg.init_keep))
+            self.eye_gate = ViewGate(
+                llm_hidden_size, int(gate_cfg.hidden_dim), float(gate_cfg.init_keep),
+                standardize=bool(gate_cfg.get("standardize_inputs", True)),
+            )
 
         drive_cfg = self.config.framework.drive
         self.prompt = str(drive_cfg.get("prompt", "predict trajectory"))
@@ -379,9 +429,8 @@ class Qwen_Drive_PI(baseframework):
         tau = float(self.config.framework.eye_gate.get("temperature", 1.0))
         rows, logits = [], []
         for b in range(hidden.shape[0]):
-            q = hidden[b][text[b]].float().mean(0)
             row = keep[b].clone()
-            logit = self.eye_gate(hidden[b][visual[b]], q)
+            logit = self.eye_gate(hidden[b][visual[b]], hidden[b][text[b]])
             row[visual[b]] = torch.sigmoid(logit / tau)
             rows.append(row)
             logits.append(logit)

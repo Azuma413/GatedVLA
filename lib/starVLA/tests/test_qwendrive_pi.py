@@ -234,3 +234,34 @@ def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
     torch.manual_seed(123)
     c = closed.predict_action([sample])["normalized_actions"]
     assert not np.allclose(a, c, atol=1e-3)
+
+
+def test_gate_input_standardization():
+    """A shared near-constant massive channel makes the plain gate input-independent; standardising fixes it."""
+    from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate
+
+    torch.manual_seed(0)
+    width = 64
+
+    def tokens(n):
+        x = torch.randn(n, width)
+        x[:, 0] = 45.0 + 0.1 * torch.randn(n)  # massive, near-constant channel shared by visual and text tokens
+        return x
+
+    h, text = tokens(200), tokens(20)
+    spread = {}
+    for standardize in (False, True):
+        torch.manual_seed(1)
+        gate = ViewGate(width, 32, init_keep=0.5, standardize=standardize).train()
+        logits = gate(h, text)
+        spread[standardize] = (logits.std() / logits.abs().mean()).item()
+    assert spread[True] > 5 * spread[False], spread
+
+    # running statistics: initialised from the first batch, then an EMA; used unchanged in eval
+    gate = ViewGate(width, 32, init_keep=0.5).train()
+    gate(h, text)
+    assert bool(gate.std_h.initialized) and torch.allclose(gate.std_h.mean, h.mean(0), atol=1e-5)
+    mean_before = gate.std_h.mean.clone()
+    gate.eval()
+    gate(tokens(50), text)
+    assert torch.equal(gate.std_h.mean, mean_before)
