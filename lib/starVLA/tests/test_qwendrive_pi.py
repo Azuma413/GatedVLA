@@ -76,13 +76,14 @@ def tiny_qwen_drive_dir(tmp_path_factory):
     return out, model
 
 
-def _make_cfg(base_vlm: str):
+def _make_cfg(base_vlm: str, eye_gate: dict = None):
     return OmegaConf.create(
         {
             "framework": {
                 "name": "QwenDrivePI",
                 "qwenvl": {"base_vlm": base_vlm, "attn_implementation": "sdpa"},
                 "drive": {"current_image_pixels": 128 * 64, "history_image_pixels": 64 * 32},
+                "eye_gate": eye_gate or {"enabled": False},
             },
             "datasets": {"vla_data": {}},
             "trainer": {"repeated_diffusion_steps": 2},
@@ -136,6 +137,182 @@ def test_forward_and_predict(tiny_qwen_drive_dir):
     out = model.predict_action([_sample(rng)])["normalized_actions"]
     assert out.shape == (1, 10, 2)
     assert np.all(np.isfinite(out))
+
+
+def test_eye_gate(tiny_qwen_drive_dir):
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    model = build_framework(_make_cfg(str(path), {"enabled": True, "mode": "learned"})).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng), _sample(rng)]
+    out = model(batch)
+    for key in ("loss_gated", "loss_full", "loss_budget", "keep_view0", "keep_view1"):
+        assert key in out, key
+    # gate starts around init_keep (0.2) and, with a random output layer, already depends on the input
+    assert abs(out["keep_view0"].item() - 0.2) < 0.1 and abs(out["keep_view1"].item() - 0.2) < 0.1
+    assert "mask_mi" not in out  # mi_loss_weight defaults to 0
+    out["action_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.parameters())
+
+    # keep maps are split per frame following the image grids (history frame has the smaller pixel budget)
+    model.eval()
+    pred = model.predict_action([_sample(rng)])
+    maps = pred["keep_maps"][0]
+    assert len(maps) == 2 and maps[0].size < maps[1].size
+    assert maps[1].std() > 0
+
+
+def test_eye_gate_mutual_information(tiny_qwen_drive_dir):
+    """I(m; x) = H(mean m) − mean H(m): ≥ 0, 0 for input-independent masks, and its gradient reaches the gate."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    model = build_framework(
+        _make_cfg(str(path), {"enabled": True, "mode": "learned", "mi_loss_weight": 0.1})
+    ).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng) for _ in range(3)])
+    for key in ("mask_mi", "mask_marginal_entropy", "mask_cond_entropy"):
+        assert key in out, key
+    assert out["mask_mi"].item() >= 0
+    assert torch.isclose(out["mask_mi"], out["mask_marginal_entropy"] - out["mask_cond_entropy"], atol=1e-6)
+
+    # input-independent masks (uniform, or a fixed spatial pattern) give I = 0 with a zero gradient
+    view_ids = torch.tensor([[-1, 0, 0, 1, 1, 1]] * 4)
+    pattern = torch.tensor([1.0, 0.3, 0.9, 0.2, 0.5, 0.7])
+    for fixed in (torch.full((4, 6), 0.2), pattern.repeat(4, 1)):
+        keep = fixed.clone().requires_grad_(True)
+        mi, _, _ = model._mask_mutual_information(keep, view_ids)
+        mi.backward()
+        assert abs(mi.item()) < 1e-6 and keep.grad.abs().max().item() < 1e-6
+    # an input-dependent mask has I > 0
+    keep = torch.tensor([[1.0, 0.1, 0.9, 0.9, 0.1, 0.5], [1.0, 0.9, 0.1, 0.1, 0.9, 0.5]] * 2)
+    assert model._mask_mutual_information(keep, view_ids)[0].item() > 0.5
+
+
+def test_eye_gate_logit_l2_without_budget(tiny_qwen_drive_dir):
+    """Budget loss off, β·mean ℓ² on: the L2 gradient reaches a saturated gate (it bypasses the sigmoid)."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = {"enabled": True, "mode": "learned", "budget_loss_weight": 0.0, "mi_loss_weight": 0.1, "logit_l2_weight": 1e-3}
+    model = build_framework(_make_cfg(str(path), cfg)).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng) for _ in range(2)]
+    out = model(batch)
+    assert "loss_budget" not in out and "gate_logit_rms" in out and "mask_mi" in out
+
+    # saturate the gate fully closed (ℓ ≈ -30): only the L2 term still moves the output bias
+    with torch.no_grad():
+        model.eye_gate.fc2.weight.zero_()
+        model.eye_gate.fc2.bias.fill_(-30.0)
+    out = model(batch)
+    assert abs(out["gate_logit_rms"].item() - 30.0) < 1e-3
+    out["action_loss"].backward()
+    assert model.eye_gate.fc2.bias.grad.item() < -1e-3  # descent raises the bias back towards 0
+
+
+def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
+    """A gate fixed fully open (uniform, keep = 1 -> bias 0) must reproduce the ungated model exactly."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    torch.manual_seed(0)
+    plain = build_framework(_make_cfg(str(path))).float().eval()
+    gated = build_framework(_make_cfg(str(path), {"enabled": True, "mode": "uniform", "budget": 1.0})).float().eval()
+    gated.load_state_dict(plain.state_dict())
+    sample = _sample(np.random.default_rng(1))
+    torch.manual_seed(123)
+    a = plain.predict_action([sample])["normalized_actions"]
+    torch.manual_seed(123)
+    b = gated.predict_action([sample])["normalized_actions"]
+    assert np.allclose(a, b, atol=1e-5)
+    # and closing it changes the prediction
+    closed = build_framework(_make_cfg(str(path), {"enabled": True, "mode": "uniform", "budget": 1e-6})).float().eval()
+    closed.load_state_dict(plain.state_dict())
+    torch.manual_seed(123)
+    c = closed.predict_action([sample])["normalized_actions"]
+    assert not np.allclose(a, c, atol=1e-3)
+
+
+def test_gate_input_standardization():
+    """A shared near-constant massive channel makes the plain gate input-independent; standardising fixes it."""
+    from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate
+
+    torch.manual_seed(0)
+    width = 64
+
+    def tokens(n):
+        x = torch.randn(n, width)
+        x[:, 0] = 45.0 + 0.1 * torch.randn(n)  # massive, near-constant channel shared by visual and text tokens
+        return x
+
+    h, text = tokens(200), tokens(20)
+    spread = {}
+    for standardize in (False, True):
+        torch.manual_seed(1)
+        gate = ViewGate(width, 32, init_keep=0.5, standardize=standardize).train()
+        logits = gate(h, text)
+        spread[standardize] = (logits.std() / logits.abs().mean()).item()
+    assert spread[True] > 5 * spread[False], spread
+
+    # running statistics: initialised from the first batch, then an EMA; used unchanged in eval
+    gate = ViewGate(width, 32, init_keep=0.5).train()
+    gate(h, text)
+    assert bool(gate.std_h.initialized) and torch.allclose(gate.std_h.mean, h.mean(0), atol=1e-5)
+    mean_before = gate.std_h.mean.clone()
+    gate.eval()
+    gate(tokens(50), text)
+    assert torch.equal(gate.std_h.mean, mean_before)
+
+
+def test_budgeted_keep():
+    """Budget and contrast fixed by construction: exact mean, invariant to the score scale, soft, differentiable."""
+    from starVLA.model.framework.VLM4A.QwenDrivePI import budgeted_keep
+
+    torch.manual_seed(0)
+    s = torch.randn(900, requires_grad=True)
+    m = budgeted_keep(s, 0.2, 2.0)
+    assert abs(m.mean().item() - 0.2) < 1e-4
+    # scaling the scores (what saturates a plain sigmoid gate) does not change the mask
+    assert torch.allclose(budgeted_keep(100 * s.detach(), 0.2, 2.0), m.detach(), atol=1e-5)
+    # soft: the bulk of the tokens (|z| <= 2) stays away from 0/1; only the far tails approach it
+    assert ((m > 0.005) & (m < 0.995)).float().mean().item() > 0.9
+    (m * torch.randn(900)).sum().backward()
+    assert (s.grad != 0).all()
+
+
+def test_budgeted_keep_gradient_matches_finite_differences():
+    """The bisection is not differentiated; the implicit-function term must make the gradient exact."""
+    from starVLA.model.framework.VLM4A.QwenDrivePI import budgeted_keep
+
+    torch.manual_seed(0)
+    s = torch.randn(50, dtype=torch.float64, requires_grad=True)
+    c = torch.randn(50, dtype=torch.float64)
+    loss = lambda x: (budgeted_keep(x, 0.2, 2.0, iters=200) * c).sum()  # noqa: E731
+    loss(s).backward()
+    eps, num = 1e-6, torch.zeros(50, dtype=torch.float64)
+    with torch.no_grad():
+        for i in range(50):
+            d = torch.zeros(50, dtype=torch.float64)
+            d[i] = eps
+            num[i] = (loss(s + d) - loss(s - d)) / (2 * eps)
+    assert torch.allclose(s.grad, num, rtol=1e-4, atol=1e-7), (s.grad - num).abs().max()
+
+
+def test_eye_gate_budgeted(tiny_qwen_drive_dir):
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "contrast": 2.0, "budget_loss_weight": 0.0}
+    model = build_framework(_make_cfg(str(path), cfg)).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng), _sample(rng)])
+    assert "loss_budget" not in out
+    assert abs(out["keep_view0"].item() - 0.2) < 1e-3 and abs(out["keep_view1"].item() - 0.2) < 1e-3
+    out["action_loss"].backward()
+    assert model.eye_gate.fc1.weight.grad.abs().sum() > 0
 
 
 def test_drive_prompt():

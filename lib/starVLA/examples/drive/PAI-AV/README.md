@@ -49,3 +49,24 @@ Live log: `logs/<RUN_ID>.log`. Outputs in `outputs/qwendrive_pi/<RUN_ID>/`:
   each also per maneuver (`eval/left/*`, `eval/right/*`, `eval/straight/*`).
 - `eval_bev/{left,right,straight}`: front image + bird's-eye view with past (2 s), GT future (5 s, dashed),
   GT horizon, prediction and target point, for the same samples at every eval.
+
+## 4. Visual evidence gate (EyePolicy) — `starvla_qwendrive_pi_paiav_eye.yaml`
+
+Port of `lib/EyePolicy` (π0.5 `eye` policy) to the layer-wise DiT expert:
+
+| | EyePolicy (π0.5) | QwenDrivePI |
+|---|---|---|
+| gate input | final-layer hidden of each image token `h_p`, mean text hidden `q` | same (Qwen3.5 final layer; `q` = mean over all non-visual, non-pad tokens) |
+| gate head | per camera `W2·swish(W1·[h_p, q, h_p⊙q])`, RMSNorm, init keep 0.99, τ = 1, no floor | same, one head shared by both frames (same camera); budget still per frame |
+| where it acts | `log m` on action-expert → image-token attention logits, every layer | `log m` on DiT cross-attention logits to visual tokens, every cross-attention block |
+| text-token path | not blocked | not blocked |
+| loss | `L_gated + λ_full·L_full + λ_b·Σ_cam (mean m − ρ)²`, shared noise / t | same (ρ = 0.2, λ_b = 0.1, λ_full = 1) |
+| controls | `uniform` (m = ρ), `random` (Bernoulli(ρ)) | same (`framework.eye_gate.mode`) |
+
+Logged: `train/{loss_gated,loss_full,loss_budget,keep_view0,keep_view1}`, `eval/keep_view*`, and a "gated view"
+panel (current frame × keep map) in `eval_bev/*`.
+
+Planned combination with AnchorVLA (not implemented): the anchor classifier would read a learned query token
+(query-based DAAR) and the DiT would generate the residual to the selected anchor (DARF). The gate's context `q`
+is the hook for the combination (e.g. `[q, anchor embedding]`), so the gate can depend on the chosen maneuver.
+Note the current 0.9 s horizon is likely too short for maneuver-level anchors.

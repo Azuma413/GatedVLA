@@ -46,7 +46,7 @@ def displacement_metrics(
     return metrics
 
 
-def fig_to_image(fig, dpi: int = 90, canvas: tuple = (1150, 520)) -> Image.Image:
+def fig_to_image(fig, dpi: int = 90, canvas: tuple = (1700, 520)) -> Image.Image:
     """Render a matplotlib figure to PIL with a tight bounding box (multi-line titles are not clipped), then
     fit it onto a fixed white canvas so that every logged image has the same size."""
     import io
@@ -67,18 +67,30 @@ def plot_bev(
     image: Optional[Image.Image] = None,
     extra_preds: Optional[List[np.ndarray]] = None,
     title: str = "",
+    keep_map: Optional[np.ndarray] = None,
 ):
-    """Front image (left) and bird's-eye view (right) with past / GT / predicted ego trajectories.
+    """Front image (left), optionally the image weighted by the visual gate's keep map (middle), and the
+    bird's-eye view (right) with past / GT / predicted ego trajectories.
 
     BEV axes: up = ego forward (+x), right = ego right (-y)."""
-    ncols = 2 if image is not None else 1
-    fig, axes = plt.subplots(1, ncols, figsize=(5.2 * ncols + (2.5 if image is not None else 0), 5.2),
-                             gridspec_kw={"width_ratios": [1.6, 1] if image is not None else [1]})
+    panels = ([image] if image is not None else []) + ([keep_map] if image is not None and keep_map is not None else [])
+    ratios = [1.6] * len(panels) + [1]
+    fig, axes = plt.subplots(1, len(ratios), figsize=(5.2 + 8.3 * len(panels), 5.2), gridspec_kw={"width_ratios": ratios})
     axes = np.atleast_1d(axes)
     if image is not None:
         axes[0].imshow(image)
         axes[0].set_axis_off()
         axes[0].set_title("front camera (t0)", fontsize=9)
+    if image is not None and keep_map is not None:
+        # each merged token's patch scaled by its min-max normalised keep value (bright = attended most)
+        lo, hi = float(np.min(keep_map)), float(np.max(keep_map))
+        norm = (keep_map - lo) / (hi - lo) if hi > lo else np.ones_like(keep_map)
+        mask = Image.fromarray((norm * 255).astype(np.uint8)).resize(image.size, Image.NEAREST)
+        gated = np.asarray(image, dtype=np.float32) * (np.asarray(mask, dtype=np.float32)[..., None] / 255.0)
+        axes[1].imshow(gated.astype(np.uint8))
+        axes[1].set_axis_off()
+        axes[1].set_title(f"mask on current frame, min-max normalised (m: min {lo:.2f} / mean "
+                          f"{float(np.mean(keep_map)):.2f} / max {hi:.2f})", fontsize=9)
     ax = axes[-1]
 
     def _plot(xy, **kw):
