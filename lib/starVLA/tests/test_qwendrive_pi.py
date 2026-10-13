@@ -315,9 +315,29 @@ def test_eye_gate_budgeted(tiny_qwen_drive_dir):
     assert model.eye_gate.fc1.weight.grad.abs().sum() > 0
 
 
-def test_target_point_prompt():
-    from starVLA.dataloader.pai_av_drive import target_point_prompt
+def test_drive_prompt():
+    from starVLA.dataloader.pai_av_drive import drive_prompt
 
-    assert target_point_prompt("predict trajectory", np.array([24.71, -3.94])) == (
-        "predict trajectory. target point (ego frame, x forward, y left): x 24.7 m, y -3.9 m"
+    assert drive_prompt("predict trajectory", np.array([24.71, -3.94]), 8.26) == (
+        "predict trajectory. speed: 8.3 m/s. target point: x 24.7 m, y -3.9 m"
     )
+    assert drive_prompt("predict trajectory") == "predict trajectory"
+
+
+def test_unicycle_round_trip_and_normalizer():
+    """accel / curvature encoding of a smooth turn decodes back to the same positions; mean/std normaliser."""
+    from starVLA.dataloader.pai_av_drive import Normalizer
+    from starVLA.model.modules.action_space.unicycle import UnicycleCodec
+
+    t = np.arange(1, 26) * 0.1
+    v0, kappa = 8.0, 0.05  # constant speed on a 20 m radius arc
+    yaw = kappa * v0 * t
+    xy = np.stack([np.sin(yaw) / kappa, (1 - np.cos(yaw)) / kappa], -1)
+    codec = UnicycleCodec(25)
+    controls = codec.encode(xy, yaw, v0)
+    assert np.allclose(controls[5:-5, 1], kappa, atol=2e-3) and np.allclose(controls[5:-5, 0], 0.0, atol=0.05)
+    assert np.abs(codec.decode(controls[None], [v0])[0].numpy() - xy).max() < 0.05
+
+    norm = Normalizer({"action": {"norm": "mean_std", "mean": [0.0, 0.0], "std": [1.0, 0.02]}})
+    z = norm.normalize("action", controls)
+    assert np.allclose(norm.unnormalize("action", z), controls, atol=1e-5)
