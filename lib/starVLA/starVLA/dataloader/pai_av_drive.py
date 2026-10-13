@@ -15,6 +15,11 @@ Sample layout (DriveMoE DrivePi0 design, 10 Hz):
              acc / angvel in the ego (rig) frame of that step, heading relative to yaw(t0),
              target point in the ego frame at t0 (repeated per step).
     action : (action_horizon=10, 2) ego-frame (x forward, y left) positions at t0 + 0 .. t0 + 0.9 s.
+Alternative layout (``state_mode="traj"``, ``action_mode="unicycle"``; only quantities AlpaSim provides):
+    state  : (state_horizon, 5) [x, y, heading_rel, speed, acc_lon] at t0-(H-1)·dt .. t0, positions in the ego
+             frame at t0 (+ target_x, target_y with ``state_target_point``)
+    action : (action_horizon, 2) [acceleration m/s², curvature 1/m] per step from t0 (Alpamayo 1.5 unicycle
+             model, see ``UnicycleCodec``), mean/std normalised; positions are recovered by integrating from v0.
 PAI-AV has no route, so the target point is the first future ego position >= ``target_distance`` m
 (Euclidean) from the current position, or the last recorded position if the clip ends earlier.
 Only the dense part of the egomotion (the ~20 s around the camera window, see ``EgoTrack``) is used.
@@ -43,6 +48,8 @@ STATE_NAMES = [
     "speed", "acc_x", "acc_y", "acc_z", "angvel_x", "angvel_y", "angvel_z", "heading_rel", "target_x", "target_y",
 ]
 ACTION_NAMES = ["x", "y"]
+TRAJ_STATE_NAMES = ["x", "y", "heading_rel", "speed", "acc_lon"]
+UNICYCLE_ACTION_NAMES = ["accel", "curvature"]
 US = 1e-6
 
 
@@ -209,6 +216,19 @@ def classify_maneuver(track: EgoTrack, t0: float, horizon_s: float = 3.0, turn_d
     return "straight"
 
 
+_CODECS: Dict[tuple, object] = {}
+
+
+def _unicycle_codec(horizon: int, dt: float):
+    """Per-process UnicycleCodec (imported lazily: torch solvers, only needed for action_mode="unicycle")."""
+    key = (horizon, dt)
+    if key not in _CODECS:
+        from starVLA.model.modules.action_space.unicycle import UnicycleCodec
+
+        _CODECS[key] = UnicycleCodec(horizon, dt)
+    return _CODECS[key]
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Sample construction (raw, un-normalised)
 # ──────────────────────────────────────────────────────────────────────
@@ -224,7 +244,14 @@ class DriveSampler:
         target_distance: float = 25.0,
         context_past_s: float = 2.0,
         context_future_s: float = 5.0,
+        state_mode: str = "drivemoe",
+        action_mode: str = "waypoints",
+        state_target_point: bool = True,
     ):
+        if state_mode not in ("drivemoe", "traj") or action_mode not in ("waypoints", "unicycle"):
+            raise ValueError(f"state_mode {state_mode} / action_mode {action_mode}")
+        self.state_mode, self.action_mode = state_mode, action_mode
+        self.state_target_point = state_target_point or state_mode == "drivemoe"
         self.state_horizon = state_horizon
         self.action_horizon = action_horizon
         self.dt = dt
@@ -233,19 +260,60 @@ class DriveSampler:
         self.context_past_s = context_past_s
         self.context_future_s = context_future_s
 
+    @property
+    def state_names(self) -> List[str]:
+        if self.state_mode == "drivemoe":
+            return STATE_NAMES
+        return TRAJ_STATE_NAMES + (["target_x", "target_y"] if self.state_target_point else [])
+
+    @property
+    def action_names(self) -> List[str]:
+        return ACTION_NAMES if self.action_mode == "waypoints" else UNICYCLE_ACTION_NAMES
+
+    @property
+    def future_steps(self) -> int:
+        """Steps after t0 covered by the action (waypoints include t0 itself, controls do not)."""
+        return self.action_horizon - 1 if self.action_mode == "waypoints" else self.action_horizon
+
     def valid_range(self, track: EgoTrack, frame_ts: Optional[np.ndarray] = None):
         lo = track.t_min + (self.state_horizon - 1) * self.dt / US
-        hi = track.t_max - (self.action_horizon - 1) * self.dt / US
+        hi = track.t_max - self.future_steps * self.dt / US
         if frame_ts is not None:
             lo = max(lo, frame_ts[0] + max(self.image_offsets) / US)
             hi = min(hi, frame_ts[-1])
         return lo, hi
+
+    def gt_xy(self, track: EgoTrack, t0: float) -> np.ndarray:
+        """Ground-truth ego-frame positions at t0, t0 + dt, .., t0 + future_steps·dt."""
+        return track.positions_ego(t0 + np.arange(self.future_steps + 1) * self.dt / US, t0).astype(np.float32)
+
+    def speed(self, track: EgoTrack, t0: float) -> float:
+        return float(np.interp(t0, track.t, track.speed))
 
     def state_action(self, track: EgoTrack, t0: float):
         t_hist = t0 + (np.arange(self.state_horizon) - (self.state_horizon - 1)) * self.dt / US
         t_fut = t0 + np.arange(self.action_horizon) * self.dt / US
         _, yaw0 = track.pose(t0)
         target = track.target_point(t0, self.target_distance)
+        if self.state_mode == "traj":
+            parts = [
+                track.positions_ego(t_hist, t0),
+                (np.interp(t_hist, track.t, track.yaw) - yaw0)[:, None],
+                track._interp(track.speed, t_hist)[:, None],
+                track._interp(track.acc_body[:, 0], t_hist)[:, None],
+            ]
+            if self.state_target_point:
+                parts.append(np.repeat(target[None], self.state_horizon, axis=0))
+            state = np.concatenate(parts, axis=1)
+        if self.action_mode == "unicycle":
+            t_ctl = t0 + np.arange(1, self.action_horizon + 1) * self.dt / US
+            action = _unicycle_codec(self.action_horizon, self.dt).encode(
+                track.positions_ego(t_ctl, t0), np.interp(t_ctl, track.t, track.yaw) - yaw0, self.speed(track, t0)
+            )
+        else:
+            action = track.positions_ego(t_fut, t0)
+        if self.state_mode == "traj":
+            return state.astype(np.float32), action.astype(np.float32), target.astype(np.float32)
         state = np.concatenate(
             [
                 track._interp(track.speed, t_hist)[:, None],
@@ -256,7 +324,6 @@ class DriveSampler:
             ],
             axis=1,
         )
-        action = track.positions_ego(t_fut, t0)
         return state.astype(np.float32), action.astype(np.float32), target.astype(np.float32)
 
     def context(self, track: EgoTrack, t0: float) -> Dict[str, np.ndarray]:
@@ -278,12 +345,16 @@ class DriveSampler:
 #  Normalisation (q01 / q99 -> [-1, 1], as DriveMoE and starVLA)
 # ──────────────────────────────────────────────────────────────────────
 class Normalizer:
+    """q01/q99 -> [-1, 1] per dimension, or z-score where the stats say ``"norm": "mean_std"``."""
+
     def __init__(self, stats: dict):
         self.stats = stats
+        self._zscore = {k for k, v in stats.items() if isinstance(v, dict) and v.get("norm") == "mean_std"}
         self._s = {
-            k: (np.asarray(v["q01"], np.float32), np.asarray(v["q99"], np.float32))
+            k: (np.asarray(v["mean"], np.float32), np.asarray(v["std"], np.float32)) if k in self._zscore
+            else (np.asarray(v["q01"], np.float32), np.asarray(v["q99"], np.float32))
             for k, v in stats.items()
-            if isinstance(v, dict) and "q01" in v
+            if isinstance(v, dict) and ("q01" in v or "mean" in v)
         }
 
     @classmethod
@@ -292,12 +363,16 @@ class Normalizer:
             return cls(json.load(f))
 
     def normalize(self, key: str, x: np.ndarray) -> np.ndarray:
-        lo, hi = self._s[key]
-        return (2.0 * (x - lo) / np.maximum(hi - lo, 1e-6) - 1.0).astype(np.float32)
+        a, b = self._s[key]
+        if key in self._zscore:
+            return ((x - a) / np.maximum(b, 1e-6)).astype(np.float32)
+        return (2.0 * (x - a) / np.maximum(b - a, 1e-6) - 1.0).astype(np.float32)
 
     def unnormalize(self, key: str, x: np.ndarray) -> np.ndarray:
-        lo, hi = self._s[key]
-        return ((np.asarray(x, np.float32) + 1.0) / 2.0 * (hi - lo) + lo).astype(np.float32)
+        a, b = self._s[key]
+        if key in self._zscore:
+            return (np.asarray(x, np.float32) * b + a).astype(np.float32)
+        return ((np.asarray(x, np.float32) + 1.0) / 2.0 * (b - a) + a).astype(np.float32)
 
 
 def compute_norm_stats(data_root: str, clips: pd.DataFrame, sampler: DriveSampler, t0s_per_clip: int = 8, seed: int = 0):
@@ -317,12 +392,15 @@ def compute_norm_stats(data_root: str, clips: pd.DataFrame, sampler: DriveSample
             s, a, _ = sampler.state_action(track, t0)
             states.append(s)
             actions.append(a)
-    states = np.concatenate(states).reshape(-1, len(STATE_NAMES))
-    actions = np.concatenate(actions).reshape(-1, len(ACTION_NAMES))
+    states = np.concatenate(states).reshape(-1, len(sampler.state_names))
+    actions = np.concatenate(actions).reshape(-1, len(sampler.action_names))
     pct = lambda x, q: np.percentile(x, q, axis=0).tolist()  # noqa: E731
+    action_stats = {"q01": pct(actions, 1), "q99": pct(actions, 99), "names": sampler.action_names}
+    if sampler.action_mode == "unicycle":  # Alpamayo normalises accel / curvature by mean and std
+        action_stats.update(norm="mean_std", mean=actions.mean(0).tolist(), std=actions.std(0).tolist())
     return {
-        "state": {"q01": pct(states, 1), "q99": pct(states, 99), "names": STATE_NAMES},
-        "action": {"q01": pct(actions, 1), "q99": pct(actions, 99), "names": ACTION_NAMES},
+        "state": {"q01": pct(states, 1), "q99": pct(states, 99), "names": sampler.state_names},
+        "action": action_stats,
         "num_samples": int(len(actions) // sampler.action_horizon),
     }
 
@@ -385,9 +463,11 @@ class PAIAVDriveDataset(Dataset):
         max_retries: int = 10,
         prompt: str = "predict trajectory",
         target_point_in_prompt: bool = False,
+        speed_in_prompt: bool = False,
     ):
         self.prompt = prompt
         self.target_point_in_prompt = target_point_in_prompt
+        self.speed_in_prompt = speed_in_prompt
         self.data_root = data_root
         self.normalizer = normalizer
         self.sampler = sampler or DriveSampler()
@@ -423,8 +503,9 @@ class PAIAVDriveDataset(Dataset):
             "clip_id": clip_id,
             "t0": t0,
             "maneuver": classify_maneuver(track, t0),
-            "action_xy": action,
+            "action_xy": self.sampler.gt_xy(track, t0),
             "target_xy": target,
+            "v0": self.sampler.speed(track, t0),
             **self.sampler.context(track, t0),
         }
         item = {
@@ -433,9 +514,21 @@ class PAIAVDriveDataset(Dataset):
             "action": self.normalizer.normalize("action", action),
             "meta": meta,
         }
-        if self.target_point_in_prompt:
-            item["lang"] = target_point_prompt(self.prompt, target)
+        if self.target_point_in_prompt or self.speed_in_prompt:
+            item["lang"] = drive_prompt(
+                self.prompt,
+                target if self.target_point_in_prompt else None,
+                meta["v0"] if self.speed_in_prompt else None,
+            )
         return item
+
+    def action_to_xy(self, normalized_action: np.ndarray, meta: dict) -> np.ndarray:
+        """Predicted normalised action -> ego-frame positions aligned with ``meta["action_xy"]``."""
+        action = self.normalizer.unnormalize("action", normalized_action)
+        if self.sampler.action_mode == "waypoints":
+            return action
+        xy = _unicycle_codec(self.sampler.action_horizon, self.sampler.dt).decode(action[None], [meta["v0"]])[0]
+        return np.concatenate([np.zeros((1, 2), np.float32), xy.numpy().astype(np.float32)])
 
     def __getitem__(self, i: int) -> dict:
         if self.samples is not None:
@@ -453,11 +546,16 @@ class PAIAVDriveDataset(Dataset):
         raise RuntimeError(f"failed to build a sample after {self.max_retries} attempts: {last_error}")
 
 
-def target_point_prompt(prompt: str, target_xy: np.ndarray) -> str:
-    """Instruction with the navigation target in text, so that the VLM itself knows where to go
-    (ego frame at t0, x forward, y left, 0.1 m resolution)."""
-    x, y = (float(v) for v in target_xy)
-    return f"{prompt}. target point (ego frame, x forward, y left): x {x:.1f} m, y {y:.1f} m"
+def drive_prompt(prompt: str, target_xy: Optional[np.ndarray] = None, speed: Optional[float] = None) -> str:
+    """Instruction with the current speed and the navigation target point (ego frame at t0, x forward, y left)
+    in text, so that the VLM itself knows where to go."""
+    parts = [prompt]
+    if speed is not None:
+        parts.append(f"speed: {float(speed):.1f} m/s")
+    if target_xy is not None:
+        x, y = (float(v) for v in target_xy)
+        parts.append(f"target point: x {x:.1f} m, y {y:.1f} m")
+    return ". ".join(parts)
 
 
 def collate_examples(batch: List[dict]) -> List[dict]:

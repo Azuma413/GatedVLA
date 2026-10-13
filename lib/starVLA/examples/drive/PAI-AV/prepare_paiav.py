@@ -59,6 +59,9 @@ def main():
     p.add_argument("--state_horizon", type=int, default=5)
     p.add_argument("--action_horizon", type=int, default=10)
     p.add_argument("--target_distance", type=float, default=25.0)
+    p.add_argument("--state_mode", default="drivemoe", choices=["drivemoe", "traj"])
+    p.add_argument("--action_mode", default="waypoints", choices=["waypoints", "unicycle"])
+    p.add_argument("--no_state_target_point", action="store_true", help="traj state without the target point")
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -66,7 +69,8 @@ def main():
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     sampler = DriveSampler(
-        state_horizon=args.state_horizon, action_horizon=args.action_horizon, target_distance=args.target_distance
+        state_horizon=args.state_horizon, action_horizon=args.action_horizon, target_distance=args.target_distance,
+        state_mode=args.state_mode, action_mode=args.action_mode, state_target_point=not args.no_state_target_point,
     )
 
     train = load_clip_table(args.data_root, "train")
@@ -75,18 +79,21 @@ def main():
     jobs = [(args.data_root, clips.iloc[s], sampler, args.t0s_per_clip, args.seed + k) for k, s in enumerate(shards)]
     with Pool(args.workers) as pool:
         parts = pool.map(_stats_worker, jobs)
-    states = np.concatenate([s for s, _ in parts]).reshape(-1, len(STATE_NAMES))
-    actions = np.concatenate([a for _, a in parts]).reshape(-1, len(ACTION_NAMES))
+    state_names, action_names = sampler.state_names, sampler.action_names
+    states = np.concatenate([s for s, _ in parts]).reshape(-1, len(state_names))
+    actions = np.concatenate([a for _, a in parts]).reshape(-1, len(action_names))
     pct = lambda x, q: np.percentile(x, q, axis=0).tolist()  # noqa: E731
     stats = {
-        "state": {"q01": pct(states, 1), "q99": pct(states, 99), "names": STATE_NAMES},
-        "action": {"q01": pct(actions, 1), "q99": pct(actions, 99), "names": ACTION_NAMES},
+        "state": {"q01": pct(states, 1), "q99": pct(states, 99), "names": state_names},
+        "action": {"q01": pct(actions, 1), "q99": pct(actions, 99), "names": action_names},
         "num_samples": int(len(states) // args.state_horizon),
         "sampler": vars(sampler),
     }
+    if sampler.action_mode == "unicycle":  # Alpamayo normalises accel / curvature by mean and std
+        stats["action"].update(norm="mean_std", mean=actions.mean(0).tolist(), std=actions.std(0).tolist())
     (out / "norm_stats.json").write_text(json.dumps(stats, indent=2))
-    print(pd.DataFrame({"q01": stats["state"]["q01"], "q99": stats["state"]["q99"]}, index=STATE_NAMES))
-    print(pd.DataFrame({"q01": stats["action"]["q01"], "q99": stats["action"]["q99"]}, index=ACTION_NAMES))
+    print(pd.DataFrame({"q01": stats["state"]["q01"], "q99": stats["state"]["q99"]}, index=state_names))
+    print(pd.DataFrame({k: v for k, v in stats["action"].items() if k in ("q01", "q99", "mean", "std")}, index=action_names))
 
     val = load_clip_table(args.data_root, args.eval_split)
     samples = build_eval_index(args.data_root, val, sampler, per_class=args.eval_per_class, seed=args.seed)

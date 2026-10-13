@@ -128,6 +128,9 @@ def main():
         state_horizon=int(fw.action_model.get("state_horizon", 5)),
         action_horizon=int(fw.action_model.get("action_horizon", 10)),
         target_distance=float(dcfg.get("target_distance", 25.0)),
+        state_mode=str(dcfg.get("state_mode", "drivemoe")),
+        action_mode=str(dcfg.get("action_mode", "waypoints")),
+        state_target_point=bool(dcfg.get("state_target_point", True)),
     )
     image_kwargs = dict(
         current_image_pixels=int(fw.get("drive", {}).get("current_image_pixels", 921600)),
@@ -135,6 +138,7 @@ def main():
         # navigation target as text in the VLM prompt (the VLM otherwise never sees where to go)
         prompt=str(fw.get("drive", {}).get("prompt", "predict trajectory")),
         target_point_in_prompt=bool(dcfg.get("target_point_in_prompt", False)),
+        speed_in_prompt=bool(dcfg.get("speed_in_prompt", False)),
     )
     train_ds = PAIAVDriveDataset(
         dcfg.data_root, normalizer, split="train", sampler=sampler_cfg, max_clips=dcfg.get("max_clips", None),
@@ -282,7 +286,7 @@ def main():
                 meta = item["meta"]
                 rec = {
                     "idx": i,
-                    "pred_xy": normalizer.unnormalize("action", p),
+                    "pred_xy": eval_ds.action_to_xy(p, meta),
                     "gt_xy": meta["action_xy"],
                     "maneuver": meta["maneuver"],
                 }
