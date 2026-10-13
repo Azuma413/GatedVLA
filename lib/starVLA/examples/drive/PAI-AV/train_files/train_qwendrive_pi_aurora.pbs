@@ -16,6 +16,13 @@
 #                         (re-submit the same command to continue: training resumes from <run>/resume/latest
 #                          and keeps logging into the same W&B run; TIME_LIMIT_HOURS saves + exits before walltime)
 # Extra OmegaConf overrides: qsub -v EXTRA="trainer.learning_rate.base=3e-5 datasets.vla_data.per_device_batch_size=2"
+# Training mode (one code base; picks the config unless CONFIG is given):
+#   MODE=baseline        v2 layout (speed + target point in the prompt, AlpaSim state, accel/curvature actions)
+#   MODE=eye             v2 + EyePolicy gate (budgeted soft mask); set PRETRAINED=<baseline checkpoint dir>
+#   MODE=anchor_s1       AnchorVLA stage 1 (VLM + classifier)          -- waypoint actions (v1 layout) for now
+#   MODE=anchor_s2       AnchorVLA stage 2 (+ residual flow); PRETRAINED=<stage-1 checkpoint dir>
+#   MODE=anchor_eye_s2   AnchorVLA stage 2 + eye gate;      PRETRAINED=<stage-1 checkpoint dir>
+#   e.g. qsub -q capacity -l walltime=24:00:00 -v MODE=eye,PRETRAINED=<dir>,NUM_EPOCHS=3,RUN_ID=<id> <this file>
 # Run qsub from lib/starVLA. Prereq (once): examples/drive/PAI-AV/prepare_paiav.py (norm stats + eval index).
 # NB: no `set -u` (Aurora lmod init references unbound vars).
 set -eo pipefail
@@ -24,7 +31,19 @@ REPO_DIR=${REPO_DIR:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research}
 STARVLA_DIR=${REPO_DIR}/lib/starVLA
 VENV=${VENV:-/lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/starvla_venv}
 ENV_FILE=${ENV_FILE:-/lus/flare/projects/RobustViT/hiratsuka/.env}   # WANDB_API_KEY, HF_TOKEN
-CONFIG=${CONFIG:-examples/drive/PAI-AV/train_files/starvla_qwendrive_pi_paiav.yaml}
+MODE=${MODE:-}
+PRETRAINED=${PRETRAINED:-}
+TF=examples/drive/PAI-AV/train_files
+case "${MODE}" in
+  "")            ;;
+  baseline)      DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_v2_h25.yaml ;;
+  eye)           DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_v2_h25.yaml ;;
+  anchor_s1)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s1_h25.yaml ;;
+  anchor_s2)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s2_h25.yaml ;;
+  anchor_eye_s2) DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_eye_s2_h25.yaml ;;
+  *) echo "unknown MODE=${MODE} (baseline | eye | anchor_s1 | anchor_s2 | anchor_eye_s2)"; exit 2 ;;
+esac
+CONFIG=${CONFIG:-${DEFAULT_CONFIG:-${TF}/starvla_qwendrive_pi_paiav.yaml}}
 NPROC=${NPROC:-12}
 PPN=${PPN:-${NPROC}}
 RUN_ID=${RUN_ID:-starvla_qwendrive_pi_paiav}
@@ -63,6 +82,7 @@ ARGS="run_id=${RUN_ID}"
 [ -n "${EVAL_INTERVAL}" ] && ARGS="${ARGS} trainer.eval_interval=${EVAL_INTERVAL}"
 [ -n "${SAVE_INTERVAL}" ] && ARGS="${ARGS} trainer.save_interval=${SAVE_INTERVAL}"
 [ -n "${TIME_LIMIT_HOURS}" ] && ARGS="${ARGS} trainer.time_limit_hours=${TIME_LIMIT_HOURS}"
+[ -n "${PRETRAINED}" ] && ARGS="${ARGS} trainer.pretrained_checkpoint=${PRETRAINED}"
 ARGS="${ARGS} ${EXTRA}"
 
 # 12 ranks: 8 physical cores each (6 per socket) for the rank + its video-decoding dataloader workers.

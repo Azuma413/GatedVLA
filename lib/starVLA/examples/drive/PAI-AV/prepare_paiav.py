@@ -129,6 +129,8 @@ def main():
     print(pd.DataFrame({k: v for k, v in stats["action"].items() if k in ("q01", "q99", "mean", "std")}, index=action_names))
 
     if args.num_anchors > 0:
+        if sampler.action_mode != "waypoints":
+            raise SystemExit("--num_anchors needs --action_mode waypoints (anchors are trajectories in metres)")
         traj = actions.reshape(-1, args.action_horizon, len(ACTION_NAMES))
         anchors = kmeans(traj, args.num_anchors, seed=args.seed)
         nearest = mean_l2(traj, anchors).argmin(1)
