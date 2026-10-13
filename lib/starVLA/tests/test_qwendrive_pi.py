@@ -136,3 +136,11 @@ def test_forward_and_predict(tiny_qwen_drive_dir):
     out = model.predict_action([_sample(rng)])["normalized_actions"]
     assert out.shape == (1, 10, 2)
     assert np.all(np.isfinite(out))
+
+
+def test_target_point_prompt():
+    from starVLA.dataloader.pai_av_drive import target_point_prompt
+
+    assert target_point_prompt("predict trajectory", np.array([24.71, -3.94])) == (
+        "predict trajectory. target point (ego frame, x forward, y left): x 24.7 m, y -3.9 m"
+    )
