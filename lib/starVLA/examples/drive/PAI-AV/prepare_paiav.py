@@ -128,9 +128,41 @@ def main():
     print(pd.DataFrame({"q01": stats["state"]["q01"], "q99": stats["state"]["q99"]}, index=state_names))
     print(pd.DataFrame({k: v for k, v in stats["action"].items() if k in ("q01", "q99", "mean", "std")}, index=action_names))
 
-    if args.num_anchors > 0:
-        if sampler.action_mode != "waypoints":
-            raise SystemExit("--num_anchors needs --action_mode waypoints (anchors are trajectories in metres)")
+    if args.num_anchors > 0 and sampler.action_mode == "unicycle":
+        # Control-space codebook: k-means on mean/std normalised [accel, curvature] sequences. The nearest anchor of
+        # a sample (for the residual statistics) is chosen in metres after integrating both from the sample's v0,
+        # as the classifier's soft target does.
+        import torch
+
+        from starVLA.model.modules.action_space.unicycle import unicycle_rollout
+
+        ctl = actions.reshape(-1, args.action_horizon, len(action_names))
+        v0 = states.reshape(len(ctl), args.state_horizon, len(state_names))[:, -1, state_names.index("speed")]
+        mean, std = np.asarray(stats["action"]["mean"]), np.asarray(stats["action"]["std"])
+        anchors = (kmeans((ctl - mean) / std, args.num_anchors, seed=args.seed) * std + mean).astype(np.float32)
+        a_t = torch.as_tensor(anchors, dtype=torch.float64)
+        nearest = []
+        for s in range(0, len(ctl), 2000):
+            v = torch.as_tensor(v0[s : s + 2000], dtype=torch.float64)
+            gt_m = unicycle_rollout(torch.as_tensor(ctl[s : s + 2000], dtype=torch.float64), v)
+            an_m = unicycle_rollout(a_t[None].expand(len(v), -1, -1, -1), v[:, None].expand(-1, len(anchors)))
+            nearest.append(torch.linalg.norm(gt_m[:, None] - an_m, dim=-1).mean(-1).argmin(1).numpy())
+        nearest = np.concatenate(nearest)
+        residual = ctl - anchors[nearest]
+        residual_std = np.maximum(residual.std(0), 0.05 * std)  # floor: 5 % of the control std
+        np.savez(
+            out / "anchors.npz",
+            anchors=anchors,
+            residual_std=residual_std.astype(np.float32),
+            space="control",
+            dt=np.float32(sampler.dt),
+            action_mean=mean.astype(np.float32),
+            action_std=std.astype(np.float32),
+        )
+        counts = np.bincount(nearest, minlength=args.num_anchors)
+        print(f"control anchors: {anchors.shape}, cluster sizes min/median/max {counts.min()}/{int(np.median(counts))}/"
+              f"{counts.max()}, mean |residual| / std {np.abs(residual / std).mean():.3f}")
+    elif args.num_anchors > 0:
         traj = actions.reshape(-1, args.action_horizon, len(ACTION_NAMES))
         anchors = kmeans(traj, args.num_anchors, seed=args.seed)
         nearest = mean_l2(traj, anchors).argmin(1)
@@ -139,6 +171,7 @@ def main():
             out / "anchors.npz",
             anchors=anchors,
             residual_std=residual_std.astype(np.float32),
+            space="waypoints",
             action_q01=np.asarray(stats["action"]["q01"], np.float32),
             action_q99=np.asarray(stats["action"]["q99"], np.float32),
         )

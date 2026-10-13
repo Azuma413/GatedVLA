@@ -15,6 +15,22 @@ import torch
 from .unicycle_accel_curvature import UnicycleAccelCurvatureActionSpace
 
 
+def unicycle_rollout(controls: torch.Tensor, v0: torch.Tensor, dt: float = 0.1) -> torch.Tensor:
+    """Positions (..., N, 2) at t0 + dt .. t0 + N·dt from raw controls (..., N, 2) [accel, curvature] and v0 (...).
+
+    Same integration as Alpamayo's ``action_to_traj`` (trapezoidal positions), in the input's dtype / device and
+    differentiable, for use inside the model (anchor distances, reference trajectories)."""
+    accel, kappa = controls[..., 0], controls[..., 1]
+    v0 = v0.to(controls.dtype)[..., None]
+    v = torch.cat([v0, v0 + torch.cumsum(accel * dt, dim=-1)], dim=-1)  # (..., N+1)
+    dtheta = kappa * v[..., :-1] * dt + kappa * accel * (0.5 * dt**2)
+    theta = torch.cat([torch.zeros_like(v0), torch.cumsum(dtheta, dim=-1)], dim=-1)
+    vx, vy = v * torch.cos(theta), v * torch.sin(theta)
+    x = torch.cumsum((vx[..., :-1] + vx[..., 1:]) * (0.5 * dt), dim=-1)
+    y = torch.cumsum((vy[..., :-1] + vy[..., 1:]) * (0.5 * dt), dim=-1)
+    return torch.stack([x, y], dim=-1)
+
+
 def _yaw_to_rot(yaw: torch.Tensor) -> torch.Tensor:
     c, s = torch.cos(yaw), torch.sin(yaw)
     rot = torch.zeros(*yaw.shape, 3, 3, dtype=yaw.dtype, device=yaw.device)

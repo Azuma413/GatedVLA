@@ -63,10 +63,18 @@ def anchor_classes(anchors: np.ndarray, turn_deg: float = 15.0, stop_m: float = 
 def anchor_metrics(anchors: np.ndarray, gt_xy: np.ndarray, ids: np.ndarray, weights: np.ndarray,
                    top1: np.ndarray, reference: np.ndarray, maneuvers: Sequence[str]) -> Dict[str, float]:
     """Decision-anchor diagnostics: classification vs. the GT-nearest anchor, how mixed the top-N anchors are,
-    and the error of the reference trajectory alone (before the residual flow)."""
-    nearest = np.linalg.norm(gt_xy[:, None] - anchors[None], axis=-1).mean(-1).argmin(1)
-    classes, heading = anchor_classes(anchors), anchor_headings(anchors)
-    top_classes = classes[ids]  # (N, top_n)
+    and the error of the reference trajectory alone (before the residual flow).
+
+    ``anchors``: (K, H, 2) trajectories, or (N, K, H, 2) per-sample trajectories (control-space anchors integrated
+    from each sample's current speed)."""
+    per_sample = anchors.ndim == 4
+    anchors_n = anchors if per_sample else np.broadcast_to(anchors, (len(gt_xy), *anchors.shape))
+    nearest = np.linalg.norm(gt_xy[:, None] - anchors_n, axis=-1).mean(-1).argmin(1)
+    if per_sample:
+        top_classes = np.stack([anchor_classes(a)[i] for a, i in zip(anchors, ids)])
+        top_heading = np.stack([anchor_headings(a)[i] for a, i in zip(anchors, ids)])
+    else:
+        top_classes, top_heading = anchor_classes(anchors)[ids], anchor_headings(anchors)[ids]  # (N, top_n)
     entropy = -(weights * np.log(np.clip(weights, 1e-12, None))).sum(-1)
     ref_err = np.linalg.norm(reference - gt_xy, axis=-1)
     out = {
@@ -74,7 +82,7 @@ def anchor_metrics(anchors: np.ndarray, gt_xy: np.ndarray, ids: np.ndarray, weig
         "anchor/topn_recall": float((ids == nearest[:, None]).any(-1).mean()),
         "anchor/topn_mixed_class_frac": float(np.mean([len(set(c)) > 1 for c in top_classes])),
         "anchor/topn_left_and_right_frac": float(np.mean([("left" in c) and ("right" in c) for c in top_classes])),
-        "anchor/topn_heading_spread_deg": float((heading[ids].max(-1) - heading[ids].min(-1)).mean()),
+        "anchor/topn_heading_spread_deg": float((top_heading.max(-1) - top_heading.min(-1)).mean()),
         "anchor/weight_top1": float(weights[:, 0].mean()),
         "anchor/weight_entropy": float(entropy.mean()),
         "anchor/reference_ADE": float(ref_err.mean()),

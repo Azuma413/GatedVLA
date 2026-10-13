@@ -418,3 +418,44 @@ def test_anchor_with_eye_gate(tiny_qwen_drive_dir, tiny_anchors):
     model.eval()
     pred = model.predict_action([_sample(rng)])
     assert "keep_maps" in pred and "anchor_reference" in pred
+
+
+@pytest.fixture(scope="module")
+def tiny_control_anchors(tmp_path_factory):
+    rng = np.random.default_rng(0)
+    anchors = np.stack([np.stack([np.full(10, a), np.full(10, k)], -1) for a in (-1.0, 0.0, 1.0) for k in (-0.05, 0.0, 0.05)])
+    path = tmp_path_factory.mktemp("canchors") / "anchors.npz"
+    np.savez(path, anchors=anchors.astype(np.float32) + rng.normal(0, 0.001, anchors.shape).astype(np.float32),
+             residual_std=np.full((10, 2), 0.1, np.float32), space="control", dt=np.float32(0.1),
+             action_mean=np.array([0.0, 0.0], np.float32), action_std=np.array([0.9, 0.025], np.float32))
+    return str(path)
+
+
+def test_anchor_control_space(tiny_qwen_drive_dir, tiny_control_anchors):
+    """Control-space anchors: soft targets from metre distances after integrating from v0; stage 2 residual in
+    control space; eval gets per-sample anchor trajectories."""
+    from starVLA.model.framework.base_framework import build_framework
+    from starVLA.model.modules.action_space.unicycle import unicycle_rollout
+
+    path, _ = tiny_qwen_drive_dir
+    for stage in (1, 2):
+        model = build_framework(_make_cfg(str(path), anchor=_anchor_cfg(tiny_control_anchors, stage=stage))).float()
+        assert model.anchor_space == "control"
+        rng = np.random.default_rng(0)
+        batch = [dict(_sample(rng), v0=float(v)) for v in (3.0, 12.0)]
+        out = model(batch)
+        assert torch.isfinite(out["action_loss"]) and ("loss_flow" in out) == (stage == 2)
+        out["action_loss"].backward()
+        assert model.anchor_classifier[-1].weight.grad is not None
+        model.eval()
+        pred = model.predict_action([batch[1]])
+        assert pred["anchor_xy"].shape == (1, 9, 11, 2) and pred["anchor_reference"].shape == (1, 11, 2)
+        if stage == 1:  # prediction = reference controls; its rollout from v0 is the reported reference trajectory
+            ctl = pred["normalized_actions"][0] * np.array([0.9, 0.025])
+            xy = unicycle_rollout(torch.as_tensor(ctl, dtype=torch.float64), torch.tensor(12.0, dtype=torch.float64))
+            assert np.allclose(xy.numpy(), pred["anchor_reference"][0, 1:], atol=1e-3)
+
+    # nearest anchor in metres depends on the speed: same controls, different v0 -> distances scale with speed
+    d_slow = model._anchor_distances(model.anchors[:1], torch.tensor([2.0]))
+    d_fast = model._anchor_distances(model.anchors[:1], torch.tensor([20.0]))
+    assert d_fast[0, 2] > d_slow[0, 2]

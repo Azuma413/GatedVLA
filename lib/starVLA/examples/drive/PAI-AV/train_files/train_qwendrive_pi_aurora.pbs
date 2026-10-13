@@ -19,7 +19,7 @@
 # Training mode (one code base; picks the config unless CONFIG is given):
 #   MODE=baseline        v2 layout (speed + target point in the prompt, AlpaSim state, accel/curvature actions)
 #   MODE=eye             v2 + EyePolicy gate (budgeted soft mask); set PRETRAINED=<baseline checkpoint dir>
-#   MODE=anchor_s1       AnchorVLA stage 1 (VLM + classifier)          -- waypoint actions (v1 layout) for now
+#   MODE=anchor_s1       AnchorVLA stage 1 (VLM + classifier), control-space anchors (v2 layout)
 #   MODE=anchor_s2       AnchorVLA stage 2 (+ residual flow); PRETRAINED=<stage-1 checkpoint dir>
 #   MODE=anchor_eye_s2   AnchorVLA stage 2 + eye gate;      PRETRAINED=<stage-1 checkpoint dir>
 #   e.g. qsub -q capacity -l walltime=24:00:00 -v MODE=eye,PRETRAINED=<dir>,NUM_EPOCHS=3,RUN_ID=<id> <this file>
@@ -38,9 +38,9 @@ case "${MODE}" in
   "")            ;;
   baseline)      DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_v2_h25.yaml ;;
   eye)           DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_v2_h25.yaml ;;
-  anchor_s1)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s1_h25.yaml ;;
-  anchor_s2)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s2_h25.yaml ;;
-  anchor_eye_s2) DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_eye_s2_h25.yaml ;;
+  anchor_s1)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s1_v2_h25.yaml ;;
+  anchor_s2)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s2_v2_h25.yaml ;;
+  anchor_eye_s2) DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_eye_s2_v2_h25.yaml ;;
   *) echo "unknown MODE=${MODE} (baseline | eye | anchor_s1 | anchor_s2 | anchor_eye_s2)"; exit 2 ;;
 esac
 CONFIG=${CONFIG:-${DEFAULT_CONFIG:-${TF}/starvla_qwendrive_pi_paiav.yaml}}

@@ -67,6 +67,7 @@ from PIL import Image
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config, populate_layerwise_dit_cfg
+from starVLA.model.modules.action_space.unicycle import unicycle_rollout
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import LayerwiseFlowmatchingActionHead, get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -405,13 +406,22 @@ class Qwen_Drive_PI(baseframework):
     # ------------------------------------------------------------------
     def _init_anchor(self, anchor_cfg, llm_hidden_size: int) -> None:
         data = np.load(anchor_cfg.path)
-        anchors = torch.as_tensor(data["anchors"], dtype=torch.float32)  # (K, H, 2) metres
+        # "waypoints": anchors are trajectories (K, H, 2) in metres (q01/q99 action normalisation).
+        # "control": anchors are [accel, curvature] sequences (K, H, 2) (mean/std action normalisation); distances
+        # to the ground truth are measured in metres after integrating from each sample's current speed v0.
+        self.anchor_space = str(data["space"]) if "space" in data else "waypoints"
+        anchors = torch.as_tensor(data["anchors"], dtype=torch.float32)
         if anchors.shape[1] != self.action_horizon:
             raise ValueError(f"anchors have horizon {anchors.shape[1]}, action_horizon is {self.action_horizon}")
         self.register_buffer("anchors", anchors, persistent=False)
         self.register_buffer("residual_std", torch.as_tensor(data["residual_std"], dtype=torch.float32), persistent=False)
-        self.register_buffer("action_q01", torch.as_tensor(data["action_q01"], dtype=torch.float32), persistent=False)
-        self.register_buffer("action_q99", torch.as_tensor(data["action_q99"], dtype=torch.float32), persistent=False)
+        if self.anchor_space == "control":
+            self.anchor_dt = float(data["dt"])
+            self.register_buffer("action_mean", torch.as_tensor(data["action_mean"], dtype=torch.float32), persistent=False)
+            self.register_buffer("action_std", torch.as_tensor(data["action_std"], dtype=torch.float32), persistent=False)
+        else:
+            self.register_buffer("action_q01", torch.as_tensor(data["action_q01"], dtype=torch.float32), persistent=False)
+            self.register_buffer("action_q99", torch.as_tensor(data["action_q99"], dtype=torch.float32), persistent=False)
         self.anchor_stage = int(anchor_cfg.stage)
         if anchor_cfg.reference not in ("soft", "hard"):
             raise ValueError(f"anchor.reference must be soft / hard, got {anchor_cfg.reference}")
@@ -441,11 +451,35 @@ class Qwen_Drive_PI(baseframework):
         output[is_query] = self.anchor_query.to(output.dtype)
         return output
 
-    def _normalize_actions(self, xy: torch.Tensor) -> torch.Tensor:
-        return 2.0 * (xy - self.action_q01) / (self.action_q99 - self.action_q01).clamp(min=1e-6) - 1.0
+    def _normalize_actions(self, a: torch.Tensor) -> torch.Tensor:
+        if self.anchor_space == "control":
+            return (a - self.action_mean) / self.action_std.clamp(min=1e-6)
+        return 2.0 * (a - self.action_q01) / (self.action_q99 - self.action_q01).clamp(min=1e-6) - 1.0
 
     def _unnormalize_actions(self, x: torch.Tensor) -> torch.Tensor:
+        if self.anchor_space == "control":
+            return x * self.action_std + self.action_mean
         return (x + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+
+    def _to_metres(self, a: torch.Tensor, v0: Optional[torch.Tensor]) -> torch.Tensor:
+        """Raw actions (B, [K,] H, 2) -> positions in metres (controls are integrated from v0 (B,))."""
+        if self.anchor_space != "control":
+            return a
+        v0 = v0.to(a.device, a.dtype)
+        if a.dim() == 4:
+            v0 = v0[:, None].expand(-1, a.shape[1])
+        return unicycle_rollout(a, v0, self.anchor_dt)
+
+    @staticmethod
+    def _current_speed(examples: List[dict], device) -> Optional[torch.Tensor]:
+        """Current speed v0 (B,) in m/s (``v0``, or ``meta["v0"]``), needed by control-space anchors."""
+        if "v0" in examples[0]:
+            speeds = [ex["v0"] for ex in examples]
+        elif "v0" in examples[0].get("meta", {}):
+            speeds = [ex["meta"]["v0"] for ex in examples]
+        else:
+            return None
+        return torch.as_tensor(np.asarray(speeds, dtype=np.float32), device=device)
 
     def _anchor_reference(self, logits: torch.Tensor):
         """Reference trajectory (B, H, 2) in metres, top-N anchor ids and weights."""
@@ -458,13 +492,15 @@ class Qwen_Drive_PI(baseframework):
         weights = torch.softmax(top_logits.float() / float(cfg.reference_temperature), dim=-1)
         return (weights[..., None, None] * self.anchors[ids]).sum(1), ids, weights
 
-    def _anchor_distances(self, traj_m: torch.Tensor) -> torch.Tensor:
-        """AnchorVLA Eq. 3: mean point-wise L2 distance (B, K)."""
-        return torch.linalg.norm(traj_m[:, None] - self.anchors[None], dim=-1).mean(-1)
+    def _anchor_distances(self, gt: torch.Tensor, v0: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """AnchorVLA Eq. 3: mean point-wise L2 distance in metres (B, K) between the ground truth and every anchor
+        (control anchors are integrated from each sample's v0, like the ground-truth controls)."""
+        anchors = self.anchors[None].expand(gt.shape[0], -1, -1, -1)
+        return torch.linalg.norm(self._to_metres(gt, v0)[:, None] - self._to_metres(anchors, v0), dim=-1).mean(-1)
 
-    def _anchor_losses(self, logits: torch.Tensor, gt_m: torch.Tensor) -> dict:
+    def _anchor_losses(self, logits: torch.Tensor, gt_m: torch.Tensor, v0: Optional[torch.Tensor] = None) -> dict:
         cfg = self.config.framework.anchor
-        dist = self._anchor_distances(gt_m)
+        dist = self._anchor_distances(gt_m, v0)
         near_d, near_ids = (-dist).topk(int(cfg.target_top_n), dim=-1)
         target = torch.zeros_like(dist).scatter_(1, near_ids, torch.softmax(near_d / float(cfg.target_gamma), dim=-1))
         log_p = torch.log_softmax(logits.float(), dim=-1)
@@ -673,7 +709,8 @@ class Qwen_Drive_PI(baseframework):
             anchor_cfg = self.config.framework.anchor
             logits = self.anchor_classifier(gate_inputs["query_hidden"].to(self.anchor_classifier[0].weight.dtype))
             gt_m = self._unnormalize_actions(actions_target.float())
-            anchor_out = self._anchor_losses(logits, gt_m)
+            v0 = self._current_speed(examples, device)
+            anchor_out = self._anchor_losses(logits, gt_m, v0)
             total = total + float(anchor_cfg.cls_loss_weight) * anchor_out["loss_anchor_cls"]
             out.update({k: v.detach() for k, v in anchor_out.items()})
             if self.anchor_stage == 1:
@@ -775,6 +812,13 @@ class Qwen_Drive_PI(baseframework):
                 anchor_weights=weights.float().cpu().numpy(),
                 anchor_top1=logits.argmax(-1).cpu().numpy(),
             )
+            if self.anchor_space == "control":  # positions of the reference / every anchor for eval and plots
+                v0 = self._current_speed(examples, device)
+                zero = torch.zeros(reference.shape[0], 1, 2, device=device)
+                out["anchor_reference"] = torch.cat([zero, self._to_metres(reference, v0)], 1).float().cpu().numpy()
+                anchors_m = self._to_metres(self.anchors[None].expand(reference.shape[0], -1, -1, -1), v0)
+                zero_k = torch.zeros(*anchors_m.shape[:2], 1, 2, device=device)
+                out["anchor_xy"] = torch.cat([zero_k, anchors_m], 2).float().cpu().numpy()
             if self.anchor_stage == 1:
                 pred_m = reference
             else:

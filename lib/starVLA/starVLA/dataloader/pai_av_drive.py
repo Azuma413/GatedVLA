@@ -512,6 +512,7 @@ class PAIAVDriveDataset(Dataset):
             "image": images,
             "state": self.normalizer.normalize("state", state),
             "action": self.normalizer.normalize("action", action),
+            "v0": meta["v0"],  # current speed (m/s): controls are integrated from it
             "meta": meta,
         }
         if self.target_point_in_prompt or self.speed_in_prompt:

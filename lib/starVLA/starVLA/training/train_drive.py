@@ -132,9 +132,11 @@ def main():
         action_mode=str(dcfg.get("action_mode", "waypoints")),
         state_target_point=bool(dcfg.get("state_target_point", True)),
     )
-    if fw.get("anchor", {}).get("enabled", False) and sampler_cfg.action_mode != "waypoints":
-        # Anchors, residuals and the reference are in waypoint space; the control-space variant is not built yet.
-        raise ValueError("framework.anchor requires datasets.vla_data.action_mode: waypoints for now")
+    if fw.get("anchor", {}).get("enabled", False):
+        anchor_file = np.load(fw.anchor.path)
+        anchor_space = str(anchor_file["space"]) if "space" in anchor_file else "waypoints"
+        if (anchor_space == "control") != (sampler_cfg.action_mode == "unicycle"):
+            raise ValueError(f"{anchor_space} anchors do not match datasets.vla_data.action_mode {sampler_cfg.action_mode}")
     image_kwargs = dict(
         current_image_pixels=int(fw.get("drive", {}).get("current_image_pixels", 921600)),
         history_image_pixels=int(fw.get("drive", {}).get("history_image_pixels", 174080)),
@@ -307,6 +309,8 @@ def main():
                         anchor_top1=int(pred_out["anchor_top1"][j]),
                         anchor_reference=pred_out["anchor_reference"][j],
                     )
+                    if "anchor_xy" in pred_out:  # control-space anchors as trajectories of this sample
+                        rec["anchor_xy"] = pred_out["anchor_xy"][j]
                 if i in plot_ids:
                     thumb = item["image"][-1].copy()
                     thumb.thumbnail((640, 360))
@@ -328,7 +332,7 @@ def main():
         )
         if "anchor_ids" in records[0]:
             metrics.update(anchor_metrics(
-                anchors_np,
+                np.stack([r["anchor_xy"] for r in records]) if "anchor_xy" in records[0] else anchors_np,
                 np.stack([r["gt_xy"] for r in records]),
                 np.stack([r["anchor_ids"] for r in records]),
                 np.stack([r["anchor_weights"] for r in records]),
@@ -358,7 +362,8 @@ def main():
             fig = plot_bev(
                 meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"),
                 reference=r.get("anchor_reference"),
-                candidate_anchors=anchors_np[r["anchor_ids"]] if "anchor_ids" in r else None,
+                candidate_anchors=(r["anchor_xy"] if "anchor_xy" in r else anchors_np)[r["anchor_ids"]]
+                if "anchor_ids" in r else None,
             )
             image = fig_to_image(fig)
             plt.close(fig)
