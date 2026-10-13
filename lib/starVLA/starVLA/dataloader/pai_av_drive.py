@@ -383,7 +383,11 @@ class PAIAVDriveDataset(Dataset):
         image_factor: int = 32,
         max_clips: Optional[int] = None,
         max_retries: int = 10,
+        prompt: str = "predict trajectory",
+        target_point_in_prompt: bool = False,
     ):
+        self.prompt = prompt
+        self.target_point_in_prompt = target_point_in_prompt
         self.data_root = data_root
         self.normalizer = normalizer
         self.sampler = sampler or DriveSampler()
@@ -423,12 +427,15 @@ class PAIAVDriveDataset(Dataset):
             "target_xy": target,
             **self.sampler.context(track, t0),
         }
-        return {
+        item = {
             "image": images,
             "state": self.normalizer.normalize("state", state),
             "action": self.normalizer.normalize("action", action),
             "meta": meta,
         }
+        if self.target_point_in_prompt:
+            item["lang"] = target_point_prompt(self.prompt, target)
+        return item
 
     def __getitem__(self, i: int) -> dict:
         if self.samples is not None:
@@ -444,6 +451,13 @@ class PAIAVDriveDataset(Dataset):
             except Exception as e:  # corrupt / too-short clip: resample another clip
                 last_error = e
         raise RuntimeError(f"failed to build a sample after {self.max_retries} attempts: {last_error}")
+
+
+def target_point_prompt(prompt: str, target_xy: np.ndarray) -> str:
+    """Instruction with the navigation target in text, so that the VLM itself knows where to go
+    (ego frame at t0, x forward, y left, 0.1 m resolution)."""
+    x, y = (float(v) for v in target_xy)
+    return f"{prompt}. target point (ego frame, x forward, y left): x {x:.1f} m, y {y:.1f} m"
 
 
 def collate_examples(batch: List[dict]) -> List[dict]:

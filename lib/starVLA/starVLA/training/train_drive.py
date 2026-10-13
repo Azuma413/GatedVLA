@@ -132,6 +132,9 @@ def main():
     image_kwargs = dict(
         current_image_pixels=int(fw.get("drive", {}).get("current_image_pixels", 921600)),
         history_image_pixels=int(fw.get("drive", {}).get("history_image_pixels", 174080)),
+        # navigation target as text in the VLM prompt (the VLM otherwise never sees where to go)
+        prompt=str(fw.get("drive", {}).get("prompt", "predict trajectory")),
+        target_point_in_prompt=bool(dcfg.get("target_point_in_prompt", False)),
     )
     train_ds = PAIAVDriveDataset(
         dcfg.data_root, normalizer, split="train", sampler=sampler_cfg, max_clips=dcfg.get("max_clips", None),
