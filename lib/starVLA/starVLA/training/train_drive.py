@@ -96,7 +96,7 @@ def main():
 
     from starVLA.dataloader.pai_av_drive import DriveSampler, Normalizer, PAIAVDriveDataset, collate_examples
     from starVLA.model.framework.base_framework import build_framework
-    from starVLA.training.drive_openloop import MANEUVERS, displacement_metrics, fig_to_image, plot_bev
+    from starVLA.training.drive_openloop import MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, plot_bev
 
     is_main = rank == 0
     distributed = world > 1
@@ -132,6 +132,9 @@ def main():
         action_mode=str(dcfg.get("action_mode", "waypoints")),
         state_target_point=bool(dcfg.get("state_target_point", True)),
     )
+    if fw.get("anchor", {}).get("enabled", False) and sampler_cfg.action_mode != "waypoints":
+        # Anchors, residuals and the reference are in waypoint space; the control-space variant is not built yet.
+        raise ValueError("framework.anchor requires datasets.vla_data.action_mode: waypoints for now")
     image_kwargs = dict(
         current_image_pixels=int(fw.get("drive", {}).get("current_image_pixels", 921600)),
         history_image_pixels=int(fw.get("drive", {}).get("history_image_pixels", 174080)),
@@ -267,6 +270,9 @@ def main():
     for m in MANEUVERS:
         plot_ids.update([i for i, s in enumerate(eval_samples) if s.get("maneuver") == m][:plots_per_class])
     eval_bs = int(dcfg.get("eval_batch_size", bs))
+    anchors_np = None
+    if fw.get("anchor", {}).get("enabled", False):
+        anchors_np = np.load(fw.anchor.path)["anchors"]
 
     def evaluate(step):
         model.eval()
@@ -284,7 +290,7 @@ def main():
                 pred_out = model(items, predict=True)
             pred = pred_out["normalized_actions"][:real]
             keep_maps = pred_out.get("keep_maps", [None] * len(items))
-            for i, item, p, kmaps in zip(ids[:real], items, pred, keep_maps):
+            for j, (i, item, p, kmaps) in enumerate(zip(ids[:real], items, pred, keep_maps)):
                 meta = item["meta"]
                 rec = {
                     "idx": i,
@@ -294,6 +300,13 @@ def main():
                 }
                 if kmaps is not None:
                     rec["keep_mean"] = [float(k.mean()) for k in kmaps]
+                if "anchor_ids" in pred_out:
+                    rec.update(
+                        anchor_ids=pred_out["anchor_ids"][j],
+                        anchor_weights=pred_out["anchor_weights"][j],
+                        anchor_top1=int(pred_out["anchor_top1"][j]),
+                        anchor_reference=pred_out["anchor_reference"][j],
+                    )
                 if i in plot_ids:
                     thumb = item["image"][-1].copy()
                     thumb.thumbnail((640, 360))
@@ -313,6 +326,16 @@ def main():
             [r["maneuver"] for r in records],
             dt=sampler_cfg.dt,
         )
+        if "anchor_ids" in records[0]:
+            metrics.update(anchor_metrics(
+                anchors_np,
+                np.stack([r["gt_xy"] for r in records]),
+                np.stack([r["anchor_ids"] for r in records]),
+                np.stack([r["anchor_weights"] for r in records]),
+                np.array([r["anchor_top1"] for r in records]),
+                np.stack([r["anchor_reference"] for r in records]),
+                [r["maneuver"] for r in records],
+            ))
         if "keep_mean" in records[0]:
             keep_means = np.array([r["keep_mean"] for r in records])
             for v in range(keep_means.shape[1]):
@@ -332,7 +355,11 @@ def main():
                 continue
             meta = r["meta"]
             title = f"{r['maneuver']} | {meta['clip_id'][:8]} t0={meta['t0'] * 1e-6:.1f}s | step {step}"
-            fig = plot_bev(meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"))
+            fig = plot_bev(
+                meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"),
+                reference=r.get("anchor_reference"),
+                candidate_anchors=anchors_np[r["anchor_ids"]] if "anchor_ids" in r else None,
+            )
             image = fig_to_image(fig)
             plt.close(fig)
             image.save(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.png")

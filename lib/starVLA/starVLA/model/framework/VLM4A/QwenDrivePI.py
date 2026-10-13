@@ -42,6 +42,16 @@ Inference uses the gated path.
 information between the observation and a keep decision b_p ~ Bernoulli(m_p). It is 0 for any mask that does not
 depend on the input (uniform, or a fixed spatial pattern), which ``log m`` biases leave free under the softmax.
 The gate output layer is randomly initialised: at an input-independent mask the gradient of I is exactly 0.
+
+Optional decision anchors (``framework.anchor``, AnchorVLA DAAR + DARF, modified)
+──────────────────────────────────────────────────────────────────────────────────
+A k-means codebook of K trajectory-pattern anchors (``prepare_paiav.py --num_anchors``). A learned query token is
+appended to the prompt; an MLP on its VLM output predicts K anchor logits, trained with AnchorVLA's soft target
+over the nearest anchors (Eq. 3-6). The reference trajectory is the softmax-weighted mean of the top-N anchors
+(``reference: soft``; differentiable, so the flow loss also reaches the logits) or the top-1 anchor
+(``reference: hard``). The DiT generates the residual ``(τ − reference) / σ_r`` by flow matching (DARF); the
+reference enters every DiT block as a per-step query bias. Stage 1 trains only the classifier path
+(prediction = reference); stage 2 adds the residual flow loss. No top-M candidates / confidence branch.
 """
 
 import math
@@ -118,6 +128,25 @@ class QwenDrivePIDefaultConfig:
             # set so that mean m = budget (see budgeted_keep); use with budget_loss_weight 0.
             "parameterization": "sigmoid",
             "contrast": 2.0,
+        }
+    )
+
+    # === Decision anchors (AnchorVLA-style, see module docstring) ===
+    anchor: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "path": None,  # anchors.npz from prepare_paiav.py --num_anchors
+            "stage": 2,  # 1: anchor classifier only; 2: + residual flow
+            "query_token": "<|quad_start|>",  # unused special token whose embedding is replaced by a learned query
+            "classifier_hidden": 1024,
+            "target_top_n": 8,  # soft target over the nearest anchors (AnchorVLA Eq. 4)
+            "target_gamma": 1.0,  # metres
+            "reference": "soft",  # soft: softmax-weighted mean of top-N anchors; hard: top-1 anchor
+            "reference_top_n": 6,
+            "reference_temperature": 1.0,
+            "cls_loss_weight": 1.0,
+            "flow_loss_weight": 1.0,
+            "flow_loss": "l1",  # AnchorVLA Eq. 11
         }
     )
 
@@ -359,12 +388,93 @@ class Qwen_Drive_PI(baseframework):
                 standardize=bool(gate_cfg.get("standardize_inputs", True)),
             )
 
+        anchor_cfg = self.config.framework.anchor
+        self.anchor_enabled = bool(anchor_cfg.get("enabled", False))
+        if self.anchor_enabled:
+            self._init_anchor(anchor_cfg, llm_hidden_size)
+
         drive_cfg = self.config.framework.drive
         self.prompt = str(drive_cfg.get("prompt", "predict trajectory"))
         self.current_image_pixels = int(drive_cfg.get("current_image_pixels", 921600))
         self.history_image_pixels = int(drive_cfg.get("history_image_pixels", 174080))
         self.image_factor = int(drive_cfg.get("image_factor", 32))
         self.action_clip = drive_cfg.get("action_clip", None)
+
+    # ------------------------------------------------------------------
+    # Decision anchors
+    # ------------------------------------------------------------------
+    def _init_anchor(self, anchor_cfg, llm_hidden_size: int) -> None:
+        data = np.load(anchor_cfg.path)
+        anchors = torch.as_tensor(data["anchors"], dtype=torch.float32)  # (K, H, 2) metres
+        if anchors.shape[1] != self.action_horizon:
+            raise ValueError(f"anchors have horizon {anchors.shape[1]}, action_horizon is {self.action_horizon}")
+        self.register_buffer("anchors", anchors, persistent=False)
+        self.register_buffer("residual_std", torch.as_tensor(data["residual_std"], dtype=torch.float32), persistent=False)
+        self.register_buffer("action_q01", torch.as_tensor(data["action_q01"], dtype=torch.float32), persistent=False)
+        self.register_buffer("action_q99", torch.as_tensor(data["action_q99"], dtype=torch.float32), persistent=False)
+        self.anchor_stage = int(anchor_cfg.stage)
+        if anchor_cfg.reference not in ("soft", "hard"):
+            raise ValueError(f"anchor.reference must be soft / hard, got {anchor_cfg.reference}")
+
+        tokenizer = self.qwen_vl_interface.processor.tokenizer
+        self.anchor_query_text = str(anchor_cfg.query_token)
+        self.anchor_query_id = int(tokenizer.convert_tokens_to_ids(self.anchor_query_text))
+        embed = self.qwen_vl_interface.model.model.language_model.embed_tokens
+        self.anchor_query = nn.Parameter(embed.weight[self.anchor_query_id].detach().clone().float())
+        embed.register_forward_hook(self._replace_query_embedding)
+
+        hidden = int(anchor_cfg.classifier_hidden)
+        self.anchor_classifier = nn.Sequential(
+            nn.LayerNorm(llm_hidden_size), nn.Linear(llm_hidden_size, hidden), nn.GELU(), nn.Linear(hidden, len(anchors))
+        )
+        # per-step embedding of the (normalised) reference trajectory -> query bias of the action tokens
+        self.anchor_embed = nn.Sequential(
+            nn.Linear(2, self.action_dit_hidden_dim), nn.SiLU(), nn.Linear(self.action_dit_hidden_dim, self.action_dit_hidden_dim)
+        )
+
+    def _replace_query_embedding(self, module, inputs, output):
+        """Forward hook on the token embedding: the query token gets the learned query vector."""
+        is_query = inputs[0] == self.anchor_query_id
+        if not is_query.any():
+            return output
+        output = output.clone()
+        output[is_query] = self.anchor_query.to(output.dtype)
+        return output
+
+    def _normalize_actions(self, xy: torch.Tensor) -> torch.Tensor:
+        return 2.0 * (xy - self.action_q01) / (self.action_q99 - self.action_q01).clamp(min=1e-6) - 1.0
+
+    def _unnormalize_actions(self, x: torch.Tensor) -> torch.Tensor:
+        return (x + 1.0) / 2.0 * (self.action_q99 - self.action_q01) + self.action_q01
+
+    def _anchor_reference(self, logits: torch.Tensor):
+        """Reference trajectory (B, H, 2) in metres, top-N anchor ids and weights."""
+        cfg = self.config.framework.anchor
+        if cfg.reference == "hard":
+            ids = logits.argmax(-1, keepdim=True)
+            weights = torch.ones_like(ids, dtype=torch.float32)
+            return self.anchors[ids[:, 0]], ids, weights
+        top_logits, ids = logits.topk(int(cfg.reference_top_n), dim=-1)
+        weights = torch.softmax(top_logits.float() / float(cfg.reference_temperature), dim=-1)
+        return (weights[..., None, None] * self.anchors[ids]).sum(1), ids, weights
+
+    def _anchor_distances(self, traj_m: torch.Tensor) -> torch.Tensor:
+        """AnchorVLA Eq. 3: mean point-wise L2 distance (B, K)."""
+        return torch.linalg.norm(traj_m[:, None] - self.anchors[None], dim=-1).mean(-1)
+
+    def _anchor_losses(self, logits: torch.Tensor, gt_m: torch.Tensor) -> dict:
+        cfg = self.config.framework.anchor
+        dist = self._anchor_distances(gt_m)
+        near_d, near_ids = (-dist).topk(int(cfg.target_top_n), dim=-1)
+        target = torch.zeros_like(dist).scatter_(1, near_ids, torch.softmax(near_d / float(cfg.target_gamma), dim=-1))
+        log_p = torch.log_softmax(logits.float(), dim=-1)
+        nearest = dist.argmin(-1)
+        top_ref = logits.topk(int(cfg.reference_top_n), dim=-1).indices
+        return {
+            "loss_anchor_cls": -(target * log_p).sum(-1).mean(),
+            "anchor_top1_acc": (logits.argmax(-1) == nearest).float().mean().detach(),
+            "anchor_topn_recall": (top_ref == nearest[:, None]).any(-1).float().mean().detach(),
+        }
 
     # ------------------------------------------------------------------
     # Inputs
@@ -380,6 +490,8 @@ class Qwen_Drive_PI(baseframework):
     def _prepare_inputs(self, examples: List[dict]):
         batch_images = [self._prepare_images(example["image"]) for example in examples]
         instructions = [example.get("lang") or self.prompt for example in examples]
+        if self.anchor_enabled:
+            instructions = [f"{text}{self.anchor_query_text}" for text in instructions]
         state = None
         if self.action_model.state_encoder is not None and "state" in examples[0]:
             state = np.stack([np.asarray(example["state"], dtype=np.float32) for example in examples])
@@ -424,6 +536,11 @@ class Qwen_Drive_PI(baseframework):
             "view_ids": self._visual_view_ids(qwen_inputs),
             "image_grid_thw": qwen_inputs.get("image_grid_thw"),
         }
+        if self.anchor_enabled:
+            is_query = qwen_inputs["input_ids"] == self.anchor_query_id
+            if not bool((is_query.sum(1) == 1).all()):
+                raise RuntimeError("expected exactly one anchor query token per sample")
+            gate_inputs["query_hidden"] = all_hidden[-1][is_query]  # (B, W)
         return vl_embs_list, attention_mask, gate_inputs
 
     # ------------------------------------------------------------------
@@ -550,43 +667,68 @@ class Qwen_Drive_PI(baseframework):
         actions = torch.as_tensor(np.array([example["action"] for example in examples]), device=device, dtype=dtype)
         actions_target = actions[:, -self.action_horizon :, :]
 
+        out, total = {}, 0.0
+        flow_target, query_bias, flow_weight, loss_type = actions_target, None, 1.0, "mse"
+        if self.anchor_enabled:
+            anchor_cfg = self.config.framework.anchor
+            logits = self.anchor_classifier(gate_inputs["query_hidden"].to(self.anchor_classifier[0].weight.dtype))
+            gt_m = self._unnormalize_actions(actions_target.float())
+            anchor_out = self._anchor_losses(logits, gt_m)
+            total = total + float(anchor_cfg.cls_loss_weight) * anchor_out["loss_anchor_cls"]
+            out.update({k: v.detach() for k, v in anchor_out.items()})
+            if self.anchor_stage == 1:
+                out["action_loss"] = total
+                return out
+            reference, _, weights = self._anchor_reference(logits)
+            out["anchor_weight_top1"] = weights[:, 0].mean().detach()
+            out["anchor_weight_entropy"] = -(weights * weights.clamp(min=1e-12).log()).sum(-1).mean().detach()
+            flow_target = ((gt_m - reference) / self.residual_std).to(dtype)
+            query_bias = self.anchor_embed(self._normalize_actions(reference).to(self.anchor_embed[0].weight.dtype))
+            flow_weight, loss_type = float(anchor_cfg.flow_loss_weight), str(anchor_cfg.flow_loss)
+
         repeat = self.config.trainer.get("repeated_diffusion_steps", None) if self.config.get("trainer") else None
         repeat = int(repeat or self.config.framework.action_model.get("repeated_diffusion_steps", 1))
 
-        actions_target = actions_target.repeat(repeat, 1, 1)
+        flow_target = flow_target.repeat(repeat, 1, 1)
+        query_bias = query_bias.repeat(repeat, 1, 1) if query_bias is not None else None
         vl_embs_list = [h.repeat(repeat, 1, 1) for h in vl_embs_list]
         state_t = None
         if state is not None:
             state_t = torch.as_tensor(state, device=device, dtype=dtype).repeat(repeat, 1, 1)
 
         if not self.gate_enabled:
-            action_loss = self.action_model(
-                vl_embs_list, actions_target, state_t, encoder_attention_mask=attention_mask.repeat(repeat, 1)
+            flow = self.action_model(
+                vl_embs_list, flow_target, state_t, encoder_attention_mask=attention_mask.repeat(repeat, 1),
+                query_bias=query_bias, loss_type=loss_type,
             )
-            return {"action_loss": action_loss}
+            if self.anchor_enabled:
+                out["loss_flow"] = flow.detach()
+            out["action_loss"] = total + flow_weight * flow
+            return out
 
         # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
         gate_cfg = self.config.framework.eye_gate
         keep, gate_logits = self._gate_keep(gate_inputs, attention_mask, return_logits=True)
-        noise = torch.randn(actions_target.shape, device=device, dtype=dtype)
-        t = self.action_model.sample_time(actions_target.shape[0], device=device, dtype=dtype)
+        noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
+        t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
 
         def flow_loss(keep_or_none):
             bias = self._cross_attention_bias(attention_mask, keep_or_none, dtype).repeat(repeat, 1)
             return self.action_model(
-                vl_embs_list, actions_target, state_t, encoder_attention_mask=bias, noise=noise, t=t
+                vl_embs_list, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t,
+                query_bias=query_bias, loss_type=loss_type,
             )
 
         loss_gated = flow_loss(keep)
-        out = {"loss_gated": loss_gated.detach()}
-        total = loss_gated
+        out["loss_gated"] = loss_gated.detach()
+        total = total + flow_weight * loss_gated
         keep_mean = self._keep_stats(keep, gate_inputs["view_ids"])  # (B, V)
         for v in range(self.num_views):
             out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
         if self.gate_mode == "learned":
             if float(gate_cfg.full_loss_weight) > 0:
                 loss_full = flow_loss(None)
-                total = total + float(gate_cfg.full_loss_weight) * loss_full
+                total = total + flow_weight * float(gate_cfg.full_loss_weight) * loss_full
                 out["loss_full"] = loss_full.detach()
             if float(gate_cfg.budget_loss_weight) > 0:
                 loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
@@ -624,7 +766,26 @@ class Qwen_Drive_PI(baseframework):
             keep = self._gate_keep(gate_inputs, attention_mask)
             encoder_mask = self._cross_attention_bias(attention_mask, keep, dtype)
             out["keep_maps"] = self._keep_maps(keep, gate_inputs)
-        pred_actions = self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=encoder_mask)
+        if self.anchor_enabled:
+            logits = self.anchor_classifier(gate_inputs["query_hidden"].to(self.anchor_classifier[0].weight.dtype))
+            reference, ids, weights = self._anchor_reference(logits)
+            out.update(
+                anchor_reference=reference.float().cpu().numpy(),
+                anchor_ids=ids.cpu().numpy(),
+                anchor_weights=weights.float().cpu().numpy(),
+                anchor_top1=logits.argmax(-1).cpu().numpy(),
+            )
+            if self.anchor_stage == 1:
+                pred_m = reference
+            else:
+                query_bias = self.anchor_embed(self._normalize_actions(reference).to(self.anchor_embed[0].weight.dtype))
+                residual = self.action_model.predict_action(
+                    vl_embs_list, state_t, encoder_attention_mask=encoder_mask, query_bias=query_bias
+                )
+                pred_m = reference + residual.float() * self.residual_std
+            pred_actions = self._normalize_actions(pred_m)
+        else:
+            pred_actions = self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=encoder_mask)
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred_actions.float().cpu().numpy()

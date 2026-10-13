@@ -152,6 +152,7 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
+        query_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         # 0. Self-Attention
@@ -163,11 +164,20 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-        attn_output = self.attn1(
-            norm_hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            attention_mask=encoder_attention_mask,  # @JinhuiYE original attention_mask=attention_mask
-        )
+        if query_bias is not None:
+            # Positional bias on the attention query only (keys / values and the residual stream are unchanged).
+            kv_states = encoder_hidden_states if encoder_hidden_states is not None else norm_hidden_states
+            attn_output = self.attn1(
+                norm_hidden_states + query_bias,
+                encoder_hidden_states=kv_states,
+                attention_mask=encoder_attention_mask,
+            )
+        else:
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,  # @JinhuiYE original attention_mask=attention_mask
+            )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)
 
@@ -279,6 +289,7 @@ class DiT(ModelMixin, ConfigMixin):
         return_all_hidden_states: bool = False,
         encoder_attention_mask=None,
         return_pre_output: bool = False,
+        query_bias: Optional[torch.Tensor] = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -303,6 +314,7 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    query_bias=query_bias,
                 )
             else:
                 if is_layerwise_encoder:
@@ -315,6 +327,7 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=block_encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
+                    query_bias=query_bias,
                 )
             all_hidden_states.append(hidden_states)
 

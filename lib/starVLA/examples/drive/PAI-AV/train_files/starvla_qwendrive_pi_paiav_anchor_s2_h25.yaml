@@ -1,0 +1,89 @@
+run_id: starvla_qwendrive_pi_paiav_anchor_s2_h25
+run_root_dir: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi
+seed: 42
+use_wandb: true
+wandb_entity: your_wandb_entity   # placeholder -> default entity of the API key
+wandb_project: starVLA_drive
+
+# Stage 2 (12 epochs): VLM + anchor classifier + residual flow expert, from the stage-1 weights.
+# Qwen-Drive-1.0-4B (Qwen3.5-4B) VLM + pi-style layer-wise flow-matching action expert.
+# Front camera only. Proprio / output follow DriveMoE DrivePi0:
+#   state  (5, 10): ego history t-4..t @10Hz, per step
+#                   [speed, acc_xyz, ang_vel_xyz, heading_rel, target_x, target_y] (ego frame)
+#   action (26, 2): ego-frame (x fwd, y left) waypoints t+0..t+2.5s @10Hz, absolute in current frame (SimLingo-length horizon)
+#   both q01/q99 min-max normalised to [-1, 1] (norm_stats.json from prepare_paiav.py).
+framework:
+  name: QwenDrivePI
+  qwenvl:
+    base_vlm: Qwen/Qwen-Drive-1.0-4B
+    attn_implementation: sdpa
+  drive:
+    prompt: predict trajectory
+    current_image_pixels: 921600   # 1280x720 budget for the current front frame
+    history_image_pixels: 174080   # 544x320 budget for the history front frame (t-0.1 s)
+  # AnchorVLA-style decision anchors (DAAR query classifier + residual flow), softmax-weighted top-6 reference
+  anchor:
+    enabled: true
+    path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_anchor/anchors.npz
+    stage: 2
+    reference: soft
+    reference_top_n: 6
+    reference_temperature: 1.0
+    target_top_n: 8
+    target_gamma: 1.0
+    cls_loss_weight: 1.0
+    flow_loss_weight: 1.0
+    flow_loss: l1
+  action_model:
+    action_dim: 2
+    action_horizon: 26             # t+0 .. t+2.5 s @10 Hz
+    state_dim: 10
+    state_horizon: 5
+    num_inference_timesteps: 10
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      interleave_self_attention: true
+
+datasets:
+  vla_data:
+    data_root: /lus/flare/projects/RobustViT/hiratsuka/datasets/PhysicalAI-Autonomous-Vehicles
+    stats_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25/norm_stats.json
+    eval_index_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25/eval_samples_val.json
+    num_eval_samples: 240          # 80 left / 80 right / 80 straight (val split)
+    target_distance: 25.0          # target point = first future ego position >= 25 m away
+    per_device_batch_size: 4
+    eval_batch_size: 4
+    num_workers: 8
+    prefetch_factor: 4
+    worker_start_method: spawn
+
+trainer:
+  repeated_diffusion_steps: 4
+  max_train_steps: 30000
+  num_warmup_steps: 200
+  logging_frequency: 10
+  eval_interval: 1000
+  eval_at_start: true
+  num_eval_plots_per_class: 4
+  save_interval: 5000
+  keep_last_checkpoints: 2
+  save_dtype: bfloat16
+  learning_rate:          # DriveMoE: 5e-5 for both VLM and action expert
+    base: 5.0e-05
+    qwen_vl_interface: 5.0e-05
+    action_model: 5.0e-05
+    anchor_query: 1.0e-04       # new modules (as the eye gate)
+    anchor_classifier: 1.0e-04
+    anchor_embed: 1.0e-04
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-08
+  freeze_modules: ''
+  pretrained_checkpoint: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/qdpi_paiav_anchor_s1_h25/checkpoints/step_0019200   # stage-1 final weights
+  bf16: true
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
