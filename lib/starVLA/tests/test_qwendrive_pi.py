@@ -313,3 +313,11 @@ def test_eye_gate_budgeted(tiny_qwen_drive_dir):
     assert abs(out["keep_view0"].item() - 0.2) < 1e-3 and abs(out["keep_view1"].item() - 0.2) < 1e-3
     out["action_loss"].backward()
     assert model.eye_gate.fc1.weight.grad.abs().sum() > 0
+
+
+def test_target_point_prompt():
+    from starVLA.dataloader.pai_av_drive import target_point_prompt
+
+    assert target_point_prompt("predict trajectory", np.array([24.71, -3.94])) == (
+        "predict trajectory. target point (ego frame, x forward, y left): x 24.7 m, y -3.9 m"
+    )
