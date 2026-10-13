@@ -283,6 +283,24 @@ def test_budgeted_keep():
     assert (s.grad != 0).all()
 
 
+def test_budgeted_keep_gradient_matches_finite_differences():
+    """The bisection is not differentiated; the implicit-function term must make the gradient exact."""
+    from starVLA.model.framework.VLM4A.QwenDrivePI import budgeted_keep
+
+    torch.manual_seed(0)
+    s = torch.randn(50, dtype=torch.float64, requires_grad=True)
+    c = torch.randn(50, dtype=torch.float64)
+    loss = lambda x: (budgeted_keep(x, 0.2, 2.0, iters=200) * c).sum()  # noqa: E731
+    loss(s).backward()
+    eps, num = 1e-6, torch.zeros(50, dtype=torch.float64)
+    with torch.no_grad():
+        for i in range(50):
+            d = torch.zeros(50, dtype=torch.float64)
+            d[i] = eps
+            num[i] = (loss(s + d) - loss(s - d)) / (2 * eps)
+    assert torch.allclose(s.grad, num, rtol=1e-4, atol=1e-7), (s.grad - num).abs().max()
+
+
 def test_eye_gate_budgeted(tiny_qwen_drive_dir):
     from starVLA.model.framework.base_framework import build_framework
 

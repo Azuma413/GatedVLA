@@ -237,19 +237,27 @@ def budgeted_keep(scores: torch.Tensor, budget: float, contrast: float, iters: i
     """Soft keep values of one frame with the budget and the contrast fixed by construction.
 
     ``m_p = σ(b + α·z_p)`` with ``z`` the scores standardised over the frame's tokens, ``α = contrast`` and ``b``
-    (no gradient) found by bisection so that ``mean_p m_p = budget``. The gate only decides which tokens are kept
-    relatively more: a uniform mask is impossible (z is standardised) and the spread of m is set by α, so the mask
-    cannot binarise and no budget loss is needed.
+    found by bisection so that ``mean_p m_p = budget``. The gate only decides which tokens are kept relatively more:
+    a uniform mask is impossible (z is standardised) and the spread of m is set by α, so the mask cannot binarise
+    and no budget loss is needed.
+
+    Bisection itself is not differentiated. ``b(z)`` is defined implicitly by ``Σ_p σ(b + α z_p) = N·budget``, so
+    ``∂b/∂z_q = −α w_q`` with ``w = σ' / Σσ'``; adding ``−α Σ_q w_q (z_q − sg[z_q])`` (value 0) to the bisection
+    result gives exactly this gradient.
     """
     z = (scores - scores.mean()) / (scores.std() + 1e-6)
     with torch.no_grad():
-        lo = torch.full((), -30.0, device=z.device)
-        hi = torch.full((), 30.0, device=z.device)
+        lo = torch.full((), -30.0, device=z.device, dtype=z.dtype)
+        hi = torch.full((), 30.0, device=z.device, dtype=z.dtype)
         for _ in range(iters):
             mid = (lo + hi) / 2
             above = torch.sigmoid(mid + contrast * z).mean() > budget
             lo, hi = torch.where(above, lo, mid), torch.where(above, mid, hi)
-        bias = (lo + hi) / 2
+        bias0 = (lo + hi) / 2
+        slope = torch.sigmoid(bias0 + contrast * z)
+        slope = slope * (1 - slope)
+        w = slope / slope.sum().clamp(min=1e-12)
+    bias = bias0 - contrast * (w * (z - z.detach())).sum()
     return torch.sigmoid(bias + contrast * z)
 
 
@@ -584,6 +592,9 @@ class Qwen_Drive_PI(baseframework):
                 loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
                 total = total + float(gate_cfg.budget_loss_weight) * loss_budget
                 out["loss_budget"] = loss_budget.detach()
+            # Scale of the gate scores: the budgeted mask is invariant to it, so it is not trained and only drifts;
+            # it sets the effective learning rate of the gate (larger scores -> smaller change of z per update).
+            out["gate_score_std"] = gate_logits.detach().std()
             if float(gate_cfg.get("logit_l2_weight", 0.0)) > 0:
                 # β·mean ℓ²: a finite optimum for the MI term (which grows as m -> 0/1) and a gradient on ℓ that
                 # does not pass through the sigmoid, so saturated tokens are pulled back.
