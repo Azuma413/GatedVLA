@@ -252,7 +252,7 @@ def main():
         id_file = out_dir / "wandb_run_id.txt"  # resumed jobs keep logging into the same W&B run
         run_id = id_file.read_text().strip() if id_file.exists() else uuid.uuid4().hex[:8]
         id_file.write_text(run_id)
-        wandb.init(
+        init_kwargs = dict(
             project=cfg.get("wandb_project", "starVLA_drive"),
             entity=None if entity in (None, "", "your_wandb_entity") else entity,
             name=cfg.run_id,
@@ -261,6 +261,13 @@ def main():
             config=OmegaConf.to_container(cfg, resolve=True),
             resume="allow",
         )
+        try:
+            wandb.init(**init_kwargs)
+        except Exception as e:  # compute nodes can lose the route to api.wandb.ai; never let that stop training
+            log(f"W&B init failed ({type(e).__name__}: {e}); logging offline to {out_dir}/wandb "
+                f"(upload later from a login node: wandb sync {out_dir}/wandb/offline-run-*)")
+            wandb.teardown()  # the failed online attempt keeps the run id registered in the wandb service
+            wandb.init(mode="offline", **init_kwargs)
         wandb.define_metric("train/*", step_metric="step")
         wandb.define_metric("eval/*", step_metric="step")
         wandb.define_metric("eval_bev/*", step_metric="step")
