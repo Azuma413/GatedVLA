@@ -47,6 +47,7 @@ lib/carla/simulator/
 
 # AlpaSim
 lib/alpasim/alpasim
+lib/alpasim/qwendrive_pi_venv
 
 # symlinks into the private repo
 outputs

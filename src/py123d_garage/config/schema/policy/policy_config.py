@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from omegaconf import MISSING
 
+from py123d_garage.config.schema.policy.qwendrive_pi_config import QwenDrivePIConfig
 from py123d_garage.config.schema.policy.transfuser_config import TransfuserConfig
 from py123d_garage.config.schema.policy.vavam_config import VavamConfig
 
@@ -22,6 +23,9 @@ class PolicyConfig:
 
     # VaVAM's block, read when target names the VavamPolicy.
     vavam_config: VavamConfig | None = None
+
+    # QwenDrivePI's block, read when target names the QwenDrivePIPolicy.
+    qwendrive_pi_config: QwenDrivePIConfig | None = None
 
     # -- Atomic settings --
 

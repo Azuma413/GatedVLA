@@ -71,6 +71,11 @@ class AbstractPolicyConfig(abc.ABC):
         return self.trajectory_horizon_us // self.trajectory_interval_us
 
     @property
+    def replan_interval_us(self) -> PositiveInt:
+        """How often a closed-loop driver queries the policy; in between it serves the cached plan."""
+        return self.trajectory_interval_us
+
+    @property
     def trajectory_interval_s(self) -> PositiveFloat:
         """Time between consecutive poses of the predicted trajectory in seconds."""
         return self.trajectory_interval_us * 1e-6

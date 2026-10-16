@@ -324,6 +324,13 @@ class AbstractPolicy(
             )
         return trajectories
 
+    def warmup(self) -> None:
+        """
+        Runs once on the inference device before a closed-loop benchmark serves the policy,
+        so one-time costs (kernel compilation, graph capture) do not land on the first query.
+        No-op by default.
+        """
+
     def get_training_callbacks(self) -> list[L.Callback]:
         """Returns the lightning callbacks used during training; empty by default."""
         return []

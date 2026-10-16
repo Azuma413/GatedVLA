@@ -78,7 +78,10 @@ class _Session:
         self.camera_metadatas: dict[CameraID, BaseCameraMetadata] = {}
         self.ego_pose_local: npt.NDArray[np.float64] | None = None
         self.speed_mps: float = 0.0
-        self.acceleration_mps2: float = 0.0
+        # Rig-frame dynamic state of the newest egomotion observation.
+        self.velocity_mps = Vector3D(x=0.0, y=0.0, z=0.0)
+        self.acceleration_mps2 = Vector3D(x=0.0, y=0.0, z=0.0)
+        self.angular_velocity_radps = Vector3D(x=0.0, y=0.0, z=0.0)
         self.route_polyline_rig_xy: npt.NDArray[np.float64] | None = None
         self.cached_plan: _CachedPlan | None = None
         self.num_plans: int = 0
@@ -296,7 +299,9 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
             if len(request.dynamic_states) == len(request.trajectory.poses):
                 dynamic_state = request.dynamic_states[-1]
                 session.speed_mps = math.hypot(dynamic_state.linear_velocity.x, dynamic_state.linear_velocity.y)
-                session.acceleration_mps2 = float(dynamic_state.linear_acceleration.x)
+                session.velocity_mps = _vector3d(dynamic_state.linear_velocity)
+                session.acceleration_mps2 = _vector3d(dynamic_state.linear_acceleration)
+                session.angular_velocity_radps = _vector3d(dynamic_state.angular_velocity)
         return common_pb2.Empty()
 
     @override
@@ -334,11 +339,13 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
         session = self._get_session(request.session_uuid, context)
         time_now_us = int(request.time_now_us)
         interval_us = policy.policy_config.trajectory_interval_us
+        # Every tick records the ego state, so policies replanning less often still read a full history.
+        self._record_ego_state(session)
         with self._lock:
             ego_pose_local = session.ego_pose_local
             plan = session.cached_plan
             fallback_speed_mps = max(_MIN_FALLBACK_SPEED_MPS, session.speed_mps)
-        if plan is None or time_now_us - plan.created_time_us >= interval_us:
+        if plan is None or time_now_us - plan.created_time_us >= policy.policy_config.replan_interval_us:
             fresh = self._replan(policy, session, request.session_uuid, ego_pose_local, time_now_us, interval_us)
             if fresh is not None:
                 plan = fresh
@@ -400,16 +407,16 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
         if self._py123d_garage_video_writer is not None:
             self._py123d_garage_video_writer.close()
 
-    def _plan(self, policy: AnyPolicy, session: _Session, session_uuid: str) -> npt.NDArray[np.float64]:
+    def _record_ego_state(self, session: _Session) -> None:
+        """Stamps the newest egomotion onto the newest observation bundle; a no-op before both arrived."""
         with self._lock:
             ego_pose_local = session.ego_pose_local
-            speed_mps = session.speed_mps
+            velocity_mps = session.velocity_mps
             acceleration_mps2 = session.acceleration_mps2
-            route = session.route_polyline_rig_xy
-        assert ego_pose_local is not None, "drive verifies the ego pose before planning"
-
+            angular_velocity_radps = session.angular_velocity_radps
         anchor_us = session.scene_api.newest_timestamp_us
-        assert anchor_us is not None, "drive verifies the anchor cameras before planning"
+        if ego_pose_local is None or anchor_us is None:
+            return
         session.scene_api.append(
             anchor_us,
             {
@@ -418,13 +425,19 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
                     metadata=self._ego_metadata,
                     timestamp=Timestamp.from_us(anchor_us),
                     dynamic_state_se3=DynamicStateSE3(
-                        velocity=Vector3D(x=speed_mps, y=0.0, z=0.0),
-                        acceleration=Vector3D(x=acceleration_mps2, y=0.0, z=0.0),
-                        angular_velocity=Vector3D(x=0.0, y=0.0, z=0.0),
+                        velocity=velocity_mps,
+                        acceleration=acceleration_mps2,
+                        angular_velocity=angular_velocity_radps,
                     ),
                 ),
             },
         )
+
+    def _plan(self, policy: AnyPolicy, session: _Session, session_uuid: str) -> npt.NDArray[np.float64]:
+        with self._lock:
+            ego_pose_local = session.ego_pose_local
+            route = session.route_polyline_rig_xy
+        assert ego_pose_local is not None, "drive verifies the ego pose before planning"
 
         target_point_distances_m = policy.policy_config.required_target_point_distances_m
         if route is not None and len(route) > 0:
@@ -562,6 +575,10 @@ def _decode_image(image_bytes: bytes) -> npt.NDArray[np.uint8]:
     if bgr is None:
         raise ValueError(f"the runtime pushed {len(image_bytes)} bytes that decode to no image.")
     return np.ascontiguousarray(bgr[:, :, ::-1], dtype=np.uint8)
+
+
+def _vector3d(vec3: Any) -> Vector3D:
+    return Vector3D(x=float(vec3.x), y=float(vec3.y), z=float(vec3.z))
 
 
 def _yaw_from_quaternion(quaternion: Any) -> float:

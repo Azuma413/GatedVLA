@@ -35,8 +35,13 @@ except ImportError as import_error:
 logger = initialize_overwatch(__name__)
 
 
-def load_qwen_drive_vlm(model_id: str, attn_implementation: str = "sdpa", dtype=torch.bfloat16):
-    """Load the Qwen3.5 VLM contained in a Qwen-Drive checkpoint (local dir or HF hub id)."""
+def load_qwen_drive_vlm(model_id: str, attn_implementation: str = "sdpa", dtype=torch.bfloat16, load_weights: bool = True):
+    """Load the Qwen3.5 VLM contained in a Qwen-Drive checkpoint (local dir or HF hub id).
+
+    ``load_weights=False`` only builds the architecture from ``config.json`` (randomly initialised), for
+    inference from a full starVLA checkpoint that overwrites every VLM weight anyway; ``model_id`` then only
+    needs the config and processor files, not the 9 GB ``model.safetensors``.
+    """
     config_dict, _ = PretrainedConfig.get_config_dict(model_id)
     if "vlm_config" in config_dict:
         vlm_config = Qwen3_5Config(**config_dict["vlm_config"])
@@ -44,6 +49,10 @@ def load_qwen_drive_vlm(model_id: str, attn_implementation: str = "sdpa", dtype=
     else:
         vlm_config = Qwen3_5Config(**config_dict)
         key_mapping = None
+    if not load_weights:
+        return Qwen3_5ForConditionalGeneration._from_config(
+            vlm_config, attn_implementation=attn_implementation, dtype=dtype
+        )
     return Qwen3_5ForConditionalGeneration.from_pretrained(
         model_id,
         config=vlm_config,
@@ -84,7 +93,11 @@ class _QwenDrive_VL_Interface(_QWen3_5_VL_Interface):
             logger.warning("flash_attn not installed, falling back to sdpa")
             attn_implementation = "sdpa"
 
-        self.model = load_qwen_drive_vlm(model_id, attn_implementation=attn_implementation)
+        self.model = load_qwen_drive_vlm(
+            model_id,
+            attn_implementation=attn_implementation,
+            load_weights=bool(qwenvl_config.get("load_pretrained_weights", True)),
+        )
         self.processor = load_qwen_drive_processor(model_id)
         self.processor.tokenizer.padding_side = "left"
         self.config = config

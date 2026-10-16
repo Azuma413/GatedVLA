@@ -17,4 +17,6 @@ def build_policy(config: AlpasimBenchmarkConfig, device: torch.device) -> AnyPol
     policy.verify_contract(benchmark_config=config)
     policy.initialize(config.policy_config.evaluation_checkpoint_file)
     LOG.info(f"Driving {config.policy_config.target} with {config.policy_config.evaluation_checkpoint_file}")
-    return policy.to(device).eval()
+    policy = policy.to(device).eval()
+    policy.warmup()
+    return policy

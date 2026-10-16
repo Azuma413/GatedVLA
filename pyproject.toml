@@ -56,6 +56,13 @@ optional-dependencies.carla = [
   "transforms3d>=0.4",
   "xmlschema>=2",
 ]
+# The starVLA QwenDrivePI policy (lib/starVLA, installed separately); the versions the AlpaSim driver was tested with.
+optional-dependencies.qwendrive-pi = [
+  "diffusers==0.41.0",
+  "flash-linear-attention==0.5.2",
+  "safetensors>=0.4",
+  "transformers==5.19.0",
+]
 optional-dependencies.train = [
   "huggingface-hub>=0.34,<2",
   "lightning>=2.4,<3",

@@ -14,8 +14,16 @@ _out_dir="$(realpath -m "${OUTPUT_DIR:-outputs/alpasim_submission/smoke_test_ima
 mkdir -p "${_out_dir}/driver"
 export ALPASIM_DRIVER_PORT="${ALPASIM_DRIVER_PORT:-6789}"
 
+# The challenge sandbox, as in AlpaSim's sample submissions (e2e_challenge/*/run_local_container.sh):
+# read-only root, 2 GiB /tmp and 64 MiB /run (both noexec), no capabilities; SANDBOX=0 drops it.
+_sandbox=()
+if [[ "${SANDBOX:-1}" == 1 ]]; then
+	_sandbox=(--init --cap-drop ALL --security-opt no-new-privileges:true --read-only --pids-limit 1024
+		--memory 32g --cpus 8 --tmpfs /tmp:rw,nosuid,nodev,size=2g,mode=1777 --tmpfs /run:rw,nosuid,nodev,size=64m,mode=0755)
+fi
+
 # Run the image as the driver in the background
-docker run --rm --gpus all --name "${_container}" -p "${ALPASIM_DRIVER_PORT}:6789" \
+docker run --rm --gpus "${GPUS:-all}" --name "${_container}" -p "${ALPASIM_DRIVER_PORT}:6789" "${_sandbox[@]}" \
 	-v "${_out_dir}/driver:/tmp/alpasim_driver" "${_image}" >"${_out_dir}/driver.log" 2>&1 &
 
 # Stop the driver when the wizard is done.
