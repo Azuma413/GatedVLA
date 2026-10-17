@@ -118,7 +118,7 @@ class _QWen3_5_VL_Interface(nn.Module):
             )
         return generation_output
 
-    def build_qwenvl_inputs(self, images, instructions, solutions=None, **kwargs):
+    def build_qwenvl_inputs(self, images, instructions, solutions=None, text_first=False, **kwargs):
         """
         Build model inputs from raw data (images + instructions + optional solutions).
         Follow Oficial Qwen3.5-VL Instruct format: https://huggingface.co/Qwen/Qwen3.5-VL-4B-Instruct
@@ -136,7 +136,10 @@ class _QWen3_5_VL_Interface(nn.Module):
             else:
                 prompt = instruction
 
-            content.append({"type": "text", "text": prompt})
+            if text_first:  # user content [text, images] instead of [images, text]
+                content.insert(0, {"type": "text", "text": prompt})
+            else:
+                content.append({"type": "text", "text": prompt})
             msg = [{"role": "user", "content": content}]
 
             if solutions is not None:

@@ -295,8 +295,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         t: torch.Tensor = None,
         query_bias: torch.Tensor = None,
         loss_type: str = "mse",
+        return_velocity: bool = False,
     ):
         """
+        return_velocity: also return the predicted velocity (B, action_horizon, D_action) -> (loss, pred)
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
         actions: shape (B, action_horizon, D_action)
         encoder_attention_mask: optional (B, seq_length) bool/int, or float additive bias
@@ -356,9 +358,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         if loss_type == "l1":
-            return (pred_actions - velocity).abs().mean()
-        loss = ((pred_actions - velocity) ** 2).mean()
-        return loss
+            loss = (pred_actions - velocity).abs().mean()
+        else:
+            loss = ((pred_actions - velocity) ** 2).mean()
+        return (loss, pred_actions) if return_velocity else loss
 
     @staticmethod
     def _pad_query_bias(query_bias, sa_embs):

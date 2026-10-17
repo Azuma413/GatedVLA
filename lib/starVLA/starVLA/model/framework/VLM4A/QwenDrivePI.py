@@ -103,6 +103,12 @@ class QwenDrivePIDefaultConfig:
             # Optional clamp of sampled (normalised) actions to [-action_clip, action_clip]. Off: q01/q99 are
             # pooled over all waypoints, so a clamp at 1 cuts lateral offsets beyond ~3 m and forward beyond ~69 m.
             "action_clip": None,
+            # VLM input order [text, images] instead of [images, text]: every visual token is computed with the
+            # instruction (speed / target point) in context, and the text tokens do not see the images.
+            "text_first": False,
+            # Cross-attention of the action expert reads the visual tokens only (text / template tokens masked), so
+            # the expert gets the scene and the instruction only through the (gated) visual tokens.
+            "dit_visual_only": False,
         }
     )
 
@@ -129,6 +135,13 @@ class QwenDrivePIDefaultConfig:
             # set so that mean m = budget (see budgeted_keep); use with budget_loss_weight 0.
             "parameterization": "sigmoid",
             "contrast": 2.0,
+            # Loss of the gated path. "flow": flow matching against the ground truth. "distill": ‖v_gated − sg(v_full)‖²
+            # with the same noise and t, so the part both paths solve from the ego state cancels.
+            "gated_loss": "flow",
+            # What the gated-path loss updates. "all": VLM, DiT and gate. "gate_dit": DiT and gate (VLM features and
+            # the gate input detached). "gate": the gate only (DiT gradients of this loss are dropped by the trainer,
+            # see ``gate_loss`` in the output).
+            "gated_grad": "all",
         }
     )
 
@@ -400,6 +413,13 @@ class Qwen_Drive_PI(baseframework):
         self.history_image_pixels = int(drive_cfg.get("history_image_pixels", 174080))
         self.image_factor = int(drive_cfg.get("image_factor", 32))
         self.action_clip = drive_cfg.get("action_clip", None)
+        self.text_first = bool(drive_cfg.get("text_first", False))
+        self.dit_visual_only = bool(drive_cfg.get("dit_visual_only", False))
+        if self.gate_enabled:
+            if str(gate_cfg.get("gated_loss", "flow")) not in ("flow", "distill"):
+                raise ValueError(f"eye_gate.gated_loss must be flow / distill, got {gate_cfg.gated_loss}")
+            if str(gate_cfg.get("gated_grad", "all")) not in ("all", "gate_dit", "gate"):
+                raise ValueError(f"eye_gate.gated_grad must be all / gate_dit / gate, got {gate_cfg.gated_grad}")
 
     # ------------------------------------------------------------------
     # Decision anchors
@@ -543,7 +563,9 @@ class Qwen_Drive_PI(baseframework):
         The returned list has one entry per DiT block; entries for self-attention blocks are placeholders
         (the DiT ignores them) that alias the preceding cross-attention entry.
         """
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images, instructions=instructions, text_first=self.text_first
+        )
         attention_mask = qwen_inputs.get("attention_mask", None)
         # Call the inner Qwen3.5 model (no LM head): only hidden states are needed.
         qwenvl_outputs = self.qwen_vl_interface.model.model(
@@ -567,11 +589,22 @@ class Qwen_Drive_PI(baseframework):
             attention_mask = attention_mask.to(dtype=torch.bool)
         else:
             attention_mask = torch.ones(qwen_inputs["input_ids"].shape, dtype=torch.bool, device=all_hidden[-1].device)
+        view_ids = self._visual_view_ids(qwen_inputs)
+        visual = view_ids >= 0
+        text_mask = (~visual) & attention_mask
+        if self.text_first:
+            # q: the prompt only. Template tokens after the images have seen the images.
+            pos = torch.arange(visual.shape[1], device=visual.device)[None]
+            first_visual = torch.where(visual, pos, visual.shape[1]).min(1, keepdim=True).values
+            text_mask = text_mask & (pos < first_visual)
         gate_inputs = {
             "final_hidden": all_hidden[-1],
-            "view_ids": self._visual_view_ids(qwen_inputs),
+            "view_ids": view_ids,
             "image_grid_thw": qwen_inputs.get("image_grid_thw"),
+            "text_mask": text_mask,
         }
+        if self.dit_visual_only:
+            attention_mask = attention_mask & visual  # the expert's cross-attention sees the visual tokens only
         if self.anchor_enabled:
             is_query = qwen_inputs["input_ids"] == self.anchor_query_id
             if not bool((is_query.sum(1) == 1).all()):
@@ -610,7 +643,7 @@ class Qwen_Drive_PI(baseframework):
             return (keep, None) if return_logits else keep
 
         hidden = gate_inputs["final_hidden"]
-        text = (~visual) & attention_mask
+        text = gate_inputs["text_mask"] if "text_mask" in gate_inputs else (~visual) & attention_mask
         gate_cfg = self.config.framework.eye_gate
         tau = float(gate_cfg.get("temperature", 1.0))
         budgeted = str(gate_cfg.get("parameterization", "sigmoid")) == "budgeted"
@@ -745,28 +778,50 @@ class Qwen_Drive_PI(baseframework):
 
         # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
         gate_cfg = self.config.framework.eye_gate
-        keep, gate_logits = self._gate_keep(gate_inputs, attention_mask, return_logits=True)
+        distill = self.gate_mode == "learned" and str(gate_cfg.get("gated_loss", "flow")) == "distill"
+        gated_grad = str(gate_cfg.get("gated_grad", "all")) if self.gate_mode == "learned" else "all"
+        # Separated gradients: the gated path sees the VLM features and the gate input detached.
+        gated_embs, gate_in = vl_embs_list, gate_inputs
+        if gated_grad != "all":
+            gated_embs = [h.detach() for h in vl_embs_list]
+            gate_in = dict(gate_inputs, final_hidden=gate_inputs["final_hidden"].detach())
+        keep, gate_logits = self._gate_keep(gate_in, attention_mask, return_logits=True)
         noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
         t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
 
-        def flow_loss(keep_or_none):
+        def flow_loss(keep_or_none, embs):
             bias = self._cross_attention_bias(attention_mask, keep_or_none, dtype).repeat(repeat, 1)
             return self.action_model(
-                vl_embs_list, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t,
-                query_bias=query_bias, loss_type=loss_type,
+                embs, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t,
+                query_bias=query_bias, loss_type=loss_type, return_velocity=True,
             )
 
-        loss_gated = flow_loss(keep)
+        full_w = float(gate_cfg.full_loss_weight) if self.gate_mode == "learned" else 0.0
+        if full_w > 0 or distill:
+            loss_full, v_full = flow_loss(None, vl_embs_list)
+            out["loss_full"] = loss_full.detach()
+            if full_w > 0:
+                total = total + flow_weight * full_w * loss_full
+        loss_gated, v_gated = flow_loss(keep, gated_embs)
         out["loss_gated"] = loss_gated.detach()
-        total = total + flow_weight * loss_gated
+        if distill:
+            loss_gate = ((v_gated.float() - v_full.detach().float()) ** 2).mean()
+            out["loss_distill"] = loss_gate.detach()
+        else:
+            loss_gate = loss_gated
+        if gated_grad == "gate":
+            out["gate_loss"] = flow_weight * loss_gate  # backpropagated separately; the trainer drops its DiT grads
+        else:
+            total = total + flow_weight * loss_gate
         keep_mean = self._keep_stats(keep, gate_inputs["view_ids"])  # (B, V)
         for v in range(self.num_views):
             out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
+        cur = gate_inputs["view_ids"] == self.num_views - 1
+        if keep.shape[0] > 1 and bool((cur.sum(1) == cur.sum(1)[0]).all()):
+            # input dependence of the current-frame mask: std over the batch per token, mean over tokens
+            m_cur = torch.stack([keep[b][cur[b]] for b in range(keep.shape[0])])
+            out["keep_xsample_std"] = m_cur.std(0).mean().detach()
         if self.gate_mode == "learned":
-            if float(gate_cfg.full_loss_weight) > 0:
-                loss_full = flow_loss(None)
-                total = total + flow_weight * float(gate_cfg.full_loss_weight) * loss_full
-                out["loss_full"] = loss_full.detach()
             if float(gate_cfg.budget_loss_weight) > 0:
                 loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
                 total = total + float(gate_cfg.budget_loss_weight) * loss_budget

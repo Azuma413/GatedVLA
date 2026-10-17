@@ -76,13 +76,13 @@ def tiny_qwen_drive_dir(tmp_path_factory):
     return out, model
 
 
-def _make_cfg(base_vlm: str, eye_gate: dict = None, anchor: dict = None):
+def _make_cfg(base_vlm: str, eye_gate: dict = None, anchor: dict = None, drive: dict = None):
     return OmegaConf.create(
         {
             "framework": {
                 "name": "QwenDrivePI",
                 "qwenvl": {"base_vlm": base_vlm, "attn_implementation": "sdpa"},
-                "drive": {"current_image_pixels": 128 * 64, "history_image_pixels": 64 * 32},
+                "drive": {"current_image_pixels": 128 * 64, "history_image_pixels": 64 * 32, **(drive or {})},
                 "eye_gate": eye_gate or {"enabled": False},
                 "anchor": anchor or {"enabled": False},
             },
@@ -235,6 +235,48 @@ def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
     torch.manual_seed(123)
     c = closed.predict_action([sample])["normalized_actions"]
     assert not np.allclose(a, c, atol=1e-3)
+
+
+def test_text_first_visual_only_gate_distill(tiny_qwen_drive_dir):
+    """[text, images] order, DiT cross-attention on visual tokens only, gate trained only by the distillation loss."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "gated_loss": "distill", "gated_grad": "gate"}
+    model = build_framework(_make_cfg(str(path), gate, drive={"text_first": True, "dit_visual_only": True})).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng), _sample(rng)]
+
+    images, instructions, _ = model._prepare_inputs(batch)
+    _, attn, gi = model._encode_vl_hidden_states(images, instructions)
+    visual = gi["view_ids"] >= 0
+    assert torch.equal(attn, attn & visual) and attn.any()  # the expert sees visual tokens only
+    pos = torch.arange(visual.shape[1])[None].expand_as(visual)
+    first_visual = pos[visual.cumsum(1) == 1].view(-1)
+    assert gi["text_mask"].any(1).all()
+    assert bool((pos[gi["text_mask"]].view(-1) < first_visual.repeat_interleave(gi["text_mask"].sum(1))).all())
+    bias = model._cross_attention_bias(attn, model._gate_keep(gi, attn), torch.float32)
+    assert torch.isinf(bias[~visual]).all() and torch.isfinite(bias[visual]).all()
+
+    out = model(batch)
+    for key in ("gate_loss", "loss_distill", "loss_gated", "loss_full", "keep_xsample_std"):
+        assert key in out, key
+    assert out["loss_distill"] > 0
+    gate_params = list(model.eye_gate.parameters())
+    vlm_params = [p for p in model.qwen_vl_interface.parameters() if p.requires_grad]
+    out["gate_loss"].backward()  # gate path: reaches the gate, never the VLM / projectors
+    assert all(p.grad is not None for p in gate_params)
+    assert all(p.grad is None for p in vlm_params)
+    assert all(p.grad is None for p in model.project_layers.parameters())
+    gate_grads = [p.grad.clone() for p in gate_params]
+    out["action_loss"].backward()  # full path: VLM + DiT, nothing on the gate
+    assert any(p.grad is not None for p in vlm_params)
+    assert all(torch.equal(p.grad, g) for p, g in zip(gate_params, gate_grads))
+
+    model.eval()
+    pred = model.predict_action([_sample(rng)])
+    assert np.all(np.isfinite(pred["normalized_actions"]))
 
 
 def test_gate_input_standardization():

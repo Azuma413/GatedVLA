@@ -242,6 +242,7 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda_for(g["lr"]) for g in param_groups])
     params = [p for g in param_groups for p in g["params"]]
+    dit_params = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith("action_model.")]
 
     # ── W&B ───────────────────────────────────────────────────────────
     wandb = None
@@ -478,6 +479,15 @@ def main():
             with autocast():
                 out = model(batch)
             loss = out["action_loss"]
+            if "gate_loss" in out:
+                # eye_gate.gated_grad=gate: the gated-path loss trains the gate only. Its graph is disjoint from
+                # action_loss's (detached VLM features), so backpropagate it first and drop what it left on the DiT.
+                if accum != 1:
+                    raise ValueError("eye_gate.gated_grad=gate needs gradient_accumulation_steps 1")
+                saved = [p.grad.clone() if p.grad is not None else None for p in dit_params]
+                out["gate_loss"].backward()
+                for p, g in zip(dit_params, saved):
+                    p.grad = g
             (loss / accum).backward()
             loss_sum += loss.detach().float().item()
             for key, value in out.items():  # extra scalars (e.g. gate losses / keep ratios)
