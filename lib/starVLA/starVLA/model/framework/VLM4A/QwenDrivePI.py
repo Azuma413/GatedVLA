@@ -142,6 +142,10 @@ class QwenDrivePIDefaultConfig:
             # the gate input detached). "gate": the gate only (DiT gradients of this loss are dropped by the trainer,
             # see ``gate_loss`` in the output).
             "gated_grad": "all",
+            # Centre the gate's visual input per token position (h_p − μ_p, EMA over the data): a mask that depends
+            # only on the position (e.g. row stripes) is then impossible. Needs a fixed token grid.
+            "position_center": False,
+            "position_slots": 2048,  # buffer size for μ_p (>= visual tokens per sample)
         }
     )
 
@@ -253,8 +257,17 @@ class ViewGate(nn.Module):
     (``ChannelStandardizer``, separate statistics for visual and text tokens); q is the mean of the standardised
     text tokens."""
 
-    def __init__(self, width: int, hidden_dim: int, init_keep: float, standardize: bool = True):
+    def __init__(self, width: int, hidden_dim: int, init_keep: float, standardize: bool = True,
+                 position_slots: int = 0, momentum: float = 0.01):
         super().__init__()
+        # Per-position centring (position_slots > 0): h_p − μ_p with μ_p an EMA of the hidden at visual-token position
+        # p over the data. The token grid is fixed, so this removes everything shared by all samples at a position
+        # (row / sequence-position components); the gate only sees how the content deviates from the average.
+        self.position_slots, self.momentum = int(position_slots), momentum
+        if self.position_slots > 0:
+            self.register_buffer("pos_mean", torch.zeros(self.position_slots, width))
+            self.register_buffer("pos_count", torch.zeros((), dtype=torch.long))  # visual tokens per sample (0: unset)
+            self.register_buffer("pos_initialized", torch.zeros((), dtype=torch.bool))
         self.std_h = ChannelStandardizer(width) if standardize else None
         self.std_t = ChannelStandardizer(width) if standardize else None
         self.norm_h = nn.RMSNorm(width)
@@ -264,8 +277,29 @@ class ViewGate(nn.Module):
         # fc2.weight keeps its default random init so that the initial mask depends on the input.
         nn.init.constant_(self.fc2.bias, math.log(init_keep / (1 - init_keep)))
 
+    def center_positions(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (B, N, W) visual-token hidden of B samples in sequence order -> h − μ (same shape, float32)."""
+        h = h.float()
+        n = h.shape[1]
+        if n > self.position_slots:
+            raise ValueError(f"{n} visual tokens per sample > eye_gate.position_slots {self.position_slots}")
+        with torch.no_grad():
+            if int(self.pos_count) == 0:
+                self.pos_count.fill_(n)
+            elif int(self.pos_count) != n:
+                raise ValueError(f"per-position centring needs a fixed token grid: {n} != {int(self.pos_count)} tokens")
+            if self.training:
+                batch_mean = h.mean(0)
+                if bool(self.pos_initialized):
+                    self.pos_mean[:n].lerp_(batch_mean, self.momentum)
+                else:
+                    self.pos_mean[:n].copy_(batch_mean)
+                    self.pos_initialized.fill_(True)
+            mean = self.pos_mean[:n] if bool(self.pos_initialized) else h.mean(0)
+        return h - mean[None]
+
     def forward(self, h: torch.Tensor, text: torch.Tensor) -> torch.Tensor:
-        """h: (N, W) visual-token hidden of one frame, text: (T, W) text-token hidden -> logits (N,)."""
+        """h: (N, W) visual-token hidden of one sample, text: (T, W) text-token hidden -> logits (N,)."""
         dtype = self.fc1.weight.dtype
         if self.std_h is not None:
             h, q = self.std_h(h), self.std_t(text).mean(0)
@@ -400,6 +434,7 @@ class Qwen_Drive_PI(baseframework):
             self.eye_gate = ViewGate(
                 llm_hidden_size, int(gate_cfg.hidden_dim), float(gate_cfg.init_keep),
                 standardize=bool(gate_cfg.get("standardize_inputs", True)),
+                position_slots=int(gate_cfg.get("position_slots", 2048)) if bool(gate_cfg.get("position_center", False)) else 0,
             )
 
         anchor_cfg = self.config.framework.anchor
@@ -648,9 +683,14 @@ class Qwen_Drive_PI(baseframework):
         tau = float(gate_cfg.get("temperature", 1.0))
         budgeted = str(gate_cfg.get("parameterization", "sigmoid")) == "budgeted"
         rows, logits = [], []
+        vis_hidden = [hidden[b][visual[b]] for b in range(hidden.shape[0])]
+        if self.eye_gate.position_slots > 0:
+            if len({v.shape[0] for v in vis_hidden}) != 1:
+                raise ValueError("per-position centring needs the same number of visual tokens in every sample")
+            vis_hidden = list(self.eye_gate.center_positions(torch.stack(vis_hidden)))
         for b in range(hidden.shape[0]):
             row = keep[b].clone()
-            logit = self.eye_gate(hidden[b][visual[b]], hidden[b][text[b]])
+            logit = self.eye_gate(vis_hidden[b], hidden[b][text[b]])
             if budgeted:
                 frames = view_ids[b][visual[b]]
                 m = torch.empty_like(logit)

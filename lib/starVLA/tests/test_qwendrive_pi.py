@@ -279,6 +279,31 @@ def test_text_first_visual_only_gate_distill(tiny_qwen_drive_dir):
     assert np.all(np.isfinite(pred["normalized_actions"]))
 
 
+def test_gate_position_centering(tiny_qwen_drive_dir):
+    """h_p − μ_p removes what every sample shares at a position; the model runs with it."""
+    from starVLA.model.framework.base_framework import build_framework
+    from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate
+
+    gate = ViewGate(8, 16, 0.2, position_slots=32).train()
+    torch.manual_seed(0)
+    pattern = torch.randn(1, 10, 8) * 50  # position-only component (e.g. rows / sequence position)
+    content = torch.randn(4, 10, 8)
+    out = gate.center_positions(pattern + content)  # first update: μ = batch mean
+    assert torch.allclose(out, content - content.mean(0, keepdim=True), atol=1e-4)
+    with pytest.raises(ValueError):
+        gate.center_positions(torch.randn(4, 11, 8))  # the token grid must stay fixed
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+           "gated_loss": "distill", "gated_grad": "gate", "position_center": True, "position_slots": 256}
+    model = build_framework(_make_cfg(str(path), cfg, drive={"text_first": True, "dit_visual_only": True})).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng), _sample(rng)])
+    assert bool(model.eye_gate.pos_initialized) and int(model.eye_gate.pos_count) > 0
+    out["gate_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.parameters())
+
+
 def test_gate_input_standardization():
     """A shared near-constant massive channel makes the plain gate input-independent; standardising fixes it."""
     from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate
