@@ -276,9 +276,27 @@ def main():
 
     # ── open-loop evaluation ──────────────────────────────────────────
     plots_per_class = int(tcfg.get("num_eval_plots_per_class", 4))
+    # Plotted samples: per class, distinct clips spread over the eval list, preferring frames brighter than the
+    # median (mask overlays are unreadable on night frames). Brightness of every eval frame is measured once, sharded.
+    bright = {i: float(np.asarray(eval_ds[i]["image"][-1].convert("L").resize((64, 36))).mean())
+              for i in range(len(eval_ds))[rank::world]}
+    if distributed:
+        parts = [None] * world
+        dist.all_gather_object(parts, bright)
+        bright = {k: v for part in parts for k, v in part.items()}
+    median = float(np.median(list(bright.values())))
     plot_ids = set()
     for m in MANEUVERS:
-        plot_ids.update([i for i, s in enumerate(eval_samples) if s.get("maneuver") == m][:plots_per_class])
+        seen, cands = set(), []
+        for i, s in enumerate(eval_samples[: len(eval_ds)]):
+            if s.get("maneuver") == m and s["clip_id"] not in seen:
+                seen.add(s["clip_id"])
+                cands.append(i)
+        pool = [i for i in cands if bright[i] >= median]
+        pool = pool if len(pool) >= plots_per_class else cands
+        if pool:
+            picks = np.linspace(0, len(pool) - 1, min(plots_per_class, len(pool))).round().astype(int)
+            plot_ids.update(pool[k] for k in picks)
     eval_bs = int(dcfg.get("eval_batch_size", bs))
     anchors_np = None
     if fw.get("anchor", {}).get("enabled", False):

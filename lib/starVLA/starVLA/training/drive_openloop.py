@@ -122,7 +122,7 @@ def plot_bev(
     reference: Optional[np.ndarray] = None,
     candidate_anchors: Optional[np.ndarray] = None,
 ):
-    """Front image (left), optionally the image weighted by the visual gate's keep map (middle), and the
+    """Front image (left), optionally the visual gate's keep map over the frame (middle), and the
     bird's-eye view (right) with past / GT / predicted ego trajectories.
 
     BEV axes: up = ego forward (+x), right = ego right (-y)."""
@@ -135,15 +135,16 @@ def plot_bev(
         axes[0].set_axis_off()
         axes[0].set_title("front camera (t0)", fontsize=9)
     if image is not None and keep_map is not None:
-        # each merged token's patch scaled by its min-max normalised keep value (bright = attended most)
-        lo, hi = float(np.min(keep_map)), float(np.max(keep_map))
-        norm = (keep_map - lo) / (hi - lo) if hi > lo else np.ones_like(keep_map)
-        mask = Image.fromarray((norm * 255).astype(np.uint8)).resize(image.size, Image.NEAREST)
-        gated = np.asarray(image, dtype=np.float32) * (np.asarray(mask, dtype=np.float32)[..., None] / 255.0)
-        axes[1].imshow(gated.astype(np.uint8))
+        # keep values on an absolute 0..1 colour scale over a dimmed grey copy of the frame (readable at night too)
+        grey = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        grey = np.clip(grey / max(float(np.percentile(grey, 99)), 1e-3), 0.0, 1.0)  # stretch dark frames
+        axes[1].imshow(grey, cmap="gray", vmin=0.0, vmax=1.0)
+        heat = axes[1].imshow(np.asarray(keep_map, dtype=np.float32), cmap="viridis", vmin=0.0, vmax=1.0, alpha=0.6,
+                              interpolation="nearest", extent=(-0.5, image.width - 0.5, image.height - 0.5, -0.5))
+        fig.colorbar(heat, ax=axes[1], fraction=0.03, pad=0.01)
         axes[1].set_axis_off()
-        axes[1].set_title(f"mask on current frame, min-max normalised (m: min {lo:.2f} / mean "
-                          f"{float(np.mean(keep_map)):.2f} / max {hi:.2f})", fontsize=9)
+        axes[1].set_title(f"keep m on current frame, absolute scale (min {float(np.min(keep_map)):.2f} / mean "
+                          f"{float(np.mean(keep_map)):.2f} / max {float(np.max(keep_map)):.2f})", fontsize=9)
     ax = axes[-1]
 
     def _plot(xy, **kw):
