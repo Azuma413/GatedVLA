@@ -73,19 +73,24 @@ class Runner:
         state_t = torch.as_tensor(state, device=self.device, dtype=dtype) if state is not None else None
         return vl, attn, gi, state_t
 
-    def predict(self, vl, state_t, biases, meta):
-        """vl from one sample (1, L, D); biases (V, L) -> positions (V, K, H+, 2)."""
-        V, K = biases.shape[0], self.noises.shape[0]
-        rep = lambda x: x.expand(V * K, *x.shape[1:]).contiguous()  # noqa: E731
-        copies = {}  # the per-block list aliases one tensor for each (cross, self) pair: copy each tensor once
-        vl_rep = [copies.setdefault(id(h), rep(h)) for h in vl]
-        out = self.model.action_model.predict_action(
-            vl_rep, rep(state_t) if state_t is not None else None,
-            encoder_attention_mask=biases.repeat_interleave(K, 0),
-            noise=self.noises.repeat(V, 1, 1),
-        ).float().cpu().numpy()
+    def predict(self, vl, state_t, biases, meta, chunk=8):
+        """vl from one sample (1, L, D); biases (V, L) -> positions (V, K, H+, 2). Runs `chunk` bias rows at a time."""
+        K = self.noises.shape[0]
+        outs = []
+        for b in biases.split(chunk):
+            V = b.shape[0]
+            rep = lambda x: x.expand(V * K, *x.shape[1:]).contiguous()  # noqa: E731
+            copies = {}  # the per-block list aliases one tensor for each (cross, self) pair: copy each tensor once
+            vl_rep = [copies.setdefault(id(h), rep(h)) for h in vl]
+            outs.append(self.model.action_model.predict_action(
+                vl_rep, rep(state_t) if state_t is not None else None,
+                encoder_attention_mask=b.repeat_interleave(K, 0),
+                noise=self.noises.repeat(V, 1, 1),
+            ).float().cpu().numpy())
+            del vl_rep, copies
+        out = np.concatenate(outs)
         xy = np.stack([self.ds.action_to_xy(o, meta) for o in out])
-        return xy.reshape(V, K, *xy.shape[1:])
+        return xy.reshape(biases.shape[0], K, *xy.shape[1:])
 
     def predict_batch(self, examples, metas, extra_bias=None):
         """Full model (VLM included) on several examples; one bias row per example (or the plain mask)."""
