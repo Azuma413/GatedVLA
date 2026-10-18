@@ -69,6 +69,7 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config, populate_layerwise_dit_cfg
 from starVLA.model.modules.action_space.unicycle import unicycle_rollout
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import LayerwiseFlowmatchingActionHead, get_action_model
+from starVLA.model.modules.action_model.attention_probe import CrossAttentionProbe
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -929,7 +930,18 @@ class Qwen_Drive_PI(baseframework):
         visual = gate_inputs["view_ids"] >= 0
         visual_mask = attention_mask & visual
         gate_in = dict(gate_inputs, final_hidden=gate_inputs["final_hidden"].detach())
-        keep = self._gate_keep(gate_in, attention_mask)
+        keep, gate_logits = self._gate_keep(gate_in, attention_mask, return_logits=True)
+        out["gate_score_std"] = gate_logits.detach().std()
+        cur = gate_inputs["view_ids"] == self.num_views - 1
+        if keep.shape[0] > 1 and bool((cur.sum(1) == cur.sum(1)[0]).all()):
+            m_cur = torch.stack([keep[b][cur[b]] for b in range(keep.shape[0])]).detach().float()
+            out["keep_xsample_std"] = m_cur.std(0).mean()
+            ranks = m_cur.argsort(1).argsort(1).float()
+            ranks = ranks - ranks.mean(1, keepdim=True)
+            ranks = ranks / ranks.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            corr = ranks @ ranks.T
+            n = corr.shape[0]
+            out["keep_pairwise_rankcorr"] = (corr.sum() - corr.diagonal().sum()) / (n * (n - 1))
         noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
         t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
 
@@ -967,10 +979,15 @@ class Qwen_Drive_PI(baseframework):
 
         out = {}
         encoder_mask = attention_mask
+        probe = None
         if self.gate_enabled:
-            keep = self._gate_keep(gate_inputs, attention_mask)
+            keep, logits = self._gate_keep(gate_inputs, attention_mask, return_logits=True)
             encoder_mask = self._cross_attention_bias(attention_mask, keep, dtype)
             out["keep_maps"] = self._keep_maps(keep, gate_inputs)
+            if logits is not None:
+                out["score_maps"] = self._keep_maps(self._frame_standardized(logits, gate_inputs), gate_inputs)
+            probe = CrossAttentionProbe(self.action_model.model, self.cross_layer_ids)
+            probe.__enter__()
         if self.anchor_enabled:
             logits = self.anchor_classifier(gate_inputs["query_hidden"].to(self.anchor_classifier[0].weight.dtype))
             reference, ids, weights = self._anchor_reference(logits)
@@ -998,10 +1015,42 @@ class Qwen_Drive_PI(baseframework):
             pred_actions = self._normalize_actions(pred_m)
         else:
             pred_actions = self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=encoder_mask)
+        if probe is not None:
+            probe.__exit__()
+            self._add_attention_outputs(out, probe.mean(), gate_inputs, attention_mask, "")
+            gate_cfg = self.config.framework.eye_gate
+            if self.gate_mode == "learned" and str(gate_cfg.get("scheme", "standard")) == "textdrop":
+                # the gate's training path ③: gated, text tokens hidden from the DiT
+                visual_mask = attention_mask & (gate_inputs["view_ids"] >= 0)
+                with CrossAttentionProbe(self.action_model.model, self.cross_layer_ids) as probe_td:
+                    drop = self.action_model.predict_action(
+                        vl_embs_list, state_t, encoder_attention_mask=self._cross_attention_bias(visual_mask, keep, dtype)
+                    )
+                self._add_attention_outputs(out, probe_td.mean(), gate_inputs, attention_mask, "_textdrop")
+                out["normalized_actions_textdrop"] = drop.float().cpu().numpy()
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred_actions.float().cpu().numpy()
         return out
+
+    def _frame_standardized(self, logits: torch.Tensor, gate_inputs: dict) -> torch.Tensor:
+        """Gate scores (concatenated visual tokens of the batch) -> (B, L) with each frame's scores standardised
+        (the z of budgeted_keep), 0 on non-visual tokens."""
+        view_ids = gate_inputs["view_ids"]
+        visual = view_ids >= 0
+        z = torch.zeros(view_ids.shape, dtype=torch.float32, device=view_ids.device)
+        z[visual] = logits.float()
+        for b in range(z.shape[0]):
+            for v in view_ids[b][visual[b]].unique():
+                sel = view_ids[b] == v
+                z[b, sel] = (z[b, sel] - z[b, sel].mean()) / (z[b, sel].std() + 1e-6)
+        return z
+
+    def _add_attention_outputs(self, out: dict, attn: torch.Tensor, gate_inputs: dict, attention_mask, suffix: str):
+        """Per-frame maps of the DiT cross-attention mass and its share on the text tokens."""
+        visual = gate_inputs["view_ids"] >= 0
+        out[f"attn_maps{suffix}"] = self._keep_maps(attn, gate_inputs)
+        out[f"attn_text_mass{suffix}"] = (attn * ((~visual) & attention_mask)).sum(1).float().cpu().numpy()
 
     def _keep_maps(self, keep: torch.Tensor, gate_inputs: dict) -> List[List[np.ndarray]]:
         """Per sample, per frame keep map of shape (h, w) in merged-token units (for visualisation)."""

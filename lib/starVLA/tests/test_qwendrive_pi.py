@@ -330,8 +330,18 @@ def test_textdrop_scheme_target_query(tiny_qwen_drive_dir):
     assert any(p.grad is not None for p in vlm_params)
     assert all((g is None and p.grad is None) or torch.equal(p.grad, g) for p, g in zip(gate_params, gate_grads))
 
-    # the mask depends on the target point
+    # eval outputs: gate scores, DiT attention of the inference path and of the text-dropped path
     model.eval()
+    pred = model.predict_action([_sample(rng) | {"meta": {"target_xy": np.array([20.0, 0.0], np.float32)}}])
+    for key in ("score_maps", "attn_maps", "attn_maps_textdrop", "attn_text_mass", "attn_text_mass_textdrop",
+                "normalized_actions_textdrop"):
+        assert key in pred, key
+    assert pred["attn_text_mass_textdrop"][0] < 1e-6 < pred["attn_text_mass"][0] < 1.0
+    vis_attn = sum(float(m.sum()) for m in pred["attn_maps"][0])
+    assert abs(vis_attn + pred["attn_text_mass"][0] - 1.0) < 1e-3  # attention sums to 1 over the tokens
+    assert abs(sum(float(m.sum()) for m in pred["attn_maps_textdrop"][0]) - 1.0) < 1e-3
+
+    # the mask depends on the target point
     sample = _sample(rng)
     maps = []
     for xy in ([20.0, 10.0], [20.0, -10.0]):

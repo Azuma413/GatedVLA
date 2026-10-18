@@ -96,7 +96,9 @@ def main():
 
     from starVLA.dataloader.pai_av_drive import DriveSampler, Normalizer, PAIAVDriveDataset, collate_examples
     from starVLA.model.framework.base_framework import build_framework
-    from starVLA.training.drive_openloop import MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, plot_bev
+    from starVLA.training.drive_openloop import (
+        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, plot_bev,
+    )
 
     is_main = rank == 0
     distributed = world > 1
@@ -328,6 +330,15 @@ def main():
                 }
                 if kmaps is not None:
                     rec["keep_mean"] = [float(k.mean()) for k in kmaps]
+                    rec["keep_cur"] = kmaps[-1].astype(np.float32)  # current frame, for the collapse metrics
+                for key in ("score_maps", "attn_maps", "attn_maps_textdrop"):
+                    if key in pred_out:
+                        rec[key[:-5] + "_cur"] = pred_out[key][j][-1].astype(np.float32)
+                for key in ("attn_text_mass", "attn_text_mass_textdrop"):
+                    if key in pred_out:
+                        rec[key] = float(pred_out[key][j])
+                if "normalized_actions_textdrop" in pred_out:
+                    rec["pred_xy_textdrop"] = eval_ds.action_to_xy(pred_out["normalized_actions_textdrop"][j], meta)
                 if "anchor_ids" in pred_out:
                     rec.update(
                         anchor_ids=pred_out["anchor_ids"][j],
@@ -370,6 +381,13 @@ def main():
             keep_means = np.array([r["keep_mean"] for r in records])
             for v in range(keep_means.shape[1]):
                 metrics[f"keep_view{v}"] = float(keep_means[:, v].mean())
+            metrics.update(gate_diagnostics(records))
+        if "pred_xy_textdrop" in records[0]:
+            td = displacement_metrics(
+                np.stack([r["pred_xy_textdrop"] for r in records]), np.stack([r["gt_xy"] for r in records]),
+                [r["maneuver"] for r in records], dt=sampler_cfg.dt,
+            )
+            metrics.update({f"textdrop/{k}": v for k, v in td.items() if "/" not in k})
         metrics["eval_time_s"] = time.time() - t_start
         log("eval step {}: ADE {:.3f} FDE {:.3f} (left {:.3f} / right {:.3f} / straight {:.3f})".format(
             step, metrics["ADE"], metrics["FDE"], metrics.get("left/ADE", float("nan")),
@@ -385,8 +403,16 @@ def main():
                 continue
             meta = r["meta"]
             title = f"{r['maneuver']} | {meta['clip_id'][:8]} t0={meta['t0'] * 1e-6:.1f}s | step {step}"
+            extra_maps = [(name, r[key]) for name, key in (("gate score z", "score_cur"),
+                                                           ("DiT attention (gated, all tokens)", "attn_cur"),
+                                                           ("DiT attention (gated, text hidden)", "attn_textdrop_cur"))
+                          if key in r]
+            if extra_maps:
+                np.savez(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.npz", **{k: r[k] for k in (
+                    "keep_cur", "score_cur", "attn_cur", "attn_textdrop_cur", "attn_text_mass", "attn_text_mass_textdrop")
+                    if k in r})
             fig = plot_bev(
-                meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"),
+                meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"), extra_maps=extra_maps,
                 reference=r.get("anchor_reference"),
                 candidate_anchors=(r["anchor_xy"] if "anchor_xy" in r else anchors_np)[r["anchor_ids"]]
                 if "anchor_ids" in r else None,
