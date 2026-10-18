@@ -350,6 +350,29 @@ def test_textdrop_scheme_target_query(tiny_qwen_drive_dir):
     assert not np.allclose(maps[0], maps[1])
 
 
+def test_gate_signal_measure(tiny_qwen_drive_dir):
+    """examples/drive/PAI-AV/gate_signal.py: losses of learned / random / uniform / oracle masks on one sample."""
+    import sys
+    from pathlib import Path
+
+    from starVLA.model.framework.base_framework import build_framework
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "drive" / "PAI-AV"))
+    from gate_signal import measure
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "query": "target", "scheme": "textdrop"}
+    model = build_framework(_make_cfg(str(path), gate)).float().eval().requires_grad_(False)
+    ex = _sample(np.random.default_rng(0)) | {"meta": {"target_xy": np.array([20.0, 3.0], np.float32)}}
+    res, learned, oracle, gl = measure(model, ex, draws=2, permutations=2, oracle_steps=5, oracle_lr=0.3)
+    for k in ("learned", "random", "uniform", "oracle", "adv_learned", "adv_oracle"):
+        assert np.isfinite(res[k]), k
+    assert learned.shape == oracle.shape
+    for v in gl.frames.unique():  # same mask family: mean keep = budget per frame
+        assert abs(float(oracle[gl.frames == v].mean()) - gl.budget) < 1e-3
+
+
 def test_gate_input_standardization():
     """A shared near-constant massive channel makes the plain gate input-independent; standardising fixes it."""
     from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate
