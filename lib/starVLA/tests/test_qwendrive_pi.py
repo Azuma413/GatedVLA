@@ -304,6 +304,42 @@ def test_gate_position_centering(tiny_qwen_drive_dir):
     assert all(p.grad is not None for p in model.eye_gate.parameters())
 
 
+def test_textdrop_scheme_target_query(tiny_qwen_drive_dir):
+    """textdrop: gate (target-point query) trained only by the text-dropped distillation; VLM + DiT by the gated
+    all-token flow loss, with the gate fixed there."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "query": "target", "scheme": "textdrop"}
+    model = build_framework(_make_cfg(str(path), gate)).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng), _sample(rng)]
+    for b, xy in zip(batch, ([20.0, 5.0], [24.0, -3.0])):
+        b["meta"] = {"target_xy": np.array(xy, np.float32)}
+    out = model(batch)
+    for key in ("gate_loss", "loss_distill", "loss_teacher", "loss_gated"):
+        assert key in out, key
+    gate_params = list(model.eye_gate.parameters())
+    vlm_params = [p for p in model.qwen_vl_interface.parameters() if p.requires_grad]
+    out["gate_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.target_embed.parameters())
+    assert all(p.grad is None for p in vlm_params)
+    gate_grads = [None if p.grad is None else p.grad.clone() for p in gate_params]
+    out["action_loss"].backward()
+    assert any(p.grad is not None for p in vlm_params)
+    assert all((g is None and p.grad is None) or torch.equal(p.grad, g) for p, g in zip(gate_params, gate_grads))
+
+    # the mask depends on the target point
+    model.eval()
+    sample = _sample(rng)
+    maps = []
+    for xy in ([20.0, 10.0], [20.0, -10.0]):
+        sample["meta"] = {"target_xy": np.array(xy, np.float32)}
+        maps.append(model.predict_action([sample])["keep_maps"][0][1])
+    assert not np.allclose(maps[0], maps[1])
+
+
 def test_gate_input_standardization():
     """A shared near-constant massive channel makes the plain gate input-independent; standardising fixes it."""
     from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate

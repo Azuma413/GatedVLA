@@ -145,6 +145,16 @@ class QwenDrivePIDefaultConfig:
             # Centre the gate's visual input per token position (h_p − μ_p, EMA over the data): a mask that depends
             # only on the position (e.g. row stripes) is then impossible. Needs a fixed token grid.
             "position_center": False,
+            # Gate query q: "text" (mean of the text-token hidden) or "target" (MLP embedding of the navigation target
+            # point (x, y) / target_scale, read from the sample's meta["target_xy"]).
+            "query": "text",
+            "target_scale": 25.0,
+            # "standard": losses above. "textdrop": per step (all from one VLM forward)
+            #   ② ungated, all tokens (text visible)                -> teacher v_ref (no gradient)
+            #   ③ gated (m), text tokens hidden from the DiT        -> ‖v③ − v_ref‖², updates the gate only
+            #   ④ gated (m fixed), all tokens                       -> flow matching, updates VLM + DiT
+            # Inference uses ④ (gated, all tokens).
+            "scheme": "standard",
             "position_slots": 2048,  # buffer size for μ_p (>= visual tokens per sample)
         }
     )
@@ -258,8 +268,13 @@ class ViewGate(nn.Module):
     text tokens."""
 
     def __init__(self, width: int, hidden_dim: int, init_keep: float, standardize: bool = True,
-                 position_slots: int = 0, momentum: float = 0.01):
+                 position_slots: int = 0, momentum: float = 0.01, target_query: bool = False):
         super().__init__()
+        # target_query: q is an embedding of the (scaled) navigation target point (x, y) instead of the mean of the
+        # text-token hidden states.
+        self.target_embed = (
+            nn.Sequential(nn.Linear(2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, width)) if target_query else None
+        )
         # Per-position centring (position_slots > 0): h_p − μ_p with μ_p an EMA of the hidden at visual-token position
         # p over the data. The token grid is fixed, so this removes everything shared by all samples at a position
         # (row / sequence-position components); the gate only sees how the content deviates from the average.
@@ -298,10 +313,14 @@ class ViewGate(nn.Module):
             mean = self.pos_mean[:n] if bool(self.pos_initialized) else h.mean(0)
         return h - mean[None]
 
-    def forward(self, h: torch.Tensor, text: torch.Tensor) -> torch.Tensor:
-        """h: (N, W) visual-token hidden of one sample, text: (T, W) text-token hidden -> logits (N,)."""
+    def forward(self, h: torch.Tensor, text: torch.Tensor, target: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """h: (N, W) visual-token hidden of one sample, text: (T, W) text-token hidden, target: (2,) scaled target
+        point (with target_query) -> logits (N,)."""
         dtype = self.fc1.weight.dtype
-        if self.std_h is not None:
+        if self.target_embed is not None:
+            h = self.std_h(h) if self.std_h is not None else h
+            q = self.target_embed(target.to(self.target_embed[0].weight.dtype)).float()
+        elif self.std_h is not None:
             h, q = self.std_h(h), self.std_t(text).mean(0)
         else:
             q = text.float().mean(0)
@@ -435,6 +454,7 @@ class Qwen_Drive_PI(baseframework):
                 llm_hidden_size, int(gate_cfg.hidden_dim), float(gate_cfg.init_keep),
                 standardize=bool(gate_cfg.get("standardize_inputs", True)),
                 position_slots=int(gate_cfg.get("position_slots", 2048)) if bool(gate_cfg.get("position_center", False)) else 0,
+                target_query=str(gate_cfg.get("query", "text")) == "target",
             )
 
         anchor_cfg = self.config.framework.anchor
@@ -524,6 +544,18 @@ class Qwen_Drive_PI(baseframework):
         if a.dim() == 4:
             v0 = v0[:, None].expand(-1, a.shape[1])
         return unicycle_rollout(a, v0, self.anchor_dt)
+
+    def _gate_target(self, examples: List[dict], device) -> Optional[torch.Tensor]:
+        """(B, 2) navigation target point / target_scale for the gate query (eye_gate.query = target)."""
+        gate_cfg = self.config.framework.eye_gate
+        if not (self.gate_enabled and str(gate_cfg.get("query", "text")) == "target"):
+            return None
+        if "target_xy" in examples[0]:
+            xy = [ex["target_xy"] for ex in examples]
+        else:
+            xy = [ex["meta"]["target_xy"] for ex in examples]
+        xy = torch.as_tensor(np.asarray(xy, dtype=np.float32), device=device)
+        return xy / float(gate_cfg.get("target_scale", 25.0))
 
     @staticmethod
     def _current_speed(examples: List[dict], device) -> Optional[torch.Tensor]:
@@ -690,7 +722,8 @@ class Qwen_Drive_PI(baseframework):
             vis_hidden = list(self.eye_gate.center_positions(torch.stack(vis_hidden)))
         for b in range(hidden.shape[0]):
             row = keep[b].clone()
-            logit = self.eye_gate(vis_hidden[b], hidden[b][text[b]])
+            target = gate_inputs["target"][b] if "target" in gate_inputs else None
+            logit = self.eye_gate(vis_hidden[b], hidden[b][text[b]], target)
             if budgeted:
                 frames = view_ids[b][visual[b]]
                 m = torch.empty_like(logit)
@@ -772,6 +805,9 @@ class Qwen_Drive_PI(baseframework):
         vl_embs_list, attention_mask, gate_inputs = self._encode_vl_hidden_states(batch_images, instructions)
 
         device, dtype = vl_embs_list[-1].device, self._head_dtype()
+        gate_target = self._gate_target(examples, device)
+        if gate_target is not None:
+            gate_inputs["target"] = gate_target
         vl_embs_list = [h.to(dtype) for h in vl_embs_list]
         actions = torch.as_tensor(np.array([example["action"] for example in examples]), device=device, dtype=dtype)
         actions_target = actions[:, -self.action_horizon :, :]
@@ -818,6 +854,9 @@ class Qwen_Drive_PI(baseframework):
 
         # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
         gate_cfg = self.config.framework.eye_gate
+        if self.gate_mode == "learned" and str(gate_cfg.get("scheme", "standard")) == "textdrop":
+            return self._textdrop_losses(out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, state_t,
+                                         query_bias, flow_weight, loss_type, repeat, device, dtype)
         distill = self.gate_mode == "learned" and str(gate_cfg.get("gated_loss", "flow")) == "distill"
         gated_grad = str(gate_cfg.get("gated_grad", "all")) if self.gate_mode == "learned" else "all"
         # Separated gradients: the gated path sees the VLM features and the gate input detached.
@@ -884,11 +923,45 @@ class Qwen_Drive_PI(baseframework):
         out["action_loss"] = total
         return out
 
+    def _textdrop_losses(self, out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, state_t,
+                         query_bias, flow_weight, loss_type, repeat, device, dtype) -> dict:
+        """eye_gate.scheme = textdrop (see QwenDrivePIDefaultConfig.eye_gate)."""
+        visual = gate_inputs["view_ids"] >= 0
+        visual_mask = attention_mask & visual
+        gate_in = dict(gate_inputs, final_hidden=gate_inputs["final_hidden"].detach())
+        keep = self._gate_keep(gate_in, attention_mask)
+        noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
+        t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
+
+        def run(keep_or_none, embs, mask):
+            bias = self._cross_attention_bias(mask, keep_or_none, dtype).repeat(repeat, 1)
+            return self.action_model(
+                embs, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t,
+                query_bias=query_bias, loss_type=loss_type, return_velocity=True,
+            )
+
+        detached = [h.detach() for h in vl_embs_list]
+        with torch.no_grad():
+            loss_ref, v_ref = run(None, detached, attention_mask)  # ② teacher: ungated, all tokens
+        _, v_drop = run(keep, detached, visual_mask)  # ③ gated, no text tokens
+        loss_distill = ((v_drop.float() - v_ref.float()) ** 2).mean()
+        out["gate_loss"] = flow_weight * loss_distill  # gate only (the trainer drops its DiT gradients)
+        loss_gated, _ = run(keep.detach(), vl_embs_list, attention_mask)  # ④ gated, all tokens: VLM + DiT
+        out.update(loss_distill=loss_distill.detach(), loss_teacher=loss_ref.detach(), loss_gated=loss_gated.detach())
+        keep_mean = self._keep_stats(keep, gate_inputs["view_ids"])
+        for v in range(self.num_views):
+            out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
+        out["action_loss"] = total + flow_weight * loss_gated
+        return out
+
     def _predict(self, examples: List[dict]) -> dict:
         batch_images, instructions, state = self._prepare_inputs(examples)
         vl_embs_list, attention_mask, gate_inputs = self._encode_vl_hidden_states(batch_images, instructions)
 
         device, dtype = vl_embs_list[-1].device, self._head_dtype()
+        gate_target = self._gate_target(examples, device)
+        if gate_target is not None:
+            gate_inputs["target"] = gate_target
         vl_embs_list = [h.to(dtype) for h in vl_embs_list]
         state_t = torch.as_tensor(state, device=device, dtype=dtype) if state is not None else None
 
