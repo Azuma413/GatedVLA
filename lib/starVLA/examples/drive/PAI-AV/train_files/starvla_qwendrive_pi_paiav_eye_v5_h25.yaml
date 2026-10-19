@@ -1,0 +1,101 @@
+run_id: starvla_qwendrive_pi_paiav_eye_v5_h25
+run_root_dir: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi
+seed: 42
+use_wandb: true
+wandb_entity: your_wandb_entity   # placeholder -> default entity of the API key
+wandb_project: starVLA_drive
+
+# Qwen-Drive-1.0-4B (Qwen3.5-4B) VLM + pi-style layer-wise flow-matching action expert.
+# Front camera only. v2 layout (inputs limited to what AlpaSim provides):
+#   prompt : "predict trajectory. speed: <v> m/s. target point: x <x> m, y <y> m" (navigation in the VLM)
+#   state  (5, 5): ego history t-4..t @10Hz, per step [x, y, heading_rel, speed, acc_lon] in the t0 ego frame
+#                  (no target point: it reaches the policy only through the VLM)
+#   action (25, 2): [acceleration, curvature] per 0.1 s step over 2.5 s (Alpamayo 1.5 unicycle model),
+#                  mean/std normalised; waypoints for eval are integrated from the current speed.
+# norm_stats / eval index: prepare_paiav.py --state_mode traj --action_mode unicycle --no_state_target_point
+#                          --action_horizon 25
+framework:
+  name: QwenDrivePI
+  qwenvl:
+    base_vlm: Qwen/Qwen-Drive-1.0-4B
+    attn_implementation: sdpa
+  drive:
+    prompt: predict trajectory
+    current_image_pixels: 921600   # 1280x720 budget for the current front frame
+    history_image_pixels: 174080   # 544x320 budget for the history front frame (t-0.1 s)
+  # EyePolicy visual evidence gate, budgeted soft mask (mean m = budget and contrast fixed by construction),
+  # per-channel standardised gate inputs. Start from a trained v2 baseline: PRETRAINED=<ckpt> (MODE=eye).
+  eye_gate:
+    enabled: true
+    mode: learned
+    hidden_dim: 256
+    init_keep: 0.99
+    budget: 0.2
+    budget_loss_weight: 0.0
+    full_loss_weight: 1.0
+    parameterization: budgeted
+    contrast: 2.0
+    standardize_inputs: true
+    # v5: the mask acts inside the VLM from the image embeddings (softmax-attention logits + log m, DeltaNet write
+    # strength / decay / conv input x m) and on the DiT cross-attention. Gate input: pre-LLM image embeddings +
+    # [target x/25, y/25, speed/20]. Per step: L_full (ungated) + L_gated (soft mask; trains the gate) +
+    # L_removed (tokens with m < 0.1 removed, others unmasked; the inference path). tau ramps 0 -> 0.1 over 2000 steps.
+    query: target_speed
+    scheme: vlm_keep
+    removal_threshold: 0.1
+    removal_warmup_steps: 2000
+  action_model:
+    action_dim: 2
+    action_horizon: 25             # controls for t0 -> t0 + 2.5 s @10 Hz
+    state_dim: 5
+    state_horizon: 5
+    num_inference_timesteps: 10
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      interleave_self_attention: true
+
+datasets:
+  vla_data:
+    data_root: /lus/flare/projects/RobustViT/hiratsuka/datasets/PhysicalAI-Autonomous-Vehicles
+    stats_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2/norm_stats.json
+    eval_index_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2/eval_samples_val.json
+    num_eval_samples: 240          # 80 left / 80 right / 80 straight (val split)
+    target_distance: 25.0          # target point = first future ego position >= 25 m away
+    state_mode: traj
+    action_mode: unicycle
+    state_target_point: false
+    target_point_in_prompt: true
+    speed_in_prompt: true
+    per_device_batch_size: 4
+    eval_batch_size: 4
+    num_workers: 8
+    prefetch_factor: 4
+    worker_start_method: spawn
+
+trainer:
+  repeated_diffusion_steps: 4
+  max_train_steps: 30000
+  num_warmup_steps: 200
+  logging_frequency: 10
+  eval_interval: 1000
+  eval_at_start: true
+  num_eval_plots_per_class: 4
+  save_interval: 5000
+  keep_last_checkpoints: 2
+  save_dtype: bfloat16
+  learning_rate:          # DriveMoE: 5e-5 for both VLM and action expert
+    base: 5.0e-05
+    qwen_vl_interface: 5.0e-05
+    action_model: 5.0e-05
+    eye_gate: 1.0e-04     # gate head is trained from scratch (EyePolicy gate_lr)
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-08
+  freeze_modules: ''
+  bf16: true
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    betas: [0.9, 0.95]
+    eps: 1.0e-08

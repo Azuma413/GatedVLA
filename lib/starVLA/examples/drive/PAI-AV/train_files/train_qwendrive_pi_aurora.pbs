@@ -22,6 +22,7 @@
 #   MODE=baseline_v3     v2 + VLM input [text, images] + DiT cross-attention on the visual tokens only
 #   MODE=eye_v3          v3 structure + gate trained only by distillation to the ungated path; PRETRAINED=<ckpt>
 #   MODE=eye_v4          v2 layout + gate with target-point query, distilled on the text-dropped path; PRETRAINED=<ckpt>
+#   MODE=eye_v5          v2 layout + mask inside the VLM (from the image embeddings) + token removal path; PRETRAINED=<ckpt>
 #   MODE=anchor_s1       AnchorVLA stage 1 (VLM + classifier), control-space anchors (v2 layout)
 #   MODE=anchor_s2       AnchorVLA stage 2 (+ residual flow); PRETRAINED=<stage-1 checkpoint dir>
 #   MODE=anchor_eye_s2   AnchorVLA stage 2 + eye gate;      PRETRAINED=<stage-1 checkpoint dir>
@@ -44,10 +45,11 @@ case "${MODE}" in
   baseline_v3)   DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_v3_h25.yaml ;;
   eye_v3)        DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_v3_h25.yaml ;;
   eye_v4)        DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_v4_h25.yaml ;;
+  eye_v5)        DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_v5_h25.yaml ;;
   anchor_s1)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s1_v2_h25.yaml ;;
   anchor_s2)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s2_v2_h25.yaml ;;
   anchor_eye_s2) DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_eye_s2_v2_h25.yaml ;;
-  *) echo "unknown MODE=${MODE} (baseline | eye | baseline_v3 | eye_v3 | eye_v4 | anchor_s1 | anchor_s2 | anchor_eye_s2)"; exit 2 ;;
+  *) echo "unknown MODE=${MODE} (baseline | eye | baseline_v3 | eye_v3 | eye_v4 | eye_v5 | anchor_s1 | anchor_s2 | anchor_eye_s2)"; exit 2 ;;
 esac
 CONFIG=${CONFIG:-${DEFAULT_CONFIG:-${TF}/starvla_qwendrive_pi_paiav.yaml}}
 NPROC=${NPROC:-12}

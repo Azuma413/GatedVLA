@@ -373,6 +373,83 @@ def test_gate_signal_measure(tiny_qwen_drive_dir):
         assert abs(float(oracle[gl.frames == v].mean()) - gl.budget) < 1e-3
 
 
+def test_visual_keep_blocks_token(tiny_qwen_drive_dir):
+    """keep 1 = unmodified language model; keep 0 on token p: nothing of p reaches any other token (softmax attention
+    and Gated DeltaNet layers), i.e. the other tokens' outputs do not depend on p's embedding."""
+    from starVLA.model.modules.vlm.visual_keep import attach
+
+    _, ref = tiny_qwen_drive_dir
+    lm = ref.model.language_model.float().eval()
+    attach(lm)
+    torch.manual_seed(0)
+    length, p = 12, 5
+    emb = torch.randn(1, length, lm.config.hidden_size)
+    other = emb.clone()
+    other[0, p] = torch.randn(lm.config.hidden_size) * 3
+    pos = torch.arange(length)[None]
+    keep = torch.ones(1, length)
+    keep[0, p] = 0.0
+    idx = [i for i in range(length) if i != p]
+    with torch.no_grad():
+        base = lm(inputs_embeds=emb, position_ids=pos).last_hidden_state
+        ones = lm(inputs_embeds=emb, position_ids=pos, visual_keep=torch.ones(1, length)).last_hidden_state
+        a = lm(inputs_embeds=emb, position_ids=pos, visual_keep=keep).last_hidden_state
+        b = lm(inputs_embeds=other, position_ids=pos, visual_keep=keep).last_hidden_state
+        c = lm(inputs_embeds=other, position_ids=pos).last_hidden_state
+        half = keep.clone()
+        half[0, p] = 0.5
+        d = lm(inputs_embeds=other, position_ids=pos, visual_keep=half).last_hidden_state
+    assert torch.allclose(ones, base, atol=1e-4)
+    assert torch.allclose(a[:, idx], b[:, idx], atol=1e-4)  # p's content does not reach the others
+    assert not torch.allclose(base[:, idx], c[:, idx], atol=1e-3)  # without the mask it does
+    gap = lambda x: float((x[:, idx] - b[:, idx]).abs().mean())  # noqa: E731
+    assert 0 < gap(d) < gap(c)  # a soft keep weight lets part of it through
+
+
+def test_visual_keep_gradient_checkpointing(tiny_qwen_drive_dir):
+    """The keep weights travel as a layer kwarg, so checkpoint recomputation sees the same weights."""
+    import copy
+
+    from starVLA.model.modules.vlm.visual_keep import attach
+
+    _, ref = tiny_qwen_drive_dir
+    grads = []
+    for ckpt in (False, True):
+        model = copy.deepcopy(ref).float().train()
+        if ckpt:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        lm = model.model.language_model
+        attach(lm)
+        torch.manual_seed(0)
+        emb = torch.randn(1, 10, lm.config.hidden_size)
+        keep = torch.rand(1, 10).clamp(0.05, 1).requires_grad_(True)
+        lm(inputs_embeds=emb, position_ids=torch.arange(10)[None], visual_keep=keep).last_hidden_state.sum().backward()
+        grads.append(keep.grad.clone())
+    assert torch.allclose(grads[0], grads[1], atol=1e-4)
+
+
+def test_vlm_keep_scheme(tiny_qwen_drive_dir):
+    """scheme vlm_keep: three paths, the gate (pre-LLM image embeddings + target / speed) gets gradients."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "query": "target_speed", "scheme": "vlm_keep", "removal_warmup_steps": 0}
+    model = build_framework(_make_cfg(str(path), gate)).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng) | {"meta": {"target_xy": np.array(xy, np.float32), "v0": v}}
+             for xy, v in (([20.0, 4.0], 5.0), ([22.0, -6.0], 9.0))]
+    out = model(batch)
+    for key in ("loss_full", "loss_gated", "loss_removed", "removed_frac", "keep_view1"):
+        assert key in out and torch.isfinite(out[key]).all(), key
+    assert 0.2 < float(out["removed_frac"]) < 0.9
+    out["action_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.parameters() if p.requires_grad)
+    model.eval()
+    pred = model.predict_action([batch[0]])
+    assert np.all(np.isfinite(pred["normalized_actions"])) and "removed_maps" in pred
+
+
 def test_gate_input_standardization():
     """A shared near-constant massive channel makes the plain gate input-independent; standardising fixes it."""
     from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate
