@@ -167,6 +167,9 @@ class QwenDrivePIDefaultConfig:
             "removal_warmup_steps": 2000,
             "speed_scale": 20.0,  # query "target_speed": [x / target_scale, y / target_scale, v0 / speed_scale]
             "position_slots": 2048,  # buffer size for μ_p (>= visual tokens per sample)
+            # vlm_keep eval: also predict without removal, with a random mask of the same size and with the mask of
+            # the left / right mirrored target (eval/full/*, eval/random/*, eval/mirror/*).
+            "eval_controls": False,
         }
     )
 
@@ -1182,12 +1185,54 @@ class Qwen_Drive_PI(baseframework):
         state_t = torch.as_tensor(state, device=keep.device, dtype=dtype) if state is not None else None
         out = {"keep_maps": self._keep_maps(keep, gi), "removed_maps": self._keep_maps(1 - hard, gi)}
         out["score_maps"] = self._keep_maps(self._frame_standardized(logits, gi), gi)
+        controls = bool(self.config.framework.eye_gate.get("eval_controls", False)) and self.gate_mode == "learned"
+        # one noise draw shared with the eval controls (paired comparisons)
+        noise = torch.randn((hard.shape[0], self.action_horizon, self.action_model.action_dim),
+                            device=hard.device, dtype=dtype) if controls else None
         with CrossAttentionProbe(self.action_model.model, self.cross_layer_ids) as probe:
-            pred = self.action_model.predict_action(vl, state_t, encoder_attention_mask=self._cross_attention_bias(attn, hard, dtype))
+            pred = self.action_model.predict_action(
+                vl, state_t, encoder_attention_mask=self._cross_attention_bias(attn, hard, dtype), noise=noise
+            )
         self._add_attention_outputs(out, probe.mean(), gi, attn, "")
         if self.action_clip is not None:
             pred = pred.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred.float().cpu().numpy()
+        if controls:
+            out["control_actions"] = self._vlm_keep_controls(prep, hard, state_t, noise)
+        return out
+
+    def _vlm_keep_controls(self, prep: dict, hard: torch.Tensor, state_t, noise: torch.Tensor) -> dict:
+        """Eval controls of the inference path B, with the noise of the main prediction (paired comparisons):
+        full     no token removed (the policy without the mask, i.e. without the gate's target information);
+        random   per frame, as many tokens kept as the learned mask keeps, chosen at random;
+        mirror   the mask the gate gives for the target mirrored left / right (y -> -y; target queries only)."""
+        gi, attn, visual = prep["gate_inputs"], prep["attention_mask"], prep["visual"]
+        dtype = self._head_dtype()
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        rand = torch.ones_like(hard)
+        for b in range(hard.shape[0]):
+            for v in gi["view_ids"][b][visual[b]].unique():
+                idx = (gi["view_ids"][b] == v).nonzero().squeeze(1)
+                n_keep = int(hard[b, idx].sum())
+                kept = idx[torch.randperm(len(idx), generator=gen)[:n_keep].to(idx.device)]
+                rand[b, idx] = 0
+                rand[b, kept] = 1
+        masks = [("full", None), ("random", rand)]
+        if "target" in gi:
+            flip = torch.ones(gi["target"].shape[1], device=gi["target"].device)
+            flip[1] = -1.0
+            keep_m = self._gate_keep(dict(gi, target=gi["target"] * flip), attn)
+            masks.append(("mirror", torch.where(visual, (keep_m >= self._removal_tau()).to(keep_m.dtype),
+                                                torch.ones_like(keep_m))))
+        out = {}
+        for name, mask in masks:
+            vl = [h.to(dtype) for h in prep["run"](mask)]
+            pred = self.action_model.predict_action(
+                vl, state_t, encoder_attention_mask=self._cross_attention_bias(attn, mask, dtype), noise=noise
+            )
+            if self.action_clip is not None:
+                pred = pred.clamp(-float(self.action_clip), float(self.action_clip))
+            out[name] = pred.float().cpu().numpy()
         return out
 
     def _frame_standardized(self, logits: torch.Tensor, gate_inputs: dict) -> torch.Tensor:

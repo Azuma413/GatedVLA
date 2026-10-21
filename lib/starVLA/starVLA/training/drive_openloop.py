@@ -128,7 +128,8 @@ def gate_diagnostics(records: List[dict]) -> dict:
     """Collapse / attention metrics of the visual gate over the eval set (current frame).
 
     mask_pairwise_rankcorr: mean Spearman correlation of the masks of two different samples (1 = one fixed pattern).
-    mask_row_r2: share of the mask variance explained by the per-row mean pattern over the eval set.
+    mask_row_r2 / mask_col_r2: share of the mask variance explained by the per-row / per-column mean pattern.
+    mask_lr_diff/<maneuver>: mean keep on the image's left half minus the right half.
     attn_text_mass[_textdrop]: DiT cross-attention mass on the text tokens.
     rankcorr_mask_attn[_textdrop]: Spearman correlation between a sample's mask and its DiT attention map."""
     out = {}
@@ -147,6 +148,15 @@ def gate_diagnostics(records: List[dict]) -> dict:
     resid = flat - flat.mean(1, keepdims=True)
     fit = np.repeat(row_pattern[None, :, None], k.shape[2], 2).reshape(1, -1) - row_pattern.mean()
     out["mask_row_r2"] = float(1 - ((resid - fit) ** 2).sum() / max((resid**2).sum(), 1e-12))
+    col_pattern = k.mean((0, 1))  # (w,)
+    fit = np.repeat(col_pattern[None, None, :], k.shape[1], 1).reshape(1, -1) - col_pattern.mean()
+    out["mask_col_r2"] = float(1 - ((resid - fit) ** 2).sum() / max((resid**2).sum(), 1e-12))
+    # keep mass on the image's left half minus the right half (image left = ego left), per maneuver
+    half = k.shape[2] // 2
+    lr = k[:, :, :half].mean((1, 2)) - k[:, :, k.shape[2] - half :].mean((1, 2))
+    for m in sorted({x["maneuver"] for x in records if "keep_cur" in x}):
+        sel = np.array([x["maneuver"] == m for x in records if "keep_cur" in x])
+        out[f"mask_lr_diff/{m}"] = float(lr[sel].mean())
     for suffix in ("", "_textdrop"):
         if f"attn_text_mass{suffix}" in records[0]:
             out[f"attn_text_mass{suffix}"] = float(np.mean([x[f"attn_text_mass{suffix}"] for x in records]))

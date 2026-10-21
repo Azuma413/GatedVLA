@@ -339,6 +339,8 @@ def main():
                         rec[key] = float(pred_out[key][j])
                 if "normalized_actions_textdrop" in pred_out:
                     rec["pred_xy_textdrop"] = eval_ds.action_to_xy(pred_out["normalized_actions_textdrop"][j], meta)
+                for name, acts in pred_out.get("control_actions", {}).items():
+                    rec.setdefault("pred_xy_controls", {})[name] = eval_ds.action_to_xy(acts[j], meta)
                 if "anchor_ids" in pred_out:
                     rec.update(
                         anchor_ids=pred_out["anchor_ids"][j],
@@ -388,6 +390,12 @@ def main():
                 [r["maneuver"] for r in records], dt=sampler_cfg.dt,
             )
             metrics.update({f"textdrop/{k}": v for k, v in td.items() if "/" not in k})
+        for name in records[0].get("pred_xy_controls", {}):
+            ctl = displacement_metrics(
+                np.stack([r["pred_xy_controls"][name] for r in records]), np.stack([r["gt_xy"] for r in records]),
+                [r["maneuver"] for r in records], dt=sampler_cfg.dt,
+            )
+            metrics.update({f"{name}/{k}": v for k, v in ctl.items()})
         metrics["eval_time_s"] = time.time() - t_start
         log("eval step {}: ADE {:.3f} FDE {:.3f} (left {:.3f} / right {:.3f} / straight {:.3f})".format(
             step, metrics["ADE"], metrics["FDE"], metrics.get("left/ADE", float("nan")),
