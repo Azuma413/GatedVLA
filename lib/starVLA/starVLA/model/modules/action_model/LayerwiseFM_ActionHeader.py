@@ -295,8 +295,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         t: torch.Tensor = None,
         query_bias: torch.Tensor = None,
         loss_type: str = "mse",
+        return_velocity: bool = False,
     ):
         """
+        return_velocity: also return the predicted velocity (B, action_horizon, D_action) -> (loss, pred)
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
         actions: shape (B, action_horizon, D_action)
         encoder_attention_mask: optional (B, seq_length) bool/int, or float additive bias
@@ -356,9 +358,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         if loss_type == "l1":
-            return (pred_actions - velocity).abs().mean()
-        loss = ((pred_actions - velocity) ** 2).mean()
-        return loss
+            loss = (pred_actions - velocity).abs().mean()
+        else:
+            loss = ((pred_actions - velocity) ** 2).mean()
+        return (loss, pred_actions) if return_velocity else loss
 
     @staticmethod
     def _pad_query_bias(query_bias, sa_embs):
@@ -375,15 +378,19 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         state: torch.Tensor = None,
         encoder_attention_mask=None,
         query_bias: torch.Tensor = None,
+        noise: torch.Tensor = None,
     ) -> torch.Tensor:
-        # Set initial actions as the sampled noise.
+        # Set initial actions as the sampled noise (or the given noise, for paired comparisons).
         batch_size = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device
-        actions = torch.randn(
-            size=(batch_size, self.action_horizon, self.action_dim),
-            dtype=vl_embs_list[0].dtype,
-            device=device,
-        )
+        if noise is not None:
+            actions = noise.to(device=device, dtype=vl_embs_list[0].dtype)
+        else:
+            actions = torch.randn(
+                size=(batch_size, self.action_horizon, self.action_dim),
+                dtype=vl_embs_list[0].dtype,
+                device=device,
+            )
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps

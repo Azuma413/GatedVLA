@@ -112,6 +112,51 @@ def fig_to_image(fig, dpi: int = 90, canvas: tuple = (1700, 520)) -> Image.Image
     return out
 
 
+def _ranks(x: np.ndarray) -> np.ndarray:
+    return np.argsort(np.argsort(x, axis=-1), axis=-1).astype(np.float64)
+
+
+def _rank_corr_rows(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Spearman correlation between matching rows of a and b (N, P)."""
+    ra, rb = _ranks(a), _ranks(b)
+    ra -= ra.mean(1, keepdims=True)
+    rb -= rb.mean(1, keepdims=True)
+    return (ra * rb).sum(1) / np.sqrt((ra**2).sum(1) * (rb**2).sum(1) + 1e-12)
+
+
+def gate_diagnostics(records: List[dict]) -> dict:
+    """Collapse / attention metrics of the visual gate over the eval set (current frame).
+
+    mask_pairwise_rankcorr: mean Spearman correlation of the masks of two different samples (1 = one fixed pattern).
+    mask_row_r2: share of the mask variance explained by the per-row mean pattern over the eval set.
+    attn_text_mass[_textdrop]: DiT cross-attention mass on the text tokens.
+    rankcorr_mask_attn[_textdrop]: Spearman correlation between a sample's mask and its DiT attention map."""
+    out = {}
+    keeps = [r["keep_cur"] for r in records if "keep_cur" in r]
+    if len(keeps) < 2 or len({k.shape for k in keeps}) != 1:
+        return out
+    k = np.stack(keeps)  # (N, h, w)
+    flat = k.reshape(len(k), -1)
+    r = _ranks(flat)
+    r -= r.mean(1, keepdims=True)
+    r /= np.sqrt((r**2).sum(1, keepdims=True)) + 1e-12
+    c = r @ r.T
+    n = len(k)
+    out["mask_pairwise_rankcorr"] = float((c.sum() - np.trace(c)) / (n * (n - 1)))
+    row_pattern = k.mean((0, 2))  # (h,)
+    resid = flat - flat.mean(1, keepdims=True)
+    fit = np.repeat(row_pattern[None, :, None], k.shape[2], 2).reshape(1, -1) - row_pattern.mean()
+    out["mask_row_r2"] = float(1 - ((resid - fit) ** 2).sum() / max((resid**2).sum(), 1e-12))
+    for suffix in ("", "_textdrop"):
+        if f"attn_text_mass{suffix}" in records[0]:
+            out[f"attn_text_mass{suffix}"] = float(np.mean([x[f"attn_text_mass{suffix}"] for x in records]))
+        key = "attn_cur" if suffix == "" else "attn_textdrop_cur"
+        if key in records[0]:
+            a = np.stack([x[key] for x in records]).reshape(len(records), -1)
+            out[f"rankcorr_mask_attn{suffix}"] = float(_rank_corr_rows(flat, a).mean())
+    return out
+
+
 def plot_bev(
     meta: dict,
     pred_xy: np.ndarray,
@@ -119,31 +164,48 @@ def plot_bev(
     extra_preds: Optional[List[np.ndarray]] = None,
     title: str = "",
     keep_map: Optional[np.ndarray] = None,
+    extra_maps: Optional[List] = None,
     reference: Optional[np.ndarray] = None,
     candidate_anchors: Optional[np.ndarray] = None,
 ):
-    """Front image (left), optionally the image weighted by the visual gate's keep map (middle), and the
+    """Front image (left), optionally the visual gate's keep map over the frame (middle), and the
     bird's-eye view (right) with past / GT / predicted ego trajectories.
 
     BEV axes: up = ego forward (+x), right = ego right (-y)."""
+    extra_maps = list(extra_maps or []) if image is not None else []
     panels = ([image] if image is not None else []) + ([keep_map] if image is not None and keep_map is not None else [])
+    panels += [m for _, m in extra_maps]
     ratios = [1.6] * len(panels) + [1]
-    fig, axes = plt.subplots(1, len(ratios), figsize=(5.2 + 8.3 * len(panels), 5.2), gridspec_kw={"width_ratios": ratios})
+    panel_w = 8.3 if len(panels) <= 2 else 6.0
+    fig, axes = plt.subplots(1, len(ratios), figsize=(5.2 + panel_w * len(panels), 5.2), gridspec_kw={"width_ratios": ratios})
     axes = np.atleast_1d(axes)
     if image is not None:
         axes[0].imshow(image)
         axes[0].set_axis_off()
         axes[0].set_title("front camera (t0)", fontsize=9)
     if image is not None and keep_map is not None:
-        # each merged token's patch scaled by its min-max normalised keep value (bright = attended most)
-        lo, hi = float(np.min(keep_map)), float(np.max(keep_map))
-        norm = (keep_map - lo) / (hi - lo) if hi > lo else np.ones_like(keep_map)
-        mask = Image.fromarray((norm * 255).astype(np.uint8)).resize(image.size, Image.NEAREST)
-        gated = np.asarray(image, dtype=np.float32) * (np.asarray(mask, dtype=np.float32)[..., None] / 255.0)
-        axes[1].imshow(gated.astype(np.uint8))
+        # keep values on an absolute 0..1 colour scale over a dimmed grey copy of the frame (readable at night too)
+        grey = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        grey = np.clip(grey / max(float(np.percentile(grey, 99)), 1e-3), 0.0, 1.0)  # stretch dark frames
+        axes[1].imshow(grey, cmap="gray", vmin=0.0, vmax=1.0)
+        heat = axes[1].imshow(np.asarray(keep_map, dtype=np.float32), cmap="viridis", vmin=0.0, vmax=1.0, alpha=0.6,
+                              interpolation="nearest", extent=(-0.5, image.width - 0.5, image.height - 0.5, -0.5))
+        fig.colorbar(heat, ax=axes[1], fraction=0.03, pad=0.01)
         axes[1].set_axis_off()
-        axes[1].set_title(f"mask on current frame, min-max normalised (m: min {lo:.2f} / mean "
-                          f"{float(np.mean(keep_map)):.2f} / max {hi:.2f})", fontsize=9)
+        axes[1].set_title(f"keep m on current frame, absolute scale (min {float(np.min(keep_map)):.2f} / mean "
+                          f"{float(np.mean(keep_map)):.2f} / max {float(np.max(keep_map)):.2f})", fontsize=9)
+    for k, (name, values) in enumerate(extra_maps):
+        ax_m = axes[len(panels) - len(extra_maps) + k]
+        values = np.asarray(values, dtype=np.float32)
+        grey = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        grey = np.clip(grey / max(float(np.percentile(grey, 99)), 1e-3), 0.0, 1.0)
+        ax_m.imshow(grey, cmap="gray", vmin=0.0, vmax=1.0)
+        lo, hi = (float(values.min()), float(values.max())) if "score" in name else (0.0, float(values.max()))
+        im = ax_m.imshow(values, cmap="magma" if "attention" in name else "coolwarm", vmin=lo, vmax=hi if hi > lo else lo + 1,
+                         alpha=0.6, interpolation="nearest", extent=(-0.5, image.width - 0.5, image.height - 0.5, -0.5))
+        fig.colorbar(im, ax=ax_m, fraction=0.03, pad=0.01)
+        ax_m.set_axis_off()
+        ax_m.set_title(f"{name} (sum on frame {float(values.sum()):.3f})" if "attention" in name else name, fontsize=9)
     ax = axes[-1]
 
     def _plot(xy, **kw):

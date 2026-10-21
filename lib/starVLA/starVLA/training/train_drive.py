@@ -96,7 +96,9 @@ def main():
 
     from starVLA.dataloader.pai_av_drive import DriveSampler, Normalizer, PAIAVDriveDataset, collate_examples
     from starVLA.model.framework.base_framework import build_framework
-    from starVLA.training.drive_openloop import MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, plot_bev
+    from starVLA.training.drive_openloop import (
+        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, plot_bev,
+    )
 
     is_main = rank == 0
     distributed = world > 1
@@ -242,6 +244,7 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda_for(g["lr"]) for g in param_groups])
     params = [p for g in param_groups for p in g["params"]]
+    dit_params = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith("action_model.")]
 
     # ── W&B ───────────────────────────────────────────────────────────
     wandb = None
@@ -252,7 +255,7 @@ def main():
         id_file = out_dir / "wandb_run_id.txt"  # resumed jobs keep logging into the same W&B run
         run_id = id_file.read_text().strip() if id_file.exists() else uuid.uuid4().hex[:8]
         id_file.write_text(run_id)
-        wandb.init(
+        init_kwargs = dict(
             project=cfg.get("wandb_project", "starVLA_drive"),
             entity=None if entity in (None, "", "your_wandb_entity") else entity,
             name=cfg.run_id,
@@ -261,6 +264,13 @@ def main():
             config=OmegaConf.to_container(cfg, resolve=True),
             resume="allow",
         )
+        try:
+            wandb.init(**init_kwargs)
+        except Exception as e:  # compute nodes can lose the route to api.wandb.ai; never let that stop training
+            log(f"W&B init failed ({type(e).__name__}: {e}); logging offline to {out_dir}/wandb "
+                f"(upload later from a login node: wandb sync {out_dir}/wandb/offline-run-*)")
+            wandb.teardown()  # the failed online attempt keeps the run id registered in the wandb service
+            wandb.init(mode="offline", **init_kwargs)
         wandb.define_metric("train/*", step_metric="step")
         wandb.define_metric("eval/*", step_metric="step")
         wandb.define_metric("eval_bev/*", step_metric="step")
@@ -268,9 +278,27 @@ def main():
 
     # ── open-loop evaluation ──────────────────────────────────────────
     plots_per_class = int(tcfg.get("num_eval_plots_per_class", 4))
+    # Plotted samples: per class, distinct clips spread over the eval list, preferring frames brighter than the
+    # median (mask overlays are unreadable on night frames). Brightness of every eval frame is measured once, sharded.
+    bright = {i: float(np.asarray(eval_ds[i]["image"][-1].convert("L").resize((64, 36))).mean())
+              for i in range(len(eval_ds))[rank::world]}
+    if distributed:
+        parts = [None] * world
+        dist.all_gather_object(parts, bright)
+        bright = {k: v for part in parts for k, v in part.items()}
+    median = float(np.median(list(bright.values())))
     plot_ids = set()
     for m in MANEUVERS:
-        plot_ids.update([i for i, s in enumerate(eval_samples) if s.get("maneuver") == m][:plots_per_class])
+        seen, cands = set(), []
+        for i, s in enumerate(eval_samples[: len(eval_ds)]):
+            if s.get("maneuver") == m and s["clip_id"] not in seen:
+                seen.add(s["clip_id"])
+                cands.append(i)
+        pool = [i for i in cands if bright[i] >= median]
+        pool = pool if len(pool) >= plots_per_class else cands
+        if pool:
+            picks = np.linspace(0, len(pool) - 1, min(plots_per_class, len(pool))).round().astype(int)
+            plot_ids.update(pool[k] for k in picks)
     eval_bs = int(dcfg.get("eval_batch_size", bs))
     anchors_np = None
     if fw.get("anchor", {}).get("enabled", False):
@@ -302,6 +330,15 @@ def main():
                 }
                 if kmaps is not None:
                     rec["keep_mean"] = [float(k.mean()) for k in kmaps]
+                    rec["keep_cur"] = kmaps[-1].astype(np.float32)  # current frame, for the collapse metrics
+                for key in ("score_maps", "attn_maps", "attn_maps_textdrop"):
+                    if key in pred_out:
+                        rec[key[:-5] + "_cur"] = pred_out[key][j][-1].astype(np.float32)
+                for key in ("attn_text_mass", "attn_text_mass_textdrop"):
+                    if key in pred_out:
+                        rec[key] = float(pred_out[key][j])
+                if "normalized_actions_textdrop" in pred_out:
+                    rec["pred_xy_textdrop"] = eval_ds.action_to_xy(pred_out["normalized_actions_textdrop"][j], meta)
                 if "anchor_ids" in pred_out:
                     rec.update(
                         anchor_ids=pred_out["anchor_ids"][j],
@@ -344,6 +381,13 @@ def main():
             keep_means = np.array([r["keep_mean"] for r in records])
             for v in range(keep_means.shape[1]):
                 metrics[f"keep_view{v}"] = float(keep_means[:, v].mean())
+            metrics.update(gate_diagnostics(records))
+        if "pred_xy_textdrop" in records[0]:
+            td = displacement_metrics(
+                np.stack([r["pred_xy_textdrop"] for r in records]), np.stack([r["gt_xy"] for r in records]),
+                [r["maneuver"] for r in records], dt=sampler_cfg.dt,
+            )
+            metrics.update({f"textdrop/{k}": v for k, v in td.items() if "/" not in k})
         metrics["eval_time_s"] = time.time() - t_start
         log("eval step {}: ADE {:.3f} FDE {:.3f} (left {:.3f} / right {:.3f} / straight {:.3f})".format(
             step, metrics["ADE"], metrics["FDE"], metrics.get("left/ADE", float("nan")),
@@ -359,8 +403,16 @@ def main():
                 continue
             meta = r["meta"]
             title = f"{r['maneuver']} | {meta['clip_id'][:8]} t0={meta['t0'] * 1e-6:.1f}s | step {step}"
+            extra_maps = [(name, r[key]) for name, key in (("gate score z", "score_cur"),
+                                                           ("DiT attention (gated, all tokens)", "attn_cur"),
+                                                           ("DiT attention (gated, text hidden)", "attn_textdrop_cur"))
+                          if key in r]
+            if extra_maps:
+                np.savez(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.npz", **{k: r[k] for k in (
+                    "keep_cur", "score_cur", "attn_cur", "attn_textdrop_cur", "attn_text_mass", "attn_text_mass_textdrop")
+                    if k in r})
             fig = plot_bev(
-                meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"),
+                meta, r["pred_xy"], image=r["image"], title=title, keep_map=r.get("keep_map"), extra_maps=extra_maps,
                 reference=r.get("anchor_reference"),
                 candidate_anchors=(r["anchor_xy"] if "anchor_xy" in r else anchors_np)[r["anchor_ids"]]
                 if "anchor_ids" in r else None,
@@ -471,6 +523,15 @@ def main():
             with autocast():
                 out = model(batch)
             loss = out["action_loss"]
+            if "gate_loss" in out:
+                # eye_gate.gated_grad=gate: the gated-path loss trains the gate only. Its graph is disjoint from
+                # action_loss's (detached VLM features), so backpropagate it first and drop what it left on the DiT.
+                if accum != 1:
+                    raise ValueError("eye_gate.gated_grad=gate needs gradient_accumulation_steps 1")
+                saved = [p.grad.clone() if p.grad is not None else None for p in dit_params]
+                out["gate_loss"].backward()
+                for p, g in zip(dit_params, saved):
+                    p.grad = g
             (loss / accum).backward()
             loss_sum += loss.detach().float().item()
             for key, value in out.items():  # extra scalars (e.g. gate losses / keep ratios)

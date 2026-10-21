@@ -69,6 +69,7 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config, populate_layerwise_dit_cfg
 from starVLA.model.modules.action_space.unicycle import unicycle_rollout
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import LayerwiseFlowmatchingActionHead, get_action_model
+from starVLA.model.modules.action_model.attention_probe import CrossAttentionProbe
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -103,6 +104,12 @@ class QwenDrivePIDefaultConfig:
             # Optional clamp of sampled (normalised) actions to [-action_clip, action_clip]. Off: q01/q99 are
             # pooled over all waypoints, so a clamp at 1 cuts lateral offsets beyond ~3 m and forward beyond ~69 m.
             "action_clip": None,
+            # VLM input order [text, images] instead of [images, text]: every visual token is computed with the
+            # instruction (speed / target point) in context, and the text tokens do not see the images.
+            "text_first": False,
+            # Cross-attention of the action expert reads the visual tokens only (text / template tokens masked), so
+            # the expert gets the scene and the instruction only through the (gated) visual tokens.
+            "dit_visual_only": False,
         }
     )
 
@@ -129,6 +136,37 @@ class QwenDrivePIDefaultConfig:
             # set so that mean m = budget (see budgeted_keep); use with budget_loss_weight 0.
             "parameterization": "sigmoid",
             "contrast": 2.0,
+            # Loss of the gated path. "flow": flow matching against the ground truth. "distill": ‖v_gated − sg(v_full)‖²
+            # with the same noise and t, so the part both paths solve from the ego state cancels.
+            "gated_loss": "flow",
+            # What the gated-path loss updates. "all": VLM, DiT and gate. "gate_dit": DiT and gate (VLM features and
+            # the gate input detached). "gate": the gate only (DiT gradients of this loss are dropped by the trainer,
+            # see ``gate_loss`` in the output).
+            "gated_grad": "all",
+            # Centre the gate's visual input per token position (h_p − μ_p, EMA over the data): a mask that depends
+            # only on the position (e.g. row stripes) is then impossible. Needs a fixed token grid.
+            "position_center": False,
+            # Gate query q: "text" (mean of the text-token hidden) or "target" (MLP embedding of the navigation target
+            # point (x, y) / target_scale, read from the sample's meta["target_xy"]).
+            "query": "text",
+            "target_scale": 25.0,
+            # "standard": losses above. "textdrop": per step (all from one VLM forward)
+            #   ② ungated, all tokens (text visible)                -> teacher v_ref (no gradient)
+            #   ③ gated (m), text tokens hidden from the DiT        -> ‖v③ − v_ref‖², updates the gate only
+            #   ④ gated (m fixed), all tokens                       -> flow matching, updates VLM + DiT
+            # Inference uses ④ (gated, all tokens).
+            # "vlm_keep": the mask acts inside the VLM (see modules/vlm/visual_keep.py) from the image embeddings
+            #   (gate input: pre-LLM image-token embeddings + query) and on the DiT cross-attention. Per step, from one
+            #   vision-encoder pass:
+            #   A-full   VLM + DiT ungated                                   -> L_full     (VLM, DiT)
+            #   A-gated  keep = m in the VLM and log m on the DiT            -> L_gated    (gate, VLM, DiT)
+            #   B        tokens with m < tau removed (keep 0), others 1      -> L_removed  (VLM, DiT); inference path
+            #   tau ramps linearly from 0 to removal_threshold over removal_warmup_steps.
+            "scheme": "standard",
+            "removal_threshold": 0.1,
+            "removal_warmup_steps": 2000,
+            "speed_scale": 20.0,  # query "target_speed": [x / target_scale, y / target_scale, v0 / speed_scale]
+            "position_slots": 2048,  # buffer size for μ_p (>= visual tokens per sample)
         }
     )
 
@@ -240,8 +278,23 @@ class ViewGate(nn.Module):
     (``ChannelStandardizer``, separate statistics for visual and text tokens); q is the mean of the standardised
     text tokens."""
 
-    def __init__(self, width: int, hidden_dim: int, init_keep: float, standardize: bool = True):
+    def __init__(self, width: int, hidden_dim: int, init_keep: float, standardize: bool = True,
+                 position_slots: int = 0, momentum: float = 0.01, target_query: int = 0):
         super().__init__()
+        # target_query: q is an embedding of the (scaled) navigation target point (x, y) instead of the mean of the
+        # text-token hidden states.
+        self.target_embed = (
+            nn.Sequential(nn.Linear(int(target_query), hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, width))
+            if target_query else None
+        )
+        # Per-position centring (position_slots > 0): h_p − μ_p with μ_p an EMA of the hidden at visual-token position
+        # p over the data. The token grid is fixed, so this removes everything shared by all samples at a position
+        # (row / sequence-position components); the gate only sees how the content deviates from the average.
+        self.position_slots, self.momentum = int(position_slots), momentum
+        if self.position_slots > 0:
+            self.register_buffer("pos_mean", torch.zeros(self.position_slots, width))
+            self.register_buffer("pos_count", torch.zeros((), dtype=torch.long))  # visual tokens per sample (0: unset)
+            self.register_buffer("pos_initialized", torch.zeros((), dtype=torch.bool))
         self.std_h = ChannelStandardizer(width) if standardize else None
         self.std_t = ChannelStandardizer(width) if standardize else None
         self.norm_h = nn.RMSNorm(width)
@@ -251,10 +304,35 @@ class ViewGate(nn.Module):
         # fc2.weight keeps its default random init so that the initial mask depends on the input.
         nn.init.constant_(self.fc2.bias, math.log(init_keep / (1 - init_keep)))
 
-    def forward(self, h: torch.Tensor, text: torch.Tensor) -> torch.Tensor:
-        """h: (N, W) visual-token hidden of one frame, text: (T, W) text-token hidden -> logits (N,)."""
+    def center_positions(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (B, N, W) visual-token hidden of B samples in sequence order -> h − μ (same shape, float32)."""
+        h = h.float()
+        n = h.shape[1]
+        if n > self.position_slots:
+            raise ValueError(f"{n} visual tokens per sample > eye_gate.position_slots {self.position_slots}")
+        with torch.no_grad():
+            if int(self.pos_count) == 0:
+                self.pos_count.fill_(n)
+            elif int(self.pos_count) != n:
+                raise ValueError(f"per-position centring needs a fixed token grid: {n} != {int(self.pos_count)} tokens")
+            if self.training:
+                batch_mean = h.mean(0)
+                if bool(self.pos_initialized):
+                    self.pos_mean[:n].lerp_(batch_mean, self.momentum)
+                else:
+                    self.pos_mean[:n].copy_(batch_mean)
+                    self.pos_initialized.fill_(True)
+            mean = self.pos_mean[:n] if bool(self.pos_initialized) else h.mean(0)
+        return h - mean[None]
+
+    def forward(self, h: torch.Tensor, text: torch.Tensor, target: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """h: (N, W) visual-token hidden of one sample, text: (T, W) text-token hidden, target: (2,) scaled target
+        point (with target_query) -> logits (N,)."""
         dtype = self.fc1.weight.dtype
-        if self.std_h is not None:
+        if self.target_embed is not None:
+            h = self.std_h(h) if self.std_h is not None else h
+            q = self.target_embed(target.to(self.target_embed[0].weight.dtype)).float()
+        elif self.std_h is not None:
             h, q = self.std_h(h), self.std_t(text).mean(0)
         else:
             q = text.float().mean(0)
@@ -387,6 +465,8 @@ class Qwen_Drive_PI(baseframework):
             self.eye_gate = ViewGate(
                 llm_hidden_size, int(gate_cfg.hidden_dim), float(gate_cfg.init_keep),
                 standardize=bool(gate_cfg.get("standardize_inputs", True)),
+                position_slots=int(gate_cfg.get("position_slots", 2048)) if bool(gate_cfg.get("position_center", False)) else 0,
+                target_query={"text": 0, "target": 2, "target_speed": 3}[str(gate_cfg.get("query", "text"))],
             )
 
         anchor_cfg = self.config.framework.anchor
@@ -400,6 +480,19 @@ class Qwen_Drive_PI(baseframework):
         self.history_image_pixels = int(drive_cfg.get("history_image_pixels", 174080))
         self.image_factor = int(drive_cfg.get("image_factor", 32))
         self.action_clip = drive_cfg.get("action_clip", None)
+        self.vlm_keep = self.gate_enabled and str(gate_cfg.get("scheme", "standard")) == "vlm_keep"
+        if self.vlm_keep:
+            from starVLA.model.modules.vlm.visual_keep import attach
+
+            attach(self.qwen_vl_interface.model)
+            self.register_buffer("keep_step", torch.zeros((), dtype=torch.long))  # training forwards (tau ramp)
+        self.text_first = bool(drive_cfg.get("text_first", False))
+        self.dit_visual_only = bool(drive_cfg.get("dit_visual_only", False))
+        if self.gate_enabled:
+            if str(gate_cfg.get("gated_loss", "flow")) not in ("flow", "distill"):
+                raise ValueError(f"eye_gate.gated_loss must be flow / distill, got {gate_cfg.gated_loss}")
+            if str(gate_cfg.get("gated_grad", "all")) not in ("all", "gate_dit", "gate"):
+                raise ValueError(f"eye_gate.gated_grad must be all / gate_dit / gate, got {gate_cfg.gated_grad}")
 
     # ------------------------------------------------------------------
     # Decision anchors
@@ -470,6 +563,21 @@ class Qwen_Drive_PI(baseframework):
             v0 = v0[:, None].expand(-1, a.shape[1])
         return unicycle_rollout(a, v0, self.anchor_dt)
 
+    def _gate_target(self, examples: List[dict], device) -> Optional[torch.Tensor]:
+        """(B, 2) navigation target point / target_scale for the gate query (eye_gate.query = target)."""
+        gate_cfg = self.config.framework.eye_gate
+        if not (self.gate_enabled and str(gate_cfg.get("query", "text")) in ("target", "target_speed")):
+            return None
+        if "target_xy" in examples[0]:
+            xy = [ex["target_xy"] for ex in examples]
+        else:
+            xy = [ex["meta"]["target_xy"] for ex in examples]
+        xy = torch.as_tensor(np.asarray(xy, dtype=np.float32), device=device) / float(gate_cfg.get("target_scale", 25.0))
+        if str(gate_cfg.get("query", "text")) == "target_speed":
+            v0 = self._current_speed(examples, device)[:, None] / float(gate_cfg.get("speed_scale", 20.0))
+            xy = torch.cat([xy, v0], dim=1)
+        return xy
+
     @staticmethod
     def _current_speed(examples: List[dict], device) -> Optional[torch.Tensor]:
         """Current speed v0 (B,) in m/s (``v0``, or ``meta["v0"]``), needed by control-space anchors."""
@@ -537,13 +645,75 @@ class Qwen_Drive_PI(baseframework):
     def _head_dtype(self) -> torch.dtype:
         return next(self.action_model.parameters()).dtype
 
+    def _project_hidden(self, all_hidden) -> list:
+        """VLM hidden states (all layers) -> one projected entry per DiT block (self-attention blocks alias the
+        preceding cross-attention entry)."""
+        hidden_states = all_hidden[-self.num_action_dit_layers :]
+        proj_dtype = next(self.project_layers.parameters(), torch.empty(0, dtype=self._head_dtype())).dtype
+        projected = {
+            i: proj(hidden_states[j].to(proj_dtype))
+            for i, j, proj in zip(self.cross_layer_ids, self.vlm_layer_ids, self.project_layers)
+        }
+        vl_embs_list = []
+        for i in range(self.num_action_dit_layers):
+            vl_embs_list.append(projected[i] if i in projected else vl_embs_list[-1])
+        return vl_embs_list
+
+    def _vlm_keep_prepare(self, batch_images: List, instructions: List[str], examples: List[dict]) -> dict:
+        """scheme vlm_keep: one vision-encoder pass, the gate on the pre-LLM image embeddings, and a function that runs
+        the language model with given per-token keep weights."""
+        qi = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        vm = self.qwen_vl_interface.model.model
+        input_ids = qi["input_ids"]
+        emb = vm.get_input_embeddings()(input_ids)
+        image = vm.get_image_features(qi["pixel_values"], qi["image_grid_thw"], return_dict=True).pooler_output
+        image = torch.cat(image, dim=0).to(emb.device, emb.dtype)
+        image_mask, _ = vm.get_placeholder_mask(input_ids, inputs_embeds=emb, image_features=image)
+        emb = emb.masked_scatter(image_mask, image)
+        attn = qi.get("attention_mask")
+        attn = torch.ones(input_ids.shape, dtype=torch.long, device=emb.device) if attn is None else attn
+        position_ids = vm.compute_3d_position_ids(
+            input_ids=input_ids, inputs_embeds=emb, image_grid_thw=qi["image_grid_thw"], attention_mask=attn,
+            mm_token_type_ids=qi.get("mm_token_type_ids"),
+        )
+        view_ids = self._visual_view_ids(qi)
+        visual = view_ids >= 0
+        gate_inputs = {
+            "final_hidden": emb,  # the gate reads the image-token embeddings before the language model
+            "view_ids": view_ids,
+            "image_grid_thw": qi["image_grid_thw"],
+            "text_mask": (~visual) & attn.bool(),
+        }
+        target = self._gate_target(examples, emb.device)
+        if target is not None:
+            gate_inputs["target"] = target
+
+        def run(keep):
+            out = vm.language_model(
+                inputs_embeds=emb, position_ids=position_ids, attention_mask=attn, use_cache=False,
+                output_hidden_states=True, return_dict=True, visual_keep=keep,
+            )
+            return self._project_hidden(out.hidden_states)
+
+        return {"run": run, "gate_inputs": gate_inputs, "attention_mask": attn.bool(), "visual": visual}
+
+    def _removal_tau(self) -> float:
+        gate_cfg = self.config.framework.eye_gate
+        tau = float(gate_cfg.get("removal_threshold", 0.1))
+        warm = int(gate_cfg.get("removal_warmup_steps", 0))
+        if self.training and warm > 0:
+            return tau * min(1.0, float(self.keep_step) / warm)
+        return tau
+
     def _encode_vl_hidden_states(self, batch_images: List, instructions: List[str]) -> tuple:
         """Run the VLM, keep the last ``num_action_dit_layers`` hidden states and project them to the expert width.
 
         The returned list has one entry per DiT block; entries for self-attention blocks are placeholders
         (the DiT ignores them) that alias the preceding cross-attention entry.
         """
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images, instructions=instructions, text_first=self.text_first
+        )
         attention_mask = qwen_inputs.get("attention_mask", None)
         # Call the inner Qwen3.5 model (no LM head): only hidden states are needed.
         qwenvl_outputs = self.qwen_vl_interface.model.model(
@@ -554,24 +724,27 @@ class Qwen_Drive_PI(baseframework):
             return_dict=True,
         )
         all_hidden = qwenvl_outputs.hidden_states
-        hidden_states = all_hidden[-self.num_action_dit_layers :]
-        proj_dtype = next(self.project_layers.parameters(), torch.empty(0, dtype=self._head_dtype())).dtype
-        projected = {
-            i: proj(hidden_states[j].to(proj_dtype))
-            for i, j, proj in zip(self.cross_layer_ids, self.vlm_layer_ids, self.project_layers)
-        }
-        vl_embs_list = []
-        for i in range(self.num_action_dit_layers):
-            vl_embs_list.append(projected[i] if i in projected else vl_embs_list[-1])
+        vl_embs_list = self._project_hidden(all_hidden)
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
         else:
             attention_mask = torch.ones(qwen_inputs["input_ids"].shape, dtype=torch.bool, device=all_hidden[-1].device)
+        view_ids = self._visual_view_ids(qwen_inputs)
+        visual = view_ids >= 0
+        text_mask = (~visual) & attention_mask
+        if self.text_first:
+            # q: the prompt only. Template tokens after the images have seen the images.
+            pos = torch.arange(visual.shape[1], device=visual.device)[None]
+            first_visual = torch.where(visual, pos, visual.shape[1]).min(1, keepdim=True).values
+            text_mask = text_mask & (pos < first_visual)
         gate_inputs = {
             "final_hidden": all_hidden[-1],
-            "view_ids": self._visual_view_ids(qwen_inputs),
+            "view_ids": view_ids,
             "image_grid_thw": qwen_inputs.get("image_grid_thw"),
+            "text_mask": text_mask,
         }
+        if self.dit_visual_only:
+            attention_mask = attention_mask & visual  # the expert's cross-attention sees the visual tokens only
         if self.anchor_enabled:
             is_query = qwen_inputs["input_ids"] == self.anchor_query_id
             if not bool((is_query.sum(1) == 1).all()):
@@ -610,14 +783,20 @@ class Qwen_Drive_PI(baseframework):
             return (keep, None) if return_logits else keep
 
         hidden = gate_inputs["final_hidden"]
-        text = (~visual) & attention_mask
+        text = gate_inputs["text_mask"] if "text_mask" in gate_inputs else (~visual) & attention_mask
         gate_cfg = self.config.framework.eye_gate
         tau = float(gate_cfg.get("temperature", 1.0))
         budgeted = str(gate_cfg.get("parameterization", "sigmoid")) == "budgeted"
         rows, logits = [], []
+        vis_hidden = [hidden[b][visual[b]] for b in range(hidden.shape[0])]
+        if self.eye_gate.position_slots > 0:
+            if len({v.shape[0] for v in vis_hidden}) != 1:
+                raise ValueError("per-position centring needs the same number of visual tokens in every sample")
+            vis_hidden = list(self.eye_gate.center_positions(torch.stack(vis_hidden)))
         for b in range(hidden.shape[0]):
             row = keep[b].clone()
-            logit = self.eye_gate(hidden[b][visual[b]], hidden[b][text[b]])
+            target = gate_inputs["target"][b] if "target" in gate_inputs else None
+            logit = self.eye_gate(vis_hidden[b], hidden[b][text[b]], target)
             if budgeted:
                 frames = view_ids[b][visual[b]]
                 m = torch.empty_like(logit)
@@ -696,9 +875,14 @@ class Qwen_Drive_PI(baseframework):
             with torch.no_grad():
                 return self._predict(examples)
         batch_images, instructions, state = self._prepare_inputs(examples)
+        if self.vlm_keep:
+            return self._vlm_keep_losses(examples, batch_images, instructions, state)
         vl_embs_list, attention_mask, gate_inputs = self._encode_vl_hidden_states(batch_images, instructions)
 
         device, dtype = vl_embs_list[-1].device, self._head_dtype()
+        gate_target = self._gate_target(examples, device)
+        if gate_target is not None:
+            gate_inputs["target"] = gate_target
         vl_embs_list = [h.to(dtype) for h in vl_embs_list]
         actions = torch.as_tensor(np.array([example["action"] for example in examples]), device=device, dtype=dtype)
         actions_target = actions[:, -self.action_horizon :, :]
@@ -745,28 +929,53 @@ class Qwen_Drive_PI(baseframework):
 
         # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
         gate_cfg = self.config.framework.eye_gate
-        keep, gate_logits = self._gate_keep(gate_inputs, attention_mask, return_logits=True)
+        if self.gate_mode == "learned" and str(gate_cfg.get("scheme", "standard")) == "textdrop":
+            return self._textdrop_losses(out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, state_t,
+                                         query_bias, flow_weight, loss_type, repeat, device, dtype)
+        distill = self.gate_mode == "learned" and str(gate_cfg.get("gated_loss", "flow")) == "distill"
+        gated_grad = str(gate_cfg.get("gated_grad", "all")) if self.gate_mode == "learned" else "all"
+        # Separated gradients: the gated path sees the VLM features and the gate input detached.
+        gated_embs, gate_in = vl_embs_list, gate_inputs
+        if gated_grad != "all":
+            gated_embs = [h.detach() for h in vl_embs_list]
+            gate_in = dict(gate_inputs, final_hidden=gate_inputs["final_hidden"].detach())
+        keep, gate_logits = self._gate_keep(gate_in, attention_mask, return_logits=True)
         noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
         t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
 
-        def flow_loss(keep_or_none):
+        def flow_loss(keep_or_none, embs):
             bias = self._cross_attention_bias(attention_mask, keep_or_none, dtype).repeat(repeat, 1)
             return self.action_model(
-                vl_embs_list, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t,
-                query_bias=query_bias, loss_type=loss_type,
+                embs, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t,
+                query_bias=query_bias, loss_type=loss_type, return_velocity=True,
             )
 
-        loss_gated = flow_loss(keep)
+        full_w = float(gate_cfg.full_loss_weight) if self.gate_mode == "learned" else 0.0
+        if full_w > 0 or distill:
+            loss_full, v_full = flow_loss(None, vl_embs_list)
+            out["loss_full"] = loss_full.detach()
+            if full_w > 0:
+                total = total + flow_weight * full_w * loss_full
+        loss_gated, v_gated = flow_loss(keep, gated_embs)
         out["loss_gated"] = loss_gated.detach()
-        total = total + flow_weight * loss_gated
+        if distill:
+            loss_gate = ((v_gated.float() - v_full.detach().float()) ** 2).mean()
+            out["loss_distill"] = loss_gate.detach()
+        else:
+            loss_gate = loss_gated
+        if gated_grad == "gate":
+            out["gate_loss"] = flow_weight * loss_gate  # backpropagated separately; the trainer drops its DiT grads
+        else:
+            total = total + flow_weight * loss_gate
         keep_mean = self._keep_stats(keep, gate_inputs["view_ids"])  # (B, V)
         for v in range(self.num_views):
             out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
+        cur = gate_inputs["view_ids"] == self.num_views - 1
+        if keep.shape[0] > 1 and bool((cur.sum(1) == cur.sum(1)[0]).all()):
+            # input dependence of the current-frame mask: std over the batch per token, mean over tokens
+            m_cur = torch.stack([keep[b][cur[b]] for b in range(keep.shape[0])])
+            out["keep_xsample_std"] = m_cur.std(0).mean().detach()
         if self.gate_mode == "learned":
-            if float(gate_cfg.full_loss_weight) > 0:
-                loss_full = flow_loss(None)
-                total = total + flow_weight * float(gate_cfg.full_loss_weight) * loss_full
-                out["loss_full"] = loss_full.detach()
             if float(gate_cfg.budget_loss_weight) > 0:
                 loss_budget = ((keep_mean - float(gate_cfg.budget)) ** 2).sum(1).mean()
                 total = total + float(gate_cfg.budget_loss_weight) * loss_budget
@@ -789,20 +998,134 @@ class Qwen_Drive_PI(baseframework):
         out["action_loss"] = total
         return out
 
+    def _vlm_keep_losses(self, examples, batch_images, instructions, state) -> dict:
+        """eye_gate.scheme = vlm_keep (see QwenDrivePIDefaultConfig.eye_gate)."""
+        if self.anchor_enabled:
+            raise NotImplementedError("eye_gate.scheme vlm_keep is not combined with anchors")
+        gate_cfg = self.config.framework.eye_gate
+        prep = self._vlm_keep_prepare(batch_images, instructions, examples)
+        gi, attn, visual = prep["gate_inputs"], prep["attention_mask"], prep["visual"]
+        keep, gate_logits = self._gate_keep(gi, attn, return_logits=True)  # (B, L), 1 on non-visual tokens
+        tau = self._removal_tau()
+        hard = torch.where(visual, (keep.detach() >= tau).to(keep.dtype), torch.ones_like(keep))
+        if self.training:
+            self.keep_step += 1
+        device, dtype = keep.device, self._head_dtype()
+        embs = {
+            "full": prep["run"](None),
+            "gated": prep["run"](keep),
+            "removed": prep["run"](hard),
+        }
+        actions = torch.as_tensor(np.array([ex["action"] for ex in examples]), device=device, dtype=dtype)
+        flow_target = actions[:, -self.action_horizon :, :]
+        repeat = self.config.trainer.get("repeated_diffusion_steps", None) if self.config.get("trainer") else None
+        repeat = int(repeat or self.config.framework.action_model.get("repeated_diffusion_steps", 1))
+        flow_target = flow_target.repeat(repeat, 1, 1)
+        state_t = None
+        if state is not None:
+            state_t = torch.as_tensor(state, device=device, dtype=dtype).repeat(repeat, 1, 1)
+        noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
+        t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
+
+        def flow(name, keep_or_none):
+            bias = self._cross_attention_bias(attn, keep_or_none, dtype).repeat(repeat, 1)
+            vl = [h.to(dtype).repeat(repeat, 1, 1) for h in embs[name]]
+            return self.action_model(vl, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t)
+
+        out = {
+            "loss_full": flow("full", None),
+            "loss_gated": flow("gated", keep),
+            "loss_removed": flow("removed", hard),  # removed keys -inf, kept tokens unmasked
+        }
+        weights = {"loss_full": float(gate_cfg.get("full_loss_weight", 1.0)), "loss_gated": 1.0,
+                   "loss_removed": float(gate_cfg.get("removed_loss_weight", 1.0))}
+        total = sum(weights[k] * v for k, v in out.items())
+        out = {k: v.detach() for k, v in out.items()}
+        out["removal_tau"] = torch.tensor(tau)
+        out["removed_frac"] = (1 - hard[visual]).mean().detach()
+        out["gate_score_std"] = gate_logits.detach().std()
+        keep_mean = self._keep_stats(keep, gi["view_ids"])
+        for v in range(self.num_views):
+            out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
+        cur = gi["view_ids"] == self.num_views - 1
+        if keep.shape[0] > 1 and bool((cur.sum(1) == cur.sum(1)[0]).all()):
+            m_cur = torch.stack([keep[b][cur[b]] for b in range(keep.shape[0])]).detach().float()
+            out["keep_xsample_std"] = m_cur.std(0).mean()
+            ranks = m_cur.argsort(1).argsort(1).float()
+            ranks = ranks - ranks.mean(1, keepdim=True)
+            ranks = ranks / ranks.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            corr = ranks @ ranks.T
+            n = corr.shape[0]
+            out["keep_pairwise_rankcorr"] = (corr.sum() - corr.diagonal().sum()) / (n * (n - 1))
+        out["action_loss"] = total
+        return out
+
+    def _textdrop_losses(self, out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, state_t,
+                         query_bias, flow_weight, loss_type, repeat, device, dtype) -> dict:
+        """eye_gate.scheme = textdrop (see QwenDrivePIDefaultConfig.eye_gate)."""
+        visual = gate_inputs["view_ids"] >= 0
+        visual_mask = attention_mask & visual
+        gate_in = dict(gate_inputs, final_hidden=gate_inputs["final_hidden"].detach())
+        keep, gate_logits = self._gate_keep(gate_in, attention_mask, return_logits=True)
+        out["gate_score_std"] = gate_logits.detach().std()
+        cur = gate_inputs["view_ids"] == self.num_views - 1
+        if keep.shape[0] > 1 and bool((cur.sum(1) == cur.sum(1)[0]).all()):
+            m_cur = torch.stack([keep[b][cur[b]] for b in range(keep.shape[0])]).detach().float()
+            out["keep_xsample_std"] = m_cur.std(0).mean()
+            ranks = m_cur.argsort(1).argsort(1).float()
+            ranks = ranks - ranks.mean(1, keepdim=True)
+            ranks = ranks / ranks.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            corr = ranks @ ranks.T
+            n = corr.shape[0]
+            out["keep_pairwise_rankcorr"] = (corr.sum() - corr.diagonal().sum()) / (n * (n - 1))
+        noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
+        t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
+
+        def run(keep_or_none, embs, mask):
+            bias = self._cross_attention_bias(mask, keep_or_none, dtype).repeat(repeat, 1)
+            return self.action_model(
+                embs, flow_target, state_t, encoder_attention_mask=bias, noise=noise, t=t,
+                query_bias=query_bias, loss_type=loss_type, return_velocity=True,
+            )
+
+        detached = [h.detach() for h in vl_embs_list]
+        with torch.no_grad():
+            loss_ref, v_ref = run(None, detached, attention_mask)  # ② teacher: ungated, all tokens
+        _, v_drop = run(keep, detached, visual_mask)  # ③ gated, no text tokens
+        loss_distill = ((v_drop.float() - v_ref.float()) ** 2).mean()
+        out["gate_loss"] = flow_weight * loss_distill  # gate only (the trainer drops its DiT gradients)
+        loss_gated, _ = run(keep.detach(), vl_embs_list, attention_mask)  # ④ gated, all tokens: VLM + DiT
+        out.update(loss_distill=loss_distill.detach(), loss_teacher=loss_ref.detach(), loss_gated=loss_gated.detach())
+        keep_mean = self._keep_stats(keep, gate_inputs["view_ids"])
+        for v in range(self.num_views):
+            out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
+        out["action_loss"] = total + flow_weight * loss_gated
+        return out
+
     def _predict(self, examples: List[dict]) -> dict:
         batch_images, instructions, state = self._prepare_inputs(examples)
+        if self.vlm_keep:
+            return self._vlm_keep_predict(examples, batch_images, instructions, state)
         vl_embs_list, attention_mask, gate_inputs = self._encode_vl_hidden_states(batch_images, instructions)
 
         device, dtype = vl_embs_list[-1].device, self._head_dtype()
+        gate_target = self._gate_target(examples, device)
+        if gate_target is not None:
+            gate_inputs["target"] = gate_target
         vl_embs_list = [h.to(dtype) for h in vl_embs_list]
         state_t = torch.as_tensor(state, device=device, dtype=dtype) if state is not None else None
 
         out = {}
         encoder_mask = attention_mask
+        probe = None
         if self.gate_enabled:
-            keep = self._gate_keep(gate_inputs, attention_mask)
+            keep, logits = self._gate_keep(gate_inputs, attention_mask, return_logits=True)
             encoder_mask = self._cross_attention_bias(attention_mask, keep, dtype)
             out["keep_maps"] = self._keep_maps(keep, gate_inputs)
+            if logits is not None:
+                out["score_maps"] = self._keep_maps(self._frame_standardized(logits, gate_inputs), gate_inputs)
+            probe = CrossAttentionProbe(self.action_model.model, self.cross_layer_ids)
+            probe.__enter__()
         if self.anchor_enabled:
             logits = self.anchor_classifier(gate_inputs["query_hidden"].to(self.anchor_classifier[0].weight.dtype))
             reference, ids, weights = self._anchor_reference(logits)
@@ -830,10 +1153,61 @@ class Qwen_Drive_PI(baseframework):
             pred_actions = self._normalize_actions(pred_m)
         else:
             pred_actions = self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=encoder_mask)
+        if probe is not None:
+            probe.__exit__()
+            self._add_attention_outputs(out, probe.mean(), gate_inputs, attention_mask, "")
+            gate_cfg = self.config.framework.eye_gate
+            if self.gate_mode == "learned" and str(gate_cfg.get("scheme", "standard")) == "textdrop":
+                # the gate's training path ③: gated, text tokens hidden from the DiT
+                visual_mask = attention_mask & (gate_inputs["view_ids"] >= 0)
+                with CrossAttentionProbe(self.action_model.model, self.cross_layer_ids) as probe_td:
+                    drop = self.action_model.predict_action(
+                        vl_embs_list, state_t, encoder_attention_mask=self._cross_attention_bias(visual_mask, keep, dtype)
+                    )
+                self._add_attention_outputs(out, probe_td.mean(), gate_inputs, attention_mask, "_textdrop")
+                out["normalized_actions_textdrop"] = drop.float().cpu().numpy()
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred_actions.float().cpu().numpy()
         return out
+
+    def _vlm_keep_predict(self, examples, batch_images, instructions, state) -> dict:
+        """Inference path B: tokens with m < removal_threshold removed in the VLM and the DiT, others unmasked."""
+        prep = self._vlm_keep_prepare(batch_images, instructions, examples)
+        gi, attn, visual = prep["gate_inputs"], prep["attention_mask"], prep["visual"]
+        keep, logits = self._gate_keep(gi, attn, return_logits=True)
+        hard = torch.where(visual, (keep >= self._removal_tau()).to(keep.dtype), torch.ones_like(keep))
+        dtype = self._head_dtype()
+        vl = [h.to(dtype) for h in prep["run"](hard)]
+        state_t = torch.as_tensor(state, device=keep.device, dtype=dtype) if state is not None else None
+        out = {"keep_maps": self._keep_maps(keep, gi), "removed_maps": self._keep_maps(1 - hard, gi)}
+        out["score_maps"] = self._keep_maps(self._frame_standardized(logits, gi), gi)
+        with CrossAttentionProbe(self.action_model.model, self.cross_layer_ids) as probe:
+            pred = self.action_model.predict_action(vl, state_t, encoder_attention_mask=self._cross_attention_bias(attn, hard, dtype))
+        self._add_attention_outputs(out, probe.mean(), gi, attn, "")
+        if self.action_clip is not None:
+            pred = pred.clamp(-float(self.action_clip), float(self.action_clip))
+        out["normalized_actions"] = pred.float().cpu().numpy()
+        return out
+
+    def _frame_standardized(self, logits: torch.Tensor, gate_inputs: dict) -> torch.Tensor:
+        """Gate scores (concatenated visual tokens of the batch) -> (B, L) with each frame's scores standardised
+        (the z of budgeted_keep), 0 on non-visual tokens."""
+        view_ids = gate_inputs["view_ids"]
+        visual = view_ids >= 0
+        z = torch.zeros(view_ids.shape, dtype=torch.float32, device=view_ids.device)
+        z[visual] = logits.float()
+        for b in range(z.shape[0]):
+            for v in view_ids[b][visual[b]].unique():
+                sel = view_ids[b] == v
+                z[b, sel] = (z[b, sel] - z[b, sel].mean()) / (z[b, sel].std() + 1e-6)
+        return z
+
+    def _add_attention_outputs(self, out: dict, attn: torch.Tensor, gate_inputs: dict, attention_mask, suffix: str):
+        """Per-frame maps of the DiT cross-attention mass and its share on the text tokens."""
+        visual = gate_inputs["view_ids"] >= 0
+        out[f"attn_maps{suffix}"] = self._keep_maps(attn, gate_inputs)
+        out[f"attn_text_mass{suffix}"] = (attn * ((~visual) & attention_mask)).sum(1).float().cpu().numpy()
 
     def _keep_maps(self, keep: torch.Tensor, gate_inputs: dict) -> List[List[np.ndarray]]:
         """Per sample, per frame keep map of shape (h, w) in merged-token units (for visualisation)."""

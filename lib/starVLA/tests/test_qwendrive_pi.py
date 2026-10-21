@@ -76,13 +76,13 @@ def tiny_qwen_drive_dir(tmp_path_factory):
     return out, model
 
 
-def _make_cfg(base_vlm: str, eye_gate: dict = None, anchor: dict = None):
+def _make_cfg(base_vlm: str, eye_gate: dict = None, anchor: dict = None, drive: dict = None):
     return OmegaConf.create(
         {
             "framework": {
                 "name": "QwenDrivePI",
                 "qwenvl": {"base_vlm": base_vlm, "attn_implementation": "sdpa"},
-                "drive": {"current_image_pixels": 128 * 64, "history_image_pixels": 64 * 32},
+                "drive": {"current_image_pixels": 128 * 64, "history_image_pixels": 64 * 32, **(drive or {})},
                 "eye_gate": eye_gate or {"enabled": False},
                 "anchor": anchor or {"enabled": False},
             },
@@ -235,6 +235,219 @@ def test_eye_gate_open_matches_ungated(tiny_qwen_drive_dir):
     torch.manual_seed(123)
     c = closed.predict_action([sample])["normalized_actions"]
     assert not np.allclose(a, c, atol=1e-3)
+
+
+def test_text_first_visual_only_gate_distill(tiny_qwen_drive_dir):
+    """[text, images] order, DiT cross-attention on visual tokens only, gate trained only by the distillation loss."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "gated_loss": "distill", "gated_grad": "gate"}
+    model = build_framework(_make_cfg(str(path), gate, drive={"text_first": True, "dit_visual_only": True})).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng), _sample(rng)]
+
+    images, instructions, _ = model._prepare_inputs(batch)
+    _, attn, gi = model._encode_vl_hidden_states(images, instructions)
+    visual = gi["view_ids"] >= 0
+    assert torch.equal(attn, attn & visual) and attn.any()  # the expert sees visual tokens only
+    pos = torch.arange(visual.shape[1])[None].expand_as(visual)
+    first_visual = pos[visual.cumsum(1) == 1].view(-1)
+    assert gi["text_mask"].any(1).all()
+    assert bool((pos[gi["text_mask"]].view(-1) < first_visual.repeat_interleave(gi["text_mask"].sum(1))).all())
+    bias = model._cross_attention_bias(attn, model._gate_keep(gi, attn), torch.float32)
+    assert torch.isinf(bias[~visual]).all() and torch.isfinite(bias[visual]).all()
+
+    out = model(batch)
+    for key in ("gate_loss", "loss_distill", "loss_gated", "loss_full", "keep_xsample_std"):
+        assert key in out, key
+    assert out["loss_distill"] > 0
+    gate_params = list(model.eye_gate.parameters())
+    vlm_params = [p for p in model.qwen_vl_interface.parameters() if p.requires_grad]
+    out["gate_loss"].backward()  # gate path: reaches the gate, never the VLM / projectors
+    assert all(p.grad is not None for p in gate_params)
+    assert all(p.grad is None for p in vlm_params)
+    assert all(p.grad is None for p in model.project_layers.parameters())
+    gate_grads = [p.grad.clone() for p in gate_params]
+    out["action_loss"].backward()  # full path: VLM + DiT, nothing on the gate
+    assert any(p.grad is not None for p in vlm_params)
+    assert all(torch.equal(p.grad, g) for p, g in zip(gate_params, gate_grads))
+
+    model.eval()
+    pred = model.predict_action([_sample(rng)])
+    assert np.all(np.isfinite(pred["normalized_actions"]))
+
+
+def test_gate_position_centering(tiny_qwen_drive_dir):
+    """h_p − μ_p removes what every sample shares at a position; the model runs with it."""
+    from starVLA.model.framework.base_framework import build_framework
+    from starVLA.model.framework.VLM4A.QwenDrivePI import ViewGate
+
+    gate = ViewGate(8, 16, 0.2, position_slots=32).train()
+    torch.manual_seed(0)
+    pattern = torch.randn(1, 10, 8) * 50  # position-only component (e.g. rows / sequence position)
+    content = torch.randn(4, 10, 8)
+    out = gate.center_positions(pattern + content)  # first update: μ = batch mean
+    assert torch.allclose(out, content - content.mean(0, keepdim=True), atol=1e-4)
+    with pytest.raises(ValueError):
+        gate.center_positions(torch.randn(4, 11, 8))  # the token grid must stay fixed
+
+    path, _ = tiny_qwen_drive_dir
+    cfg = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+           "gated_loss": "distill", "gated_grad": "gate", "position_center": True, "position_slots": 256}
+    model = build_framework(_make_cfg(str(path), cfg, drive={"text_first": True, "dit_visual_only": True})).float()
+    rng = np.random.default_rng(0)
+    out = model([_sample(rng), _sample(rng)])
+    assert bool(model.eye_gate.pos_initialized) and int(model.eye_gate.pos_count) > 0
+    out["gate_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.parameters())
+
+
+def test_textdrop_scheme_target_query(tiny_qwen_drive_dir):
+    """textdrop: gate (target-point query) trained only by the text-dropped distillation; VLM + DiT by the gated
+    all-token flow loss, with the gate fixed there."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "query": "target", "scheme": "textdrop"}
+    model = build_framework(_make_cfg(str(path), gate)).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng), _sample(rng)]
+    for b, xy in zip(batch, ([20.0, 5.0], [24.0, -3.0])):
+        b["meta"] = {"target_xy": np.array(xy, np.float32)}
+    out = model(batch)
+    for key in ("gate_loss", "loss_distill", "loss_teacher", "loss_gated"):
+        assert key in out, key
+    gate_params = list(model.eye_gate.parameters())
+    vlm_params = [p for p in model.qwen_vl_interface.parameters() if p.requires_grad]
+    out["gate_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.target_embed.parameters())
+    assert all(p.grad is None for p in vlm_params)
+    gate_grads = [None if p.grad is None else p.grad.clone() for p in gate_params]
+    out["action_loss"].backward()
+    assert any(p.grad is not None for p in vlm_params)
+    assert all((g is None and p.grad is None) or torch.equal(p.grad, g) for p, g in zip(gate_params, gate_grads))
+
+    # eval outputs: gate scores, DiT attention of the inference path and of the text-dropped path
+    model.eval()
+    pred = model.predict_action([_sample(rng) | {"meta": {"target_xy": np.array([20.0, 0.0], np.float32)}}])
+    for key in ("score_maps", "attn_maps", "attn_maps_textdrop", "attn_text_mass", "attn_text_mass_textdrop",
+                "normalized_actions_textdrop"):
+        assert key in pred, key
+    assert pred["attn_text_mass_textdrop"][0] < 1e-6 < pred["attn_text_mass"][0] < 1.0
+    vis_attn = sum(float(m.sum()) for m in pred["attn_maps"][0])
+    assert abs(vis_attn + pred["attn_text_mass"][0] - 1.0) < 1e-3  # attention sums to 1 over the tokens
+    assert abs(sum(float(m.sum()) for m in pred["attn_maps_textdrop"][0]) - 1.0) < 1e-3
+
+    # the mask depends on the target point
+    sample = _sample(rng)
+    maps = []
+    for xy in ([20.0, 10.0], [20.0, -10.0]):
+        sample["meta"] = {"target_xy": np.array(xy, np.float32)}
+        maps.append(model.predict_action([sample])["keep_maps"][0][1])
+    assert not np.allclose(maps[0], maps[1])
+
+
+def test_gate_signal_measure(tiny_qwen_drive_dir):
+    """examples/drive/PAI-AV/gate_signal.py: losses of learned / random / uniform / oracle masks on one sample."""
+    import sys
+    from pathlib import Path
+
+    from starVLA.model.framework.base_framework import build_framework
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "drive" / "PAI-AV"))
+    from gate_signal import measure
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "query": "target", "scheme": "textdrop"}
+    model = build_framework(_make_cfg(str(path), gate)).float().eval().requires_grad_(False)
+    ex = _sample(np.random.default_rng(0)) | {"meta": {"target_xy": np.array([20.0, 3.0], np.float32)}}
+    res, learned, oracle, gl = measure(model, ex, draws=2, permutations=2, oracle_steps=5, oracle_lr=0.3)
+    for k in ("learned", "random", "uniform", "oracle", "adv_learned", "adv_oracle"):
+        assert np.isfinite(res[k]), k
+    assert learned.shape == oracle.shape
+    for v in gl.frames.unique():  # same mask family: mean keep = budget per frame
+        assert abs(float(oracle[gl.frames == v].mean()) - gl.budget) < 1e-3
+
+
+def test_visual_keep_blocks_token(tiny_qwen_drive_dir):
+    """keep 1 = unmodified language model; keep 0 on token p: nothing of p reaches any other token (softmax attention
+    and Gated DeltaNet layers), i.e. the other tokens' outputs do not depend on p's embedding."""
+    from starVLA.model.modules.vlm.visual_keep import attach
+
+    _, ref = tiny_qwen_drive_dir
+    lm = ref.model.language_model.float().eval()
+    attach(lm)
+    torch.manual_seed(0)
+    length, p = 12, 5
+    emb = torch.randn(1, length, lm.config.hidden_size)
+    other = emb.clone()
+    other[0, p] = torch.randn(lm.config.hidden_size) * 3
+    pos = torch.arange(length)[None]
+    keep = torch.ones(1, length)
+    keep[0, p] = 0.0
+    idx = [i for i in range(length) if i != p]
+    with torch.no_grad():
+        base = lm(inputs_embeds=emb, position_ids=pos).last_hidden_state
+        ones = lm(inputs_embeds=emb, position_ids=pos, visual_keep=torch.ones(1, length)).last_hidden_state
+        a = lm(inputs_embeds=emb, position_ids=pos, visual_keep=keep).last_hidden_state
+        b = lm(inputs_embeds=other, position_ids=pos, visual_keep=keep).last_hidden_state
+        c = lm(inputs_embeds=other, position_ids=pos).last_hidden_state
+        half = keep.clone()
+        half[0, p] = 0.5
+        d = lm(inputs_embeds=other, position_ids=pos, visual_keep=half).last_hidden_state
+    assert torch.allclose(ones, base, atol=1e-4)
+    assert torch.allclose(a[:, idx], b[:, idx], atol=1e-4)  # p's content does not reach the others
+    assert not torch.allclose(base[:, idx], c[:, idx], atol=1e-3)  # without the mask it does
+    gap = lambda x: float((x[:, idx] - b[:, idx]).abs().mean())  # noqa: E731
+    assert 0 < gap(d) < gap(c)  # a soft keep weight lets part of it through
+
+
+def test_visual_keep_gradient_checkpointing(tiny_qwen_drive_dir):
+    """The keep weights travel as a layer kwarg, so checkpoint recomputation sees the same weights."""
+    import copy
+
+    from starVLA.model.modules.vlm.visual_keep import attach
+
+    _, ref = tiny_qwen_drive_dir
+    grads = []
+    for ckpt in (False, True):
+        model = copy.deepcopy(ref).float().train()
+        if ckpt:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        lm = model.model.language_model
+        attach(lm)
+        torch.manual_seed(0)
+        emb = torch.randn(1, 10, lm.config.hidden_size)
+        keep = torch.rand(1, 10).clamp(0.05, 1).requires_grad_(True)
+        lm(inputs_embeds=emb, position_ids=torch.arange(10)[None], visual_keep=keep).last_hidden_state.sum().backward()
+        grads.append(keep.grad.clone())
+    assert torch.allclose(grads[0], grads[1], atol=1e-4)
+
+
+def test_vlm_keep_scheme(tiny_qwen_drive_dir):
+    """scheme vlm_keep: three paths, the gate (pre-LLM image embeddings + target / speed) gets gradients."""
+    from starVLA.model.framework.base_framework import build_framework
+
+    path, _ = tiny_qwen_drive_dir
+    gate = {"enabled": True, "mode": "learned", "parameterization": "budgeted", "budget_loss_weight": 0.0,
+            "query": "target_speed", "scheme": "vlm_keep", "removal_warmup_steps": 0}
+    model = build_framework(_make_cfg(str(path), gate)).float()
+    rng = np.random.default_rng(0)
+    batch = [_sample(rng) | {"meta": {"target_xy": np.array(xy, np.float32), "v0": v}}
+             for xy, v in (([20.0, 4.0], 5.0), ([22.0, -6.0], 9.0))]
+    out = model(batch)
+    for key in ("loss_full", "loss_gated", "loss_removed", "removed_frac", "keep_view1"):
+        assert key in out and torch.isfinite(out[key]).all(), key
+    assert 0.2 < float(out["removed_frac"]) < 0.9
+    out["action_loss"].backward()
+    assert all(p.grad is not None for p in model.eye_gate.parameters() if p.requires_grad)
+    model.eval()
+    pred = model.predict_action([batch[0]])
+    assert np.all(np.isfinite(pred["normalized_actions"])) and "removed_maps" in pred
 
 
 def test_gate_input_standardization():
