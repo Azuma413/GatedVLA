@@ -12,7 +12,8 @@ wandb_project: starVLA_drive
 #   state  (5, 5): ego history [x, y, heading_rel, speed, acc_lon]; action (25, 2): [accel, curvature]
 # Where to go (e.g. which branch at an intersection) is then only available from the kept tokens, so the choice of
 # tokens changes the loss (unlike v5, where the target in the prompt made the mask irrelevant).
-# Stage 2 (eye_s2): target point also in the prompt, gate frozen. Start from a v2 baseline: PRETRAINED=<ckpt>.
+# Trained from the Qwen-Drive weights (no PRETRAINED): a v2 baseline already acts without the image.
+# Stage 2 (eye_s2): target point also in the prompt, gate frozen, from the stage-1 checkpoint.
 # norm_stats / eval index: prepare_paiav.py --state_mode traj --action_mode unicycle --no_state_target_point --action_horizon 25
 framework:
   name: QwenDrivePI

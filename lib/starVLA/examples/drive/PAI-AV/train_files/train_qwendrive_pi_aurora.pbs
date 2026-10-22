@@ -23,7 +23,7 @@
 #   MODE=eye_v3          v3 structure + gate trained only by distillation to the ungated path; PRETRAINED=<ckpt>
 #   MODE=eye_v4          v2 layout + gate with target-point query, distilled on the text-dropped path; PRETRAINED=<ckpt>
 #   MODE=eye_v5          v2 layout + mask inside the VLM (from the image embeddings) + token removal path; PRETRAINED=<ckpt>
-#   MODE=eye_s1          eye_v5 with the target point only in the gate (not in the prompt); PRETRAINED=<baseline ckpt>
+#   MODE=eye_s1          eye_v5 with the target point only in the gate (not in the prompt); from Qwen-Drive (no PRETRAINED)
 #   MODE=eye_s2          eye_s1 gate frozen + target point in the prompt; PRETRAINED=<eye_s1 checkpoint dir>
 #   MODE=anchor_s1       AnchorVLA stage 1 (VLM + classifier), control-space anchors (v2 layout)
 #   MODE=anchor_s2       AnchorVLA stage 2 (+ residual flow); PRETRAINED=<stage-1 checkpoint dir>
