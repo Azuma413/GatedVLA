@@ -37,6 +37,7 @@ datasets:
     data_root: /lus/flare/projects/RobustViT/hiratsuka/datasets/PhysicalAI-Autonomous-Vehicles
     stats_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2tp/norm_stats.json
     eval_index_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2tp/eval_samples_val.json
+    scene_index_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2tp/scene_samples_val.json   # figure-only scenes (prepare_scene_index.py)
     num_eval_samples: 240          # 80 left / 80 right / 80 straight (val split)
     target_distance: 25.0          # target point = first future ego position >= 25 m away
     state_mode: traj

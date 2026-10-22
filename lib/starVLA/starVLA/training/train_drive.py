@@ -154,6 +154,13 @@ def main():
     with open(dcfg.eval_index_path) as f:
         eval_samples = json.load(f)[: int(dcfg.get("num_eval_samples", 240))]
     eval_ds = PAIAVDriveDataset(dcfg.data_root, normalizer, samples=eval_samples, sampler=sampler_cfg, **image_kwargs)
+    # Figure-only scenes (traffic lights / stop signs / intersections, see prepare_scene_index.py): plotted at every
+    # eval, not part of the metrics.
+    scene_ds = None
+    if dcfg.get("scene_index_path"):
+        with open(dcfg.scene_index_path) as f:
+            scene_ds = PAIAVDriveDataset(dcfg.data_root, normalizer, samples=json.load(f), sampler=sampler_cfg,
+                                         **image_kwargs)
     log(f"train clips {len(train_ds)}, eval samples {len(eval_ds)}, world {world}, device {device}")
 
     bs = int(dcfg.per_device_batch_size)
@@ -355,10 +362,35 @@ def main():
                     thumb.thumbnail((640, 360))
                     rec.update(meta=meta, image=thumb, keep_map=None if kmaps is None else kmaps[-1])
                 records.append(rec)
+        scene_records = []
+        if scene_ds is not None:
+            s_shard = list(range(len(scene_ds)))[rank::world]
+            for b in range(math.ceil(math.ceil(len(scene_ds) / world) / eval_bs)):
+                ids = s_shard[b * eval_bs : (b + 1) * eval_bs]
+                real = len(ids)
+                if real == 0:  # keep collectives in lockstep across ranks
+                    ids = [s_shard[0] if s_shard else 0]
+                items = [scene_ds[i] for i in ids]
+                with autocast():
+                    pred_out = model(items, predict=True)
+                for j, (i, item) in enumerate(zip(ids[:real], items)):
+                    thumb = item["image"][-1].copy()
+                    thumb.thumbnail((640, 360))
+                    rec = {"idx": i, "meta": item["meta"], "image": thumb,
+                           "pred_xy": eval_ds.action_to_xy(pred_out["normalized_actions"][j], item["meta"]),
+                           "keep_map": pred_out["keep_maps"][j][-1] if "keep_maps" in pred_out else None}
+                    for key in ("score_maps", "attn_maps"):
+                        if key in pred_out:
+                            rec[key[:-5] + "_cur"] = pred_out[key][j][-1].astype(np.float32)
+                    scene_records.append(rec)
         if distributed:
             gathered = [None] * world
             dist.all_gather_object(gathered, records)
             records = [r for part in gathered for r in part]
+            if scene_ds is not None:
+                gathered = [None] * world
+                dist.all_gather_object(gathered, scene_records)
+                scene_records = [r for part in gathered for r in part]
         model.train()
         if not is_main:
             return
@@ -430,8 +462,25 @@ def main():
             image.save(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.png")
             if wandb is not None:
                 images[r["maneuver"]].append(wandb.Image(image, caption=title))
+        scene_images = []
+        if scene_records:
+            scene_dir = fig_dir / "scenes"
+            scene_dir.mkdir(exist_ok=True)
+            for r in sorted(scene_records, key=lambda x: x["idx"]):
+                sample = scene_ds.samples[r["idx"]]
+                title = f"{sample['caption'][:90]} | {r['meta']['clip_id'][:8]} t0={r['meta']['t0'] * 1e-6:.1f}s | step {step}"
+                extra_maps = [(name, r[key]) for name, key in (("gate score z", "score_cur"),
+                                                               ("DiT attention (gated, all tokens)", "attn_cur")) if key in r]
+                fig = plot_bev(r["meta"], r["pred_xy"], image=r["image"], title=title, keep_map=r["keep_map"],
+                               extra_maps=extra_maps)
+                image = fig_to_image(fig)
+                plt.close(fig)
+                image.save(scene_dir / f"scene_{r['idx']:03d}.png")
+                scene_images.append(wandb.Image(image, caption=title) if wandb is not None else None)
         if wandb is not None:
             payload.update({f"eval_bev/{m}": imgs for m, imgs in images.items() if imgs})
+            if scene_images:
+                payload["eval_scenes"] = scene_images
             wandb.log(payload)
 
     # ── checkpointing ─────────────────────────────────────────────────
