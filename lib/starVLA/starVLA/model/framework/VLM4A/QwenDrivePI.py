@@ -110,6 +110,12 @@ class QwenDrivePIDefaultConfig:
             # Cross-attention of the action expert reads the visual tokens only (text / template tokens masked), so
             # the expert gets the scene and the instruction only through the (gated) visual tokens.
             "dit_visual_only": False,
+            # Target point in the DiT state (traj state with state_target_point, target_x / target_y as the last two
+            # data channels): target_flag appends a presence channel (1 = target given), so that a dropped target
+            # (columns zeroed, flag 0) is not mistaken for a real one; set action_model.state_dim to the data channels
+            # + 1. target_dropout: probability per training sample that the target is dropped on the ungated path.
+            "target_flag": False,
+            "target_dropout": 0.0,
         }
     )
 
@@ -491,6 +497,8 @@ class Qwen_Drive_PI(baseframework):
             attach(self.qwen_vl_interface.model)
             self.register_buffer("keep_step", torch.zeros((), dtype=torch.long))  # training forwards (tau ramp)
         self.text_first = bool(drive_cfg.get("text_first", False))
+        self.target_flag = bool(drive_cfg.get("target_flag", False))
+        self.target_dropout = float(drive_cfg.get("target_dropout", 0.0))
         self.dit_visual_only = bool(drive_cfg.get("dit_visual_only", False))
         if self.gate_enabled:
             if str(gate_cfg.get("gated_loss", "flow")) not in ("flow", "distill"):
@@ -579,7 +587,15 @@ class Qwen_Drive_PI(baseframework):
         columns (the target enters the query once, as [x, y] / target_scale, so that it can be mirrored)."""
         data_cfg = self.config.get("datasets", {}).get("vla_data", {})
         with_target = str(data_cfg.get("state_mode", "drivemoe")) == "traj" and bool(data_cfg.get("state_target_point", True))
-        return int(self.config.framework.action_model.state_dim) - (2 if with_target else 0)
+        flag = bool(self.config.framework.drive.get("target_flag", False))
+        return int(self.config.framework.action_model.state_dim) - (2 if with_target else 0) - (1 if flag else 0)
+
+    def _flag_state(self, state: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
+        """(N, T, D) data state -> (N, T, D + 1): target columns (the last two) zeroed where ``present`` (N,) is 0,
+        and the presence flag appended."""
+        present = present.to(state.dtype)[:, None, None]
+        state = torch.cat([state[..., :-2], state[..., -2:] * present], dim=-1)
+        return torch.cat([state, present.expand(-1, state.shape[1], 1)], dim=-1)
 
     def _gate_target(self, examples: List[dict], device) -> Optional[torch.Tensor]:
         """(B, D) gate query vector: navigation target point / target_scale (eye_gate.query = target), + v0 /
@@ -939,6 +955,18 @@ class Qwen_Drive_PI(baseframework):
         state_t = None
         if state is not None:
             state_t = torch.as_tensor(state, device=device, dtype=dtype).repeat(repeat, 1, 1)
+        states = None
+        if self.target_flag and state_t is not None:
+            n = len(examples)
+            present = torch.ones(n, device=device)
+            if self.target_dropout > 0:
+                present = (torch.rand(n, device=device) >= self.target_dropout).float()
+            present = present.repeat(repeat)
+            states = {"dropped": self._flag_state(state_t, present), "present": present,
+                      "full": self._flag_state(state_t, torch.ones_like(present)),
+                      "none": self._flag_state(state_t, torch.zeros_like(present))}
+            state_t = states["dropped"]
+            out["target_present_frac"] = present.mean().detach()
 
         if not self.gate_enabled:
             flow = self.action_model(
@@ -952,6 +980,11 @@ class Qwen_Drive_PI(baseframework):
 
         # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
         gate_cfg = self.config.framework.eye_gate
+        if self.gate_mode == "learned" and str(gate_cfg.get("scheme", "standard")) == "three_path":
+            if states is None:
+                raise ValueError("eye_gate.scheme three_path needs drive.target_flag and a target point in the state")
+            return self._three_path_losses(out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, states,
+                                           repeat, device, dtype)
         if self.gate_mode == "learned" and str(gate_cfg.get("scheme", "standard")) == "textdrop":
             return self._textdrop_losses(out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, state_t,
                                          query_bias, flow_weight, loss_type, repeat, device, dtype)
@@ -1090,6 +1123,48 @@ class Qwen_Drive_PI(baseframework):
         out["action_loss"] = total
         return out
 
+    def _three_path_losses(self, out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, states, repeat,
+                           device, dtype) -> dict:
+        """eye_gate.scheme = three_path. One VLM forward; mask on the DiT cross-attention; same (noise, t) for all:
+        A  ungated, target dropped with p = drive.target_dropout   -> flow matching      -> VLM + DiT
+        B  gated (m fixed), target given                           -> |v_B - sg v_A|^2   -> DiT
+        C  gated (m), no target (the gate still sees it)           -> |v_C - sg v_A|^2   -> gate only
+        B / C are distilled on the samples whose A path had the target. Inference uses B."""
+        gate_in = dict(gate_inputs, final_hidden=gate_inputs["final_hidden"].detach())
+        keep, gate_logits = self._gate_keep(gate_in, attention_mask, return_logits=True)
+        noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
+        t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
+
+        def run(keep_or_none, embs, state):
+            bias = self._cross_attention_bias(attention_mask, keep_or_none, dtype).repeat(repeat, 1)
+            return self.action_model(embs, flow_target, state, encoder_attention_mask=bias, noise=noise, t=t,
+                                     return_velocity=True)
+
+        loss_a, v_a = run(None, vl_embs_list, states["dropped"])
+        teacher, w = v_a.detach().float(), states["present"]
+
+        def distill(v):
+            per = ((v.float() - teacher) ** 2).mean(dim=(1, 2))
+            return (per * w).sum() / w.sum().clamp(min=1.0)
+
+        detached = [h.detach() for h in vl_embs_list]
+        _, v_b = run(keep.detach(), detached, states["full"])
+        _, v_c = run(keep, detached, states["none"])
+        loss_b, loss_c = distill(v_b), distill(v_c)
+        out["gate_loss"] = loss_c  # gate only (the trainer drops its DiT gradients)
+        with torch.no_grad():  # same loss with the keep values at random places: > loss_c when the placement matters
+            _, v_r = run(self._shuffled_keep(keep.detach(), gate_inputs["view_ids"]), detached, states["none"])
+            out["loss_c_random"] = distill(v_r)
+            _, v_n = run(None, detached, states["none"])  # ungated, no target: what C starts from
+            out["loss_c_nomask"] = distill(v_n)
+        out.update(loss_a=loss_a.detach(), loss_b=loss_b.detach(), loss_c=loss_c.detach(),
+                   gate_score_std=gate_logits.detach().std())
+        keep_mean = self._keep_stats(keep, gate_inputs["view_ids"])
+        for v in range(self.num_views):
+            out[f"keep_view{v}"] = keep_mean[:, v].mean().detach()
+        out["action_loss"] = total + loss_a + loss_b
+        return out
+
     def _textdrop_losses(self, out, total, gate_inputs, attention_mask, vl_embs_list, flow_target, state_t,
                          query_bias, flow_weight, loss_type, repeat, device, dtype) -> dict:
         """eye_gate.scheme = textdrop (see QwenDrivePIDefaultConfig.eye_gate)."""
@@ -1144,6 +1219,10 @@ class Qwen_Drive_PI(baseframework):
             gate_inputs["target"] = gate_target
         vl_embs_list = [h.to(dtype) for h in vl_embs_list]
         state_t = torch.as_tensor(state, device=device, dtype=dtype) if state is not None else None
+        state_none = None
+        if self.target_flag and state_t is not None:  # inference: target given; the controls also run without it
+            ones = torch.ones(state_t.shape[0], device=device)
+            state_t, state_none = self._flag_state(state_t, ones), self._flag_state(state_t, torch.zeros_like(ones))
 
         out = {}
         encoder_mask = attention_mask
@@ -1204,7 +1283,8 @@ class Qwen_Drive_PI(baseframework):
                 self._add_attention_outputs(out, probe_td.mean(), gate_inputs, attention_mask, "_textdrop")
                 out["normalized_actions_textdrop"] = drop.float().cpu().numpy()
         if controls:
-            out["control_actions"] = self._soft_mask_controls(vl_embs_list, state_t, attention_mask, gate_inputs, keep, noise)
+            out["control_actions"] = self._soft_mask_controls(vl_embs_list, state_t, attention_mask, gate_inputs, keep, noise,
+                                                              state_none)
             # noimage: every input frame replaced by a black frame of the same size (VLM re-run, no mask): whether the
             # policy uses the image at all, including through the text tokens that attend to it inside the VLM
             black = [[Image.new("RGB", img.size) for img in frames] for frames in batch_images]
@@ -1231,12 +1311,15 @@ class Qwen_Drive_PI(baseframework):
                 out[b, idx] = keep[b, idx[torch.randperm(len(idx), generator=gen).to(idx.device)]]
         return out
 
-    def _soft_mask_controls(self, vl_embs_list, state_t, attention_mask, gate_inputs, keep, noise) -> dict:
+    def _soft_mask_controls(self, vl_embs_list, state_t, attention_mask, gate_inputs, keep, noise, state_none=None) -> dict:
         """Eval controls of the soft mask on the DiT cross-attention, with the noise of the main prediction:
         full     no mask;
         random   per frame, the learned keep values shuffled over the frame's tokens (same values, random places);
         mirror   the mask the gate gives for the target mirrored left / right (y -> -y; target queries only);
-        blind    every image token removed (keep 0): how much the policy uses the image at all."""
+        blind    every image token removed (keep 0): how much the policy uses the image at all;
+        with a target flag in the state (state_none: target dropped), also without the target in the DiT:
+        notarget        no mask;  gate_only  the learned mask (the target reaches the policy only through it);
+        gate_only_random  the learned keep values at random places."""
         dtype = self._head_dtype()
         rand = self._shuffled_keep(keep, gate_inputs["view_ids"], torch.Generator(device="cpu").manual_seed(0))
         blind = torch.where(gate_inputs["view_ids"] >= 0, torch.zeros_like(keep), torch.ones_like(keep))
@@ -1245,10 +1328,13 @@ class Qwen_Drive_PI(baseframework):
             flip = torch.ones(gate_inputs["target"].shape[1], device=keep.device)
             flip[1] = -1.0
             masks.append(("mirror", self._gate_keep(dict(gate_inputs, target=gate_inputs["target"] * flip), attention_mask)))
+        runs = [(name, mask, state_t) for name, mask in masks]
+        if state_none is not None:
+            runs += [("notarget", None, state_none), ("gate_only", keep, state_none), ("gate_only_random", rand, state_none)]
         out = {}
-        for name, mask in masks:
+        for name, mask, state in runs:
             pred = self.action_model.predict_action(
-                vl_embs_list, state_t, encoder_attention_mask=self._cross_attention_bias(attention_mask, mask, dtype),
+                vl_embs_list, state, encoder_attention_mask=self._cross_attention_bias(attention_mask, mask, dtype),
                 noise=noise,
             )
             if self.action_clip is not None:
