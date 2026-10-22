@@ -25,6 +25,9 @@
 #   MODE=eye_v5          v2 layout + mask inside the VLM (from the image embeddings) + token removal path; PRETRAINED=<ckpt>
 #   MODE=eye_s1          eye_v5 with the target point only in the gate (not in the prompt); from Qwen-Drive (no PRETRAINED)
 #   MODE=eye_s2          eye_s1 gate frozen + target point in the prompt; PRETRAINED=<eye_s1 checkpoint dir>
+#   MODE=baseline_tp     tp layout (target point + proprio in the DiT state, prompt without target / speed), no gate
+#   MODE=eye_distill_tp  tp layout + gate on the DiT cross-attention, L_full (VLM + DiT) + distillation to the
+#                        ungated velocity (gate + DiT); query = target point + ego state
 #   MODE=anchor_s1       AnchorVLA stage 1 (VLM + classifier), control-space anchors (v2 layout)
 #   MODE=anchor_s2       AnchorVLA stage 2 (+ residual flow); PRETRAINED=<stage-1 checkpoint dir>
 #   MODE=anchor_eye_s2   AnchorVLA stage 2 + eye gate;      PRETRAINED=<stage-1 checkpoint dir>
@@ -50,10 +53,12 @@ case "${MODE}" in
   eye_v5)        DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_v5_h25.yaml ;;
   eye_s1)        DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_s1_h25.yaml ;;
   eye_s2)        DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_s2_h25.yaml ;;
+  baseline_tp)   DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_tp_h25.yaml ;;
+  eye_distill_tp) DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_eye_distill_tp_h25.yaml ;;
   anchor_s1)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s1_v2_h25.yaml ;;
   anchor_s2)     DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_s2_v2_h25.yaml ;;
   anchor_eye_s2) DEFAULT_CONFIG=${TF}/starvla_qwendrive_pi_paiav_anchor_eye_s2_v2_h25.yaml ;;
-  *) echo "unknown MODE=${MODE} (baseline | eye | baseline_v3 | eye_v3 | eye_v4 | eye_v5 | eye_s1 | eye_s2 | anchor_s1 | anchor_s2 | anchor_eye_s2)"; exit 2 ;;
+  *) echo "unknown MODE=${MODE} (baseline | eye | baseline_v3 | eye_v3 | eye_v4 | eye_v5 | eye_s1 | eye_s2 | baseline_tp | eye_distill_tp | anchor_s1 | anchor_s2 | anchor_eye_s2)"; exit 2 ;;
 esac
 CONFIG=${CONFIG:-${DEFAULT_CONFIG:-${TF}/starvla_qwendrive_pi_paiav.yaml}}
 NPROC=${NPROC:-12}

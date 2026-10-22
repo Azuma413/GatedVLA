@@ -147,7 +147,8 @@ class QwenDrivePIDefaultConfig:
             # only on the position (e.g. row stripes) is then impossible. Needs a fixed token grid.
             "position_center": False,
             # Gate query q: "text" (mean of the text-token hidden) or "target" (MLP embedding of the navigation target
-            # point (x, y) / target_scale, read from the sample's meta["target_xy"]).
+            # point (x, y) / target_scale, read from the sample's meta["target_xy"]), "target_speed" (+ v0 / speed_scale)
+            # or "target_state" (+ the flattened normalised ego state the DiT gets, without its target columns).
             "query": "text",
             "target_scale": 25.0,
             # "standard": losses above. "textdrop": per step (all from one VLM forward)
@@ -469,7 +470,7 @@ class Qwen_Drive_PI(baseframework):
                 llm_hidden_size, int(gate_cfg.hidden_dim), float(gate_cfg.init_keep),
                 standardize=bool(gate_cfg.get("standardize_inputs", True)),
                 position_slots=int(gate_cfg.get("position_slots", 2048)) if bool(gate_cfg.get("position_center", False)) else 0,
-                target_query={"text": 0, "target": 2, "target_speed": 3}[str(gate_cfg.get("query", "text"))],
+                target_query=self._gate_query_dim(),
             )
 
         anchor_cfg = self.config.framework.anchor
@@ -566,10 +567,25 @@ class Qwen_Drive_PI(baseframework):
             v0 = v0[:, None].expand(-1, a.shape[1])
         return unicycle_rollout(a, v0, self.anchor_dt)
 
+    def _gate_query_dim(self) -> int:
+        """Size of the gate's query vector (0: mean of the text-token hidden)."""
+        query = str(self.config.framework.eye_gate.get("query", "text"))
+        if query == "target_state":
+            return 2 + int(self.config.framework.action_model.state_horizon) * self._gate_state_dim()
+        return {"text": 0, "target": 2, "target_speed": 3}[query]
+
+    def _gate_state_dim(self) -> int:
+        """Per-step ego-state channels in the target_state gate query: the DiT state without its target-point
+        columns (the target enters the query once, as [x, y] / target_scale, so that it can be mirrored)."""
+        data_cfg = self.config.get("datasets", {}).get("vla_data", {})
+        with_target = str(data_cfg.get("state_mode", "drivemoe")) == "traj" and bool(data_cfg.get("state_target_point", True))
+        return int(self.config.framework.action_model.state_dim) - (2 if with_target else 0)
+
     def _gate_target(self, examples: List[dict], device) -> Optional[torch.Tensor]:
-        """(B, 2) navigation target point / target_scale for the gate query (eye_gate.query = target)."""
+        """(B, D) gate query vector: navigation target point / target_scale (eye_gate.query = target), + v0 /
+        speed_scale (target_speed), or + the flattened normalised ego state without its target columns (target_state)."""
         gate_cfg = self.config.framework.eye_gate
-        if not (self.gate_enabled and str(gate_cfg.get("query", "text")) in ("target", "target_speed")):
+        if not (self.gate_enabled and str(gate_cfg.get("query", "text")) in ("target", "target_speed", "target_state")):
             return None
         if "target_xy" in examples[0]:
             xy = [ex["target_xy"] for ex in examples]
@@ -579,6 +595,10 @@ class Qwen_Drive_PI(baseframework):
         if str(gate_cfg.get("query", "text")) == "target_speed":
             v0 = self._current_speed(examples, device)[:, None] / float(gate_cfg.get("speed_scale", 20.0))
             xy = torch.cat([xy, v0], dim=1)
+        elif str(gate_cfg.get("query", "text")) == "target_state":
+            n = self._gate_state_dim()
+            state = np.stack([np.asarray(ex["state"], dtype=np.float32)[..., :n].reshape(-1) for ex in examples])
+            xy = torch.cat([xy, torch.as_tensor(state, device=device)], dim=1)
         return xy
 
     @staticmethod
@@ -964,6 +984,13 @@ class Qwen_Drive_PI(baseframework):
         if distill:
             loss_gate = ((v_gated.float() - v_full.detach().float()) ** 2).mean()
             out["loss_distill"] = loss_gate.detach()
+            if bool(gate_cfg.get("eval_controls", False)):
+                # same distillation loss with the keep values moved to random positions: > loss_distill when the
+                # learned placement matters (no gradient)
+                with torch.no_grad():
+                    rand = self._shuffled_keep(keep.detach(), gate_inputs["view_ids"])
+                    _, v_rand = flow_loss(rand, [h.detach() for h in gated_embs])
+                    out["loss_distill_random"] = ((v_rand.float() - v_full.float()) ** 2).mean()
         else:
             loss_gate = loss_gated
         if gated_grad == "gate":
@@ -1129,6 +1156,11 @@ class Qwen_Drive_PI(baseframework):
                 out["score_maps"] = self._keep_maps(self._frame_standardized(logits, gate_inputs), gate_inputs)
             probe = CrossAttentionProbe(self.action_model.model, self.cross_layer_ids)
             probe.__enter__()
+        # eval controls of the soft mask (see _soft_mask_controls), paired with the main prediction by its noise
+        controls = (self.gate_enabled and self.gate_mode == "learned" and not self.anchor_enabled
+                    and bool(self.config.framework.eye_gate.get("eval_controls", False)))
+        noise = torch.randn((len(examples), self.action_horizon, self.action_model.action_dim),
+                            device=device, dtype=dtype) if controls else None
         if self.anchor_enabled:
             logits = self.anchor_classifier(gate_inputs["query_hidden"].to(self.anchor_classifier[0].weight.dtype))
             reference, ids, weights = self._anchor_reference(logits)
@@ -1155,7 +1187,9 @@ class Qwen_Drive_PI(baseframework):
                 pred_m = reference + residual.float() * self.residual_std
             pred_actions = self._normalize_actions(pred_m)
         else:
-            pred_actions = self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=encoder_mask)
+            pred_actions = self.action_model.predict_action(
+                vl_embs_list, state_t, encoder_attention_mask=encoder_mask, noise=noise
+            )
         if probe is not None:
             probe.__exit__()
             self._add_attention_outputs(out, probe.mean(), gate_inputs, attention_mask, "")
@@ -1169,9 +1203,45 @@ class Qwen_Drive_PI(baseframework):
                     )
                 self._add_attention_outputs(out, probe_td.mean(), gate_inputs, attention_mask, "_textdrop")
                 out["normalized_actions_textdrop"] = drop.float().cpu().numpy()
+        if controls:
+            out["control_actions"] = self._soft_mask_controls(vl_embs_list, state_t, attention_mask, gate_inputs, keep, noise)
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred_actions.float().cpu().numpy()
+        return out
+
+    @staticmethod
+    def _shuffled_keep(keep: torch.Tensor, view_ids: torch.Tensor, gen: Optional[torch.Generator] = None) -> torch.Tensor:
+        """Per frame, the keep values moved to random token positions (same values, so the same budget / contrast)."""
+        visual = view_ids >= 0
+        out = keep.clone()
+        for b in range(keep.shape[0]):
+            for v in view_ids[b][visual[b]].unique():
+                idx = (view_ids[b] == v).nonzero().squeeze(1)
+                out[b, idx] = keep[b, idx[torch.randperm(len(idx), generator=gen).to(idx.device)]]
+        return out
+
+    def _soft_mask_controls(self, vl_embs_list, state_t, attention_mask, gate_inputs, keep, noise) -> dict:
+        """Eval controls of the soft mask on the DiT cross-attention, with the noise of the main prediction:
+        full     no mask;
+        random   per frame, the learned keep values shuffled over the frame's tokens (same values, random places);
+        mirror   the mask the gate gives for the target mirrored left / right (y -> -y; target queries only)."""
+        dtype = self._head_dtype()
+        rand = self._shuffled_keep(keep, gate_inputs["view_ids"], torch.Generator(device="cpu").manual_seed(0))
+        masks = [("full", None), ("random", rand)]
+        if "target" in gate_inputs:
+            flip = torch.ones(gate_inputs["target"].shape[1], device=keep.device)
+            flip[1] = -1.0
+            masks.append(("mirror", self._gate_keep(dict(gate_inputs, target=gate_inputs["target"] * flip), attention_mask)))
+        out = {}
+        for name, mask in masks:
+            pred = self.action_model.predict_action(
+                vl_embs_list, state_t, encoder_attention_mask=self._cross_attention_bias(attention_mask, mask, dtype),
+                noise=noise,
+            )
+            if self.action_clip is not None:
+                pred = pred.clamp(-float(self.action_clip), float(self.action_clip))
+            out[name] = pred.float().cpu().numpy()
         return out
 
     def _vlm_keep_predict(self, examples, batch_images, instructions, state) -> dict:
