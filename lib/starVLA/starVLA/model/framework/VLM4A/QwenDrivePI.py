@@ -1205,6 +1205,16 @@ class Qwen_Drive_PI(baseframework):
                 out["normalized_actions_textdrop"] = drop.float().cpu().numpy()
         if controls:
             out["control_actions"] = self._soft_mask_controls(vl_embs_list, state_t, attention_mask, gate_inputs, keep, noise)
+            # noimage: every input frame replaced by a black frame of the same size (VLM re-run, no mask): whether the
+            # policy uses the image at all, including through the text tokens that attend to it inside the VLM
+            black = [[Image.new("RGB", img.size) for img in frames] for frames in batch_images]
+            vl_black, mask_black, _ = self._encode_vl_hidden_states(black, instructions)
+            pred = self.action_model.predict_action(
+                [h.to(dtype) for h in vl_black], state_t, encoder_attention_mask=mask_black, noise=noise
+            )
+            if self.action_clip is not None:
+                pred = pred.clamp(-float(self.action_clip), float(self.action_clip))
+            out["control_actions"]["noimage"] = pred.float().cpu().numpy()
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred_actions.float().cpu().numpy()
