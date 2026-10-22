@@ -42,7 +42,8 @@ framework:
     query: target_state
     gated_loss: distill
     gated_grad: gate_dit
-    eval_controls: true            # eval/full, eval/random (keep values shuffled), eval/mirror (target y -> -y);
+    eval_controls: true            # eval/full, eval/random (keep values shuffled), eval/mirror (target y -> -y),
+                                   # eval/blind (all image tokens removed);
                                    # train/loss_distill_random (same loss with the keep values shuffled)
   action_model:
     action_dim: 2

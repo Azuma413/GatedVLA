@@ -1225,10 +1225,12 @@ class Qwen_Drive_PI(baseframework):
         """Eval controls of the soft mask on the DiT cross-attention, with the noise of the main prediction:
         full     no mask;
         random   per frame, the learned keep values shuffled over the frame's tokens (same values, random places);
-        mirror   the mask the gate gives for the target mirrored left / right (y -> -y; target queries only)."""
+        mirror   the mask the gate gives for the target mirrored left / right (y -> -y; target queries only);
+        blind    every image token removed (keep 0): how much the policy uses the image at all."""
         dtype = self._head_dtype()
         rand = self._shuffled_keep(keep, gate_inputs["view_ids"], torch.Generator(device="cpu").manual_seed(0))
-        masks = [("full", None), ("random", rand)]
+        blind = torch.where(gate_inputs["view_ids"] >= 0, torch.zeros_like(keep), torch.ones_like(keep))
+        masks = [("full", None), ("random", rand), ("blind", blind)]
         if "target" in gate_inputs:
             flip = torch.ones(gate_inputs["target"].shape[1], device=keep.device)
             flip[1] = -1.0
