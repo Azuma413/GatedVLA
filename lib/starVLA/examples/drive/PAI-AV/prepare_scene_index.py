@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from starVLA.dataloader.pai_av_drive import ClipStore, DriveSampler, EgoTrack, load_clip_table
+from starVLA.dataloader.pai_av_drive import ClipStore, DriveSampler, EgoTrack, Normalizer, PAIAVDriveDataset, load_clip_table
 
 PATTERN = re.compile(r"traffic light|red light|green light|yellow light|signal|stop sign|intersection", re.I)
 
@@ -32,7 +32,8 @@ def main():
     p.add_argument("--max_samples", type=int, default=48)
     args = p.parse_args()
 
-    sampler_cfg = json.loads(Path(args.stats_path).read_text())["sampler"]
+    stats = json.loads(Path(args.stats_path).read_text())
+    sampler_cfg = stats["sampler"]
     sampler = DriveSampler(**{k: v for k, v in sampler_cfg.items() if k in DriveSampler.__init__.__code__.co_varnames})
     reasoning = pd.read_parquet(Path(args.data_root) / "reasoning" / "ood_reasoning.parquet")
     reasoning = reasoning[reasoning.split == args.split]
@@ -62,7 +63,16 @@ def main():
             t0 = min(max(float(e["event_start_timestamp"]), lo), hi)
             samples.append({"clip_id": clip_id, "chunk": chunk, "t0": t0, "maneuver": str(row.event_cluster),
                             "caption": str(e["coc"])})
-    samples = samples[: args.max_samples]
+    # keep only samples that load (frames near the clip end can fail to decode)
+    ds = PAIAVDriveDataset(args.data_root, Normalizer(stats), samples=samples, sampler=sampler)
+    ok = []
+    for i, s in enumerate(samples):
+        try:
+            ds[i]
+            ok.append(s)
+        except Exception as e:
+            print(f"drop {s['clip_id']} t0={s['t0']:.0f}: {e}")
+    samples = ok[: args.max_samples]
     Path(args.out).write_text(json.dumps(samples, indent=1))
     print(f"{len(samples)} scene samples from {len({s['clip_id'] for s in samples})} clips -> {args.out}")
 
