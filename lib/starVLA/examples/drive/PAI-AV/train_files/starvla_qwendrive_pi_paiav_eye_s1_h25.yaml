@@ -7,7 +7,7 @@ wandb_project: starVLA_drive
 
 # Qwen-Drive-1.0-4B (Qwen3.5-4B) VLM + pi-style layer-wise flow-matching action expert, v2 layout except the prompt.
 # Eye gate stage 1: the navigation target point reaches the policy ONLY through the mask.
-#   prompt : "predict trajectory. speed: <v> m/s" (no target point)
+#   prompt : "predict trajectory" (no target point, no speed)
 #   gate   : pre-LLM image embeddings + [target x/25, y/25, speed/20] -> which image tokens are kept
 #   state  (5, 5): ego history [x, y, heading_rel, speed, acc_lon]; action (25, 2): [accel, curvature]
 # Where to go (e.g. which branch at an intersection) is then only available from the kept tokens, so the choice of
@@ -66,7 +66,7 @@ datasets:
     action_mode: unicycle
     state_target_point: false
     target_point_in_prompt: false   # stage 1: the target reaches the policy only through the mask
-    speed_in_prompt: true
+    speed_in_prompt: false          # stage 1: no speed text either (speed reaches the DiT through the state)
     per_device_batch_size: 4
     eval_batch_size: 4
     num_workers: 8
