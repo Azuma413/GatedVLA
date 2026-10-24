@@ -154,8 +154,8 @@ def main():
     with open(dcfg.eval_index_path) as f:
         eval_samples = json.load(f)[: int(dcfg.get("num_eval_samples", 240))]
     eval_ds = PAIAVDriveDataset(dcfg.data_root, normalizer, samples=eval_samples, sampler=sampler_cfg, **image_kwargs)
-    # Figure-only scenes (traffic lights / stop signs / intersections, see prepare_scene_index.py): plotted at every
-    # eval, not part of the metrics.
+    # Intersection scenes (one per maneuver, see prepare_scene_index.py): plotted with the eval figures of their
+    # maneuver (eval_bev/<maneuver>, in place of one regular figure each), not part of the metrics.
     scene_ds = None
     if dcfg.get("scene_index_path"):
         with open(dcfg.scene_index_path) as f:
@@ -295,16 +295,19 @@ def main():
         bright = {k: v for part in parts for k, v in part.items()}
     median = float(np.median(list(bright.values())))
     plot_ids = set()
+    scenes_per_class = {m: sum(s.get("maneuver") == m for s in (scene_ds.samples if scene_ds is not None else []))
+                        for m in MANEUVERS}
     for m in MANEUVERS:
+        n_plots = max(plots_per_class - scenes_per_class[m], 0)
         seen, cands = set(), []
         for i, s in enumerate(eval_samples[: len(eval_ds)]):
             if s.get("maneuver") == m and s["clip_id"] not in seen:
                 seen.add(s["clip_id"])
                 cands.append(i)
         pool = [i for i in cands if bright[i] >= median]
-        pool = pool if len(pool) >= plots_per_class else cands
-        if pool:
-            picks = np.linspace(0, len(pool) - 1, min(plots_per_class, len(pool))).round().astype(int)
+        pool = pool if len(pool) >= n_plots else cands
+        if pool and n_plots > 0:
+            picks = np.linspace(0, len(pool) - 1, min(n_plots, len(pool))).round().astype(int)
             plot_ids.update(pool[k] for k in picks)
     eval_bs = int(dcfg.get("eval_batch_size", bs))
     anchors_np = None
@@ -488,25 +491,22 @@ def main():
             image.save(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.png")
             if wandb is not None:
                 images[r["maneuver"]].append(wandb.Image(image, caption=title))
-        scene_images = []
-        if scene_records:
-            scene_dir = fig_dir / "scenes"
-            scene_dir.mkdir(exist_ok=True)
-            for r in sorted(scene_records, key=lambda x: x["idx"]):
-                sample = scene_ds.samples[r["idx"]]
-                title = f"{sample['caption'][:90]} | {r['meta']['clip_id'][:8]} t0={r['meta']['t0'] * 1e-6:.1f}s | step {step}"
-                extra_maps = [(name, r[key]) for name, key in (("gate score z", "score_cur"),
-                                                               ("DiT attention (gated, all tokens)", "attn_cur")) if key in r]
-                fig = plot_bev(r["meta"], r["pred_xy"], image=r["image"], title=title, keep_map=r["keep_map"],
-                               extra_maps=extra_maps)
-                image = fig_to_image(fig)
-                plt.close(fig)
-                image.save(scene_dir / f"scene_{r['idx']:03d}.png")
-                scene_images.append(wandb.Image(image, caption=title) if wandb is not None else None)
+        for r in sorted(scene_records, key=lambda x: x["idx"]):
+            sample = scene_ds.samples[r["idx"]]
+            m = sample["maneuver"]
+            title = (f"{m} (intersection: {sample['caption'][:70]}) | {r['meta']['clip_id'][:8]} "
+                     f"t0={r['meta']['t0'] * 1e-6:.1f}s | step {step}")
+            extra_maps = [(name, r[key]) for name, key in (("gate score z", "score_cur"),
+                                                           ("DiT attention (gated, all tokens)", "attn_cur")) if key in r]
+            fig = plot_bev(r["meta"], r["pred_xy"], image=r["image"], title=title, keep_map=r["keep_map"],
+                           extra_maps=extra_maps)
+            image = fig_to_image(fig)
+            plt.close(fig)
+            image.save(fig_dir / f"{m}_intersection_{r['idx']:02d}.png")
+            if wandb is not None:
+                images[m].append(wandb.Image(image, caption=title))
         if wandb is not None:
             payload.update({f"eval_bev/{m}": imgs for m, imgs in images.items() if imgs})
-            if scene_images:
-                payload["eval_scenes"] = scene_images
             wandb.log(payload)
 
     # ── checkpointing ─────────────────────────────────────────────────
