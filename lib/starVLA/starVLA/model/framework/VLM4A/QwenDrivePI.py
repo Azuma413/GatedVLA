@@ -116,6 +116,11 @@ class QwenDrivePIDefaultConfig:
             # + 1. target_dropout: probability per training sample that the target is dropped on the ungated path.
             "target_flag": False,
             "target_dropout": 0.0,
+            # Per-channel standardisation (running statistics over tokens, separate for image and text tokens) of the
+            # VLM hidden states before the DiT projectors. Without it the image tokens' hidden is ~100% a component
+            # shared by all tokens (massive-activation channels), which the projector's LayerNorm keeps: every image
+            # token gives the DiT the same key / value and the cross-attention is uniform (the image is unused).
+            "standardize_vl_hidden": False,
         }
     )
 
@@ -451,6 +456,12 @@ class Qwen_Drive_PI(baseframework):
         self.vlm_layer_ids = [
             min(i + 1, num_vl_layers - 1) if self.interleave_self_attention else i for i in self.cross_layer_ids
         ]
+        self.vl_std = None
+        if bool(self.config.framework.drive.get("standardize_vl_hidden", False)):
+            self.vl_std = nn.ModuleDict({
+                kind: nn.ModuleList([ChannelStandardizer(llm_hidden_size) for _ in self.cross_layer_ids])
+                for kind in ("visual", "text")
+            })
         self.project_layers = nn.ModuleList(
             [
                 (
@@ -684,15 +695,25 @@ class Qwen_Drive_PI(baseframework):
     def _head_dtype(self) -> torch.dtype:
         return next(self.action_model.parameters()).dtype
 
-    def _project_hidden(self, all_hidden) -> list:
+    def _project_hidden(self, all_hidden, visual: Optional[torch.Tensor] = None,
+                        valid: Optional[torch.Tensor] = None) -> list:
         """VLM hidden states (all layers) -> one projected entry per DiT block (self-attention blocks alias the
-        preceding cross-attention entry)."""
+        preceding cross-attention entry). visual / valid (B, L) bool: image tokens / non-padding tokens, needed with
+        drive.standardize_vl_hidden."""
         hidden_states = all_hidden[-self.num_action_dit_layers :]
         proj_dtype = next(self.project_layers.parameters(), torch.empty(0, dtype=self._head_dtype())).dtype
-        projected = {
-            i: proj(hidden_states[j].to(proj_dtype))
-            for i, j, proj in zip(self.cross_layer_ids, self.vlm_layer_ids, self.project_layers)
-        }
+        projected = {}
+        for k, (i, j, proj) in enumerate(zip(self.cross_layer_ids, self.vlm_layer_ids, self.project_layers)):
+            h = hidden_states[j]
+            if self.vl_std is not None:
+                if visual is None or valid is None:
+                    raise ValueError("drive.standardize_vl_hidden needs the image-token and padding masks")
+                z = torch.zeros(h.shape, dtype=torch.float32, device=h.device)  # padding stays 0
+                for kind, sel in (("visual", valid & visual), ("text", valid & ~visual)):
+                    if sel.any():
+                        z[sel] = self.vl_std[kind][k](h[sel])
+                h = z
+            projected[i] = proj(h.to(proj_dtype))
         vl_embs_list = []
         for i in range(self.num_action_dit_layers):
             vl_embs_list.append(projected[i] if i in projected else vl_embs_list[-1])
@@ -732,7 +753,7 @@ class Qwen_Drive_PI(baseframework):
                 inputs_embeds=emb, position_ids=position_ids, attention_mask=attn, use_cache=False,
                 output_hidden_states=True, return_dict=True, visual_keep=keep,
             )
-            return self._project_hidden(out.hidden_states)
+            return self._project_hidden(out.hidden_states, visual, attn.bool())
 
         return {"run": run, "gate_inputs": gate_inputs, "attention_mask": attn.bool(), "visual": visual}
 
@@ -763,13 +784,13 @@ class Qwen_Drive_PI(baseframework):
             return_dict=True,
         )
         all_hidden = qwenvl_outputs.hidden_states
-        vl_embs_list = self._project_hidden(all_hidden)
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
         else:
             attention_mask = torch.ones(qwen_inputs["input_ids"].shape, dtype=torch.bool, device=all_hidden[-1].device)
         view_ids = self._visual_view_ids(qwen_inputs)
         visual = view_ids >= 0
+        vl_embs_list = self._project_hidden(all_hidden, visual, attention_mask)
         text_mask = (~visual) & attention_mask
         if self.text_first:
             # q: the prompt only. Template tokens after the images have seen the images.
