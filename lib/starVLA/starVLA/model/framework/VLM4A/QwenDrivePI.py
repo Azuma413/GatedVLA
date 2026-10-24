@@ -121,6 +121,14 @@ class QwenDrivePIDefaultConfig:
             # shared by all tokens (massive-activation channels), which the projector's LayerNorm keeps: every image
             # token gives the DiT the same key / value and the cross-attention is uniform (the image is unused).
             "standardize_vl_hidden": False,
+            # Action head objective: "flow" (flow matching, sampled with num_inference_timesteps Euler steps) or
+            # "regress" (the same DiT read deterministically: input x = 0 at t = 0, MSE to the action; one step).
+            "head_objective": "flow",
+            # Diagnostics (no effect on the policy): detached probes on the DiT inputs (attention-pooled projected VLM
+            # features of 3 cross blocks -> final lateral offset, lateral at 1.5 s, final heading), per-dimension
+            # losses, and in eval the DiT cross-attention statistics over the image tokens, the image-token feature
+            # diversity and a black-frame (noimage) control.
+            "diagnostics": False,
         }
     )
 
@@ -283,6 +291,21 @@ class ChannelStandardizer(nn.Module):
             if bool(self.initialized):
                 mean, var = self.mean, self.var
         return (x - mean) / torch.sqrt(var + self.eps)
+
+
+class PooledProbe(nn.Module):
+    """Diagnostic probe: attention pooling over the image tokens of one DiT input, then an MLP to 3 targets."""
+
+    def __init__(self, width: int, hidden: int = 256, outputs: int = 3):
+        super().__init__()
+        self.score = nn.Linear(width, 1)
+        self.mlp = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, outputs))
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """x (B, L, W), mask (B, L) bool -> (B, outputs)."""
+        x = x.float()
+        w = self.score(x).squeeze(-1).masked_fill(~mask, float("-inf")).softmax(-1)
+        return self.mlp((w[..., None] * x).sum(1))
 
 
 class ViewGate(nn.Module):
@@ -456,6 +479,15 @@ class Qwen_Drive_PI(baseframework):
         self.vlm_layer_ids = [
             min(i + 1, num_vl_layers - 1) if self.interleave_self_attention else i for i in self.cross_layer_ids
         ]
+        self.head_objective = str(self.config.framework.drive.get("head_objective", "flow"))
+        if self.head_objective not in ("flow", "regress"):
+            raise ValueError(f"drive.head_objective must be flow / regress, got {self.head_objective}")
+        self.diagnostics = bool(self.config.framework.drive.get("diagnostics", False))
+        self.probe_blocks = []
+        if self.diagnostics:
+            ids = self.cross_layer_ids
+            self.probe_blocks = sorted({ids[0], ids[len(ids) // 2], ids[-1]})
+            self.probes = nn.ModuleDict({str(i): PooledProbe(self.action_dit_hidden_dim) for i in self.probe_blocks})
         self.vl_std = None
         if bool(self.config.framework.drive.get("standardize_vl_hidden", False)):
             self.vl_std = nn.ModuleDict({
@@ -990,13 +1022,34 @@ class Qwen_Drive_PI(baseframework):
             out["target_present_frac"] = present.mean().detach()
 
         if not self.gate_enabled:
-            flow = self.action_model(
+            if self.head_objective == "regress":  # x = 0 at t = 0: the velocity target is the action itself
+                noise = torch.zeros_like(flow_target)
+                t = torch.zeros(flow_target.shape[0], device=device, dtype=dtype)
+            else:
+                noise = torch.randn(flow_target.shape, device=device, dtype=dtype)
+                t = self.action_model.sample_time(flow_target.shape[0], device=device, dtype=dtype)
+            flow, v_pred = self.action_model(
                 vl_embs_list, flow_target, state_t, encoder_attention_mask=attention_mask.repeat(repeat, 1),
-                query_bias=query_bias, loss_type=loss_type,
+                query_bias=query_bias, loss_type=loss_type, noise=noise, t=t, return_velocity=True,
             )
             if self.anchor_enabled:
                 out["loss_flow"] = flow.detach()
             out["action_loss"] = total + flow_weight * flow
+            if self.diagnostics:
+                out["loss_head"] = flow.detach()  # action_loss below also carries the probes' losses
+                err = ((v_pred.float() - (flow_target - noise).float()) ** 2).mean(dim=(0, 1))  # per action dim
+                for k in range(err.shape[0]):
+                    out[f"loss_dim{k}"] = err[k].detach()
+                n = len(examples)
+                visual = (gate_inputs["view_ids"] >= 0) & attention_mask
+                targets = self._probe_targets(examples, device)
+                probe_total = 0.0
+                for i in self.probe_blocks:
+                    pred = self.probes[str(i)](vl_embs_list[i][:n].detach(), visual)
+                    lp = ((pred - targets) ** 2).mean()
+                    out[f"probe_loss_block{i}"] = lp.detach()
+                    probe_total = probe_total + lp
+                out["action_loss"] = out["action_loss"] + probe_total  # probes only (inputs detached)
             return out
 
         # Gated and ungated paths share the VLM forward and the flow-matching sample (noise, t).
@@ -1228,6 +1281,18 @@ class Qwen_Drive_PI(baseframework):
         out["action_loss"] = total + flow_weight * loss_gated
         return out
 
+    @staticmethod
+    def _probe_targets(examples: List[dict], device) -> torch.Tensor:
+        """(B, 3) probe targets from the ground-truth future positions: final lateral offset / 10 m, lateral at
+        1.5 s / 10 m, final heading (rad, from the last segment)."""
+        rows = []
+        for ex in examples:
+            xy = np.asarray(ex["meta"]["action_xy"], dtype=np.float64)
+            k = min(15, len(xy) - 1)
+            d = xy[-1] - xy[-2]
+            rows.append([xy[-1, 1] / 10.0, xy[k, 1] / 10.0, np.arctan2(d[1], d[0])])
+        return torch.as_tensor(np.asarray(rows, dtype=np.float32), device=device)
+
     def _predict(self, examples: List[dict]) -> dict:
         batch_images, instructions, state = self._prepare_inputs(examples)
         if self.vlm_keep:
@@ -1287,9 +1352,32 @@ class Qwen_Drive_PI(baseframework):
                 pred_m = reference + residual.float() * self.residual_std
             pred_actions = self._normalize_actions(pred_m)
         else:
-            pred_actions = self.action_model.predict_action(
-                vl_embs_list, state_t, encoder_attention_mask=encoder_mask, noise=noise
-            )
+            diag = self.diagnostics and not self.gate_enabled
+            if self.head_objective == "regress" or diag:  # paired controls share the noise of the main prediction
+                noise = torch.randn((len(examples), self.action_horizon, self.action_model.action_dim),
+                                    device=device, dtype=dtype) if noise is None else noise
+            if diag:
+                img_keys = attention_mask & (gate_inputs["view_ids"] == gate_inputs["view_ids"].max())  # current frame
+                diag_probe = CrossAttentionProbe(self.action_model.model, self.cross_layer_ids, stats=True, key_mask=img_keys)
+                diag_probe.__enter__()
+            pred_actions = self._head_predict(vl_embs_list, state_t, encoder_mask, noise)
+            if diag:
+                diag_probe.__exit__()
+                visual_all = (gate_inputs["view_ids"] >= 0) & attention_mask
+                vis_mass = (diag_probe.mean() * visual_all).sum(1)
+                stats = diag_probe.stat_means()
+                scalars = {f"attn_{k}": v.float().cpu().numpy() for k, v in stats.items()}
+                scalars["attn_image_mass"] = vis_mass.float().cpu().numpy()
+                for i in self.probe_blocks:
+                    x = vl_embs_list[i].float()
+                    scalars.update(self._token_diversity(x, img_keys, f"block{i}"))
+                    out.setdefault("probe_preds", {})[f"block{i}"] = (
+                        self.probes[str(i)](x, visual_all).float().cpu().numpy())
+                out["diag_scalars"] = scalars
+                black = [[Image.new("RGB", img.size) for img in frames] for frames in batch_images]
+                vl_black, mask_black, _ = self._encode_vl_hidden_states(black, instructions)
+                pred = self._head_predict([h.to(dtype) for h in vl_black], state_t, mask_black, noise)
+                out["control_actions"] = {"noimage": pred.float().cpu().numpy()}
         if probe is not None:
             probe.__exit__()
             self._add_attention_outputs(out, probe.mean(), gate_inputs, attention_mask, "")
@@ -1320,6 +1408,34 @@ class Qwen_Drive_PI(baseframework):
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred_actions.float().cpu().numpy()
         return out
+
+    def _head_predict(self, vl_embs_list, state_t, encoder_mask, noise):
+        """Sampled actions: flow -> num_inference_timesteps Euler steps from noise; regress -> one step from x = 0."""
+        if self.head_objective != "regress":
+            return self.action_model.predict_action(vl_embs_list, state_t, encoder_attention_mask=encoder_mask, noise=noise)
+        steps = self.action_model.num_inference_timesteps
+        self.action_model.num_inference_timesteps = 1
+        try:
+            return self.action_model.predict_action(
+                vl_embs_list, state_t, encoder_attention_mask=encoder_mask, noise=torch.zeros_like(noise)
+            )
+        finally:
+            self.action_model.num_inference_timesteps = steps
+
+    @staticmethod
+    def _token_diversity(x: torch.Tensor, mask: torch.Tensor, name: str) -> dict:
+        """Per sample: mean pairwise cosine of the masked tokens and the share of their energy in the token mean."""
+        cos, share = [], []
+        for b in range(x.shape[0]):
+            t = x[b][mask[b]]
+            if len(t) > 512:
+                t = t[torch.linspace(0, len(t) - 1, 512, device=t.device).long()]
+            u = torch.nn.functional.normalize(t, dim=-1)
+            c = u @ u.T
+            n = len(t)
+            cos.append(float((c.sum() - n) / max(n * (n - 1), 1)))
+            share.append(float(t.mean(0).pow(2).sum() * n / t.pow(2).sum().clamp_min(1e-12)))
+        return {f"feat_cos_{name}": np.array(cos), f"feat_shared_{name}": np.array(share)}
 
     @staticmethod
     def _shuffled_keep(keep: torch.Tensor, view_ids: torch.Tensor, gen: Optional[torch.Generator] = None) -> torch.Tensor:

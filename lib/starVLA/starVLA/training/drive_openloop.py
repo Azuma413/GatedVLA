@@ -124,6 +124,22 @@ def _rank_corr_rows(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return (ra * rb).sum(1) / np.sqrt((ra**2).sum(1) * (rb**2).sum(1) + 1e-12)
 
 
+def turn_metrics(pred: np.ndarray, gt: np.ndarray, maneuvers: List[str]) -> dict:
+    """Whether the predicted path follows the ground truth laterally: correlation of the final lateral offset (all
+    samples), per turn class the share with the right turn direction, the median pred / GT final lateral ratio, and
+    the spread of the predicted final lateral offset."""
+    yp, yg = pred[:, -1, 1], gt[:, -1, 1]
+    out = {"turn/corr_final_y": float(np.corrcoef(yp, yg)[0, 1]) if yp.std() > 0 else 0.0,
+           "turn/pred_final_y_std": float(yp.std())}
+    man = np.asarray(maneuvers)
+    for m in ("left", "right"):
+        sel = (man == m) & (np.abs(yg) > 0.5)
+        if sel.any():
+            out[f"turn/{m}_direction_acc"] = float((np.sign(yp[sel]) == np.sign(yg[sel])).mean())
+            out[f"turn/{m}_ratio_median"] = float(np.median(yp[sel] / yg[sel]))
+    return out
+
+
 def gate_diagnostics(records: List[dict]) -> dict:
     """Collapse / attention metrics of the visual gate over the eval set (current frame).
 

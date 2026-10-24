@@ -97,7 +97,7 @@ def main():
     from starVLA.dataloader.pai_av_drive import DriveSampler, Normalizer, PAIAVDriveDataset, collate_examples
     from starVLA.model.framework.base_framework import build_framework
     from starVLA.training.drive_openloop import (
-        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, plot_bev,
+        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, plot_bev, turn_metrics,
     )
 
     is_main = rank == 0
@@ -348,6 +348,10 @@ def main():
                     rec["pred_xy_textdrop"] = eval_ds.action_to_xy(pred_out["normalized_actions_textdrop"][j], meta)
                 for name, acts in pred_out.get("control_actions", {}).items():
                     rec.setdefault("pred_xy_controls", {})[name] = eval_ds.action_to_xy(acts[j], meta)
+                for name, preds in pred_out.get("probe_preds", {}).items():
+                    rec.setdefault("probe", {})[name] = preds[j].astype(np.float32)
+                for name, vals in pred_out.get("diag_scalars", {}).items():
+                    rec.setdefault("diag", {})[name] = float(vals[j])
                 if "anchor_ids" in pred_out:
                     rec.update(
                         anchor_ids=pred_out["anchor_ids"][j],
@@ -422,12 +426,24 @@ def main():
                 [r["maneuver"] for r in records], dt=sampler_cfg.dt,
             )
             metrics.update({f"textdrop/{k}": v for k, v in td.items() if "/" not in k})
+        metrics.update(turn_metrics(np.stack([r["pred_xy"] for r in records]), np.stack([r["gt_xy"] for r in records]),
+                                    [r["maneuver"] for r in records]))
         for name in records[0].get("pred_xy_controls", {}):
-            ctl = displacement_metrics(
-                np.stack([r["pred_xy_controls"][name] for r in records]), np.stack([r["gt_xy"] for r in records]),
-                [r["maneuver"] for r in records], dt=sampler_cfg.dt,
-            )
-            metrics.update({f"{name}/{k}": v for k, v in ctl.items()})
+            ctl_xy, gt_xy = np.stack([r["pred_xy_controls"][name] for r in records]), np.stack([r["gt_xy"] for r in records])
+            mans = [r["maneuver"] for r in records]
+            metrics.update({f"{name}/{k}": v for k, v in displacement_metrics(ctl_xy, gt_xy, mans, dt=sampler_cfg.dt).items()})
+            metrics.update({f"{name}/{k}": v for k, v in turn_metrics(ctl_xy, gt_xy, mans).items()})
+        if "probe" in records[0]:  # detached probes on the DiT inputs: correlation with the ground truth
+            gt = np.stack([r["gt_xy"] for r in records])
+            heading = np.arctan2(gt[:, -1, 1] - gt[:, -2, 1], gt[:, -1, 0] - gt[:, -2, 0])
+            truth = {"final_y": gt[:, -1, 1] / 10.0, "y_1p5s": gt[:, min(15, gt.shape[1] - 1), 1] / 10.0, "heading": heading}
+            for name in records[0]["probe"]:
+                pr = np.stack([r["probe"][name] for r in records])
+                for k, (tname, tv) in enumerate(truth.items()):
+                    metrics[f"probe_{name}/corr_{tname}"] = float(np.corrcoef(pr[:, k], tv)[0, 1])
+        if "diag" in records[0]:
+            for name in records[0]["diag"]:
+                metrics[f"diag/{name}"] = float(np.mean([r["diag"][name] for r in records]))
         metrics["eval_time_s"] = time.time() - t_start
         log("eval step {}: ADE {:.3f} FDE {:.3f} (left {:.3f} / right {:.3f} / straight {:.3f})".format(
             step, metrics["ADE"], metrics["FDE"], metrics.get("left/ADE", float("nan")),
@@ -442,6 +458,8 @@ def main():
             pred_xy=np.stack([r["pred_xy"] for r in records]), gt_xy=np.stack([r["gt_xy"] for r in records]),
             **{f"pred_xy_{name}": np.stack([r["pred_xy_controls"][name] for r in records])
                for name in records[0].get("pred_xy_controls", {})},
+            **{f"probe_{name}": np.stack([r["probe"][name] for r in records]) for name in records[0].get("probe", {})},
+            **{f"diag_{name}": np.array([r["diag"][name] for r in records]) for name in records[0].get("diag", {})},
         )
         import matplotlib.pyplot as plt
 
@@ -603,6 +621,20 @@ def main():
                 if key != "action_loss" and torch.is_tensor(value) and value.numel() == 1:
                     window["extra"][key] = window["extra"].get(key, 0.0) + value.float().item() / accum
             window["samples"] += len(batch)
+        if getattr(model, "diagnostics", False):  # gradient norm per top-level module (before clipping)
+            sq = {}
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                g = p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
+                key = "vision" if ".visual." in name else name.split(".")[0]
+                sq[key] = sq.get(key, 0.0) + g.float().pow(2).sum()
+            keys = sorted(sq)
+            vec = torch.stack([torch.as_tensor(sq[k], device=device, dtype=torch.float32) for k in keys])
+            if distributed:
+                dist.all_reduce(vec)
+            for k, v in zip(keys, vec.sqrt().tolist()):
+                window["extra"][f"gradnorm_{k}"] = window["extra"].get(f"gradnorm_{k}", 0.0) + v
         grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor()
