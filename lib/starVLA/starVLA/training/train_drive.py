@@ -237,19 +237,30 @@ def main():
     log(f"{steps_per_epoch} optimizer steps per epoch, max_steps {max_steps} ({max_steps / steps_per_epoch:.2f} epochs)")
     warmup = int(tcfg.get("num_warmup_steps", 0))
     min_lr = float(tcfg.get("scheduler_specific_kwargs", {}).get("min_lr", 0.0))
+    # LP-FT: the VLM (qwen_vl_interface, incl. the vision encoder) is frozen for the first backbone_freeze_epochs
+    # (its forward runs without gradient, its learning rate is 0), then warmed up and decayed over the rest; the other
+    # modules follow the normal schedule from step 0.
+    freeze_steps = int(float(tcfg.get("backbone_freeze_epochs", 0) or 0) * steps_per_epoch)
+    if freeze_steps:
+        log(f"LP-FT: VLM frozen for the first {freeze_steps} steps")
 
-    def lr_lambda_for(base_lr):
+    def lr_lambda_for(base_lr, start=0):
         min_ratio = min_lr / base_lr if base_lr > 0 else 0.0
 
         def f(step):
+            if step < start:
+                return 0.0
+            step = step - start
             if step < warmup:
                 return (step + 1) / max(1, warmup)
-            progress = min(1.0, (step - warmup) / max(1, max_steps - warmup))
+            progress = min(1.0, (step - warmup) / max(1, max_steps - start - warmup))
             return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
         return f
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda_for(g["lr"]) for g in param_groups])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [
+        lr_lambda_for(g["lr"], freeze_steps if g["name"] == "qwen_vl_interface" else 0) for g in param_groups
+    ])
     params = [p for g in param_groups for p in g["params"]]
     dit_params = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith("action_model.")]
 
@@ -603,6 +614,7 @@ def main():
             window["data_time"] += time.time() - t_data
             if distributed:
                 model.set_requires_gradient_sync(micro == accum - 1)
+            model.backbone_frozen = step < freeze_steps  # LP-FT (see the schedule)
             with autocast():
                 out = model(batch)
             loss = out["action_loss"]

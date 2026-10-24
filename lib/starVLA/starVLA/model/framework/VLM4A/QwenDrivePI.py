@@ -54,6 +54,7 @@ reference enters every DiT block as a per-step query bias. Stage 1 trains only t
 (prediction = reference); stage 2 adds the residual flow loss. No top-M candidates / confidence branch.
 """
 
+from contextlib import nullcontext
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -487,7 +488,8 @@ class Qwen_Drive_PI(baseframework):
         if self.diagnostics:
             ids = self.cross_layer_ids
             self.probe_blocks = sorted({ids[0], ids[len(ids) // 2], ids[-1]})
-            self.probes = nn.ModuleDict({str(i): PooledProbe(self.action_dit_hidden_dim) for i in self.probe_blocks})
+            if not bool(self.config.framework.eye_gate.get("enabled", False)):  # probes: ungated path only
+                self.probes = nn.ModuleDict({str(i): PooledProbe(self.action_dit_hidden_dim) for i in self.probe_blocks})
         self.vl_std = None
         if bool(self.config.framework.drive.get("standardize_vl_hidden", False)):
             self.vl_std = nn.ModuleDict({
@@ -807,14 +809,17 @@ class Qwen_Drive_PI(baseframework):
             images=batch_images, instructions=instructions, text_first=self.text_first
         )
         attention_mask = qwen_inputs.get("attention_mask", None)
-        # Call the inner Qwen3.5 model (no LM head): only hidden states are needed.
-        qwenvl_outputs = self.qwen_vl_interface.model.model(
-            **qwen_inputs,
-            use_cache=False,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        # Call the inner Qwen3.5 model (no LM head): only hidden states are needed. Without gradient while the trainer
+        # keeps the backbone frozen (LP-FT, trainer.backbone_freeze_epochs).
+        frozen = self.training and bool(getattr(self, "backbone_frozen", False))
+        with torch.no_grad() if frozen else nullcontext():
+            qwenvl_outputs = self.qwen_vl_interface.model.model(
+                **qwen_inputs,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
         all_hidden = qwenvl_outputs.hidden_states
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
@@ -1311,6 +1316,11 @@ class Qwen_Drive_PI(baseframework):
             state_t, state_none = self._flag_state(state_t, ones), self._flag_state(state_t, torch.zeros_like(ones))
 
         out = {}
+        diag_div = {}
+        if self.diagnostics:  # image-token feature diversity at the probed DiT inputs (collapse monitor, any scheme)
+            img_cur = attention_mask & (gate_inputs["view_ids"] == gate_inputs["view_ids"].max())
+            for i in self.probe_blocks:
+                diag_div.update(self._token_diversity(vl_embs_list[i].float(), img_cur, f"block{i}"))
         encoder_mask = attention_mask
         probe = None
         if self.gate_enabled:
@@ -1404,6 +1414,8 @@ class Qwen_Drive_PI(baseframework):
             if self.action_clip is not None:
                 pred = pred.clamp(-float(self.action_clip), float(self.action_clip))
             out["control_actions"]["noimage"] = pred.float().cpu().numpy()
+        if diag_div and "diag_scalars" not in out:
+            out["diag_scalars"] = diag_div
         if self.action_clip is not None:
             pred_actions = pred_actions.clamp(-float(self.action_clip), float(self.action_clip))
         out["normalized_actions"] = pred_actions.float().cpu().numpy()
