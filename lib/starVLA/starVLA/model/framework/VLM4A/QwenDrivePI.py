@@ -303,9 +303,9 @@ class PooledProbe(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """x (B, L, W), mask (B, L) bool -> (B, outputs)."""
-        x = x.float()
-        w = self.score(x).squeeze(-1).masked_fill(~mask, float("-inf")).softmax(-1)
-        return self.mlp((w[..., None] * x).sum(1))
+        x = x.to(self.score.weight.dtype)  # parameters may be bf16 under FSDP mixed precision
+        w = self.score(x).float().squeeze(-1).masked_fill(~mask, float("-inf")).softmax(-1)
+        return self.mlp((w[..., None] * x.float()).sum(1).to(x.dtype)).float()
 
 
 class ViewGate(nn.Module):
