@@ -435,6 +435,14 @@ def main():
         payload = {"step": step, **{f"eval/{k}": v for k, v in metrics.items()}}
         fig_dir = out_dir / "eval" / f"step_{step:07d}"
         fig_dir.mkdir(parents=True, exist_ok=True)
+        # every eval sample's predicted / ground-truth positions (for offline analysis)
+        np.savez(
+            fig_dir / "predictions.npz",
+            idx=np.array([r["idx"] for r in records]), maneuver=np.array([r["maneuver"] for r in records]),
+            pred_xy=np.stack([r["pred_xy"] for r in records]), gt_xy=np.stack([r["gt_xy"] for r in records]),
+            **{f"pred_xy_{name}": np.stack([r["pred_xy_controls"][name] for r in records])
+               for name in records[0].get("pred_xy_controls", {})},
+        )
         import matplotlib.pyplot as plt
 
         images = {m: [] for m in MANEUVERS}
