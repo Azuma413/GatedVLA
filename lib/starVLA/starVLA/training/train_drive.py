@@ -311,9 +311,6 @@ def main():
     if fw.get("anchor", {}).get("enabled", False):
         anchors_np = np.load(fw.anchor.path)["anchors"]
 
-    # Figures are always saved under eval/step_*/; uploading them to W&B is opt-in (storage quota).
-    wandb_images = bool(tcfg.get("wandb_images", False))
-
     def evaluate(step):
         model.eval()
         t_start = time.time()
@@ -489,7 +486,7 @@ def main():
             image = fig_to_image(fig)
             plt.close(fig)
             image.save(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.png")
-            if wandb is not None and wandb_images:
+            if wandb is not None:
                 images[r["maneuver"]].append(wandb.Image(image, caption=title))
         scene_images = []
         if scene_records:
@@ -505,8 +502,7 @@ def main():
                 image = fig_to_image(fig)
                 plt.close(fig)
                 image.save(scene_dir / f"scene_{r['idx']:03d}.png")
-                if wandb is not None and wandb_images:
-                    scene_images.append(wandb.Image(image, caption=title))
+                scene_images.append(wandb.Image(image, caption=title) if wandb is not None else None)
         if wandb is not None:
             payload.update({f"eval_bev/{m}": imgs for m, imgs in images.items() if imgs})
             if scene_images:
