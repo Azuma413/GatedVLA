@@ -599,7 +599,9 @@ def main():
     data_iter = iter(train_loader)
     window = {"loss": 0.0, "n": 0, "data_time": 0.0, "step_time": 0.0, "samples": 0, "extra": {}}
     t_last = time.time()
-    while step < max_steps:
+    # trainer.stop_after_steps: end the run early (no final save) while keeping the schedule of max_steps (short probes)
+    stop_after = int(tcfg.get("stop_after_steps", 0) or 0) or max_steps
+    while step < min(max_steps, stop_after):
         t_step = time.time()
         loss_sum = 0.0
         for micro in range(accum):
