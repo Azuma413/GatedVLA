@@ -38,7 +38,7 @@ framework:
     enabled: true
     mode: learned
     hidden_dim: 256
-    init_keep: 0.99
+    init_keep: 0.2                 # sigmoid mask starts at the budget (budget loss ~0 at the start)
     budget: 0.2
     budget_loss_weight: 0.1         # sigmoid mask: mean per frame pulled to the budget (path C, gate only)
     full_loss_weight: 1.0
