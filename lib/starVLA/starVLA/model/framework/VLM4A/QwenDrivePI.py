@@ -1266,7 +1266,14 @@ class Qwen_Drive_PI(baseframework):
         _, v_b = run(keep.detach(), detached, states["full"])
         _, v_c = run(keep, detached, states["none"])
         loss_b, loss_c = distill(v_b), distill(v_c)
-        out["gate_loss"] = loss_c  # gate only (the trainer drops its DiT gradients)
+        gate_loss = loss_c
+        gate_cfg = self.config.framework.eye_gate
+        if str(gate_cfg.get("parameterization", "sigmoid")) != "budgeted" and float(gate_cfg.budget_loss_weight) > 0:
+            # sigmoid mask: its mean per frame is pulled to the budget by the penalty (the budgeted one is exact)
+            loss_budget = ((self._keep_stats(keep, gate_inputs["view_ids"]) - float(gate_cfg.budget)) ** 2).sum(1).mean()
+            gate_loss = gate_loss + float(gate_cfg.budget_loss_weight) * loss_budget
+            out["loss_budget"] = loss_budget.detach()
+        out["gate_loss"] = gate_loss  # gate only (the trainer drops its DiT gradients)
         with torch.no_grad():  # same loss with the keep values at random places: > loss_c when the placement matters
             _, v_r = run(self._shuffled_keep(keep.detach(), gate_inputs["view_ids"]), detached, states["none"])
             out["loss_c_random"] = distill(v_r)
