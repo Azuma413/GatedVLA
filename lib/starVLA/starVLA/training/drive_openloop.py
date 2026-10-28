@@ -140,6 +140,22 @@ def turn_metrics(pred: np.ndarray, gt: np.ndarray, maneuvers: List[str]) -> dict
     return out
 
 
+def longitudinal_metrics(pred: np.ndarray, gt: np.ndarray, dt: float = 0.1) -> dict:
+    """Along-track behaviour on the samples whose ground truth decelerates (end speed < start speed - 2 m/s) or comes
+    to a stop (start > 2 m/s, end < 0.5 m/s): mean signed final forward error (pred - GT; > 0 = overshoots, i.e. stops
+    too late) and mean absolute error. Speeds from the first / last ground-truth steps."""
+    v_start = np.linalg.norm(gt[:, 1] - gt[:, 0], axis=-1) / dt
+    v_end = np.linalg.norm(gt[:, -1] - gt[:, -2], axis=-1) / dt
+    err = pred[:, -1, 0] - gt[:, -1, 0]
+    out = {}
+    for name, sel in (("decel", v_end < v_start - 2.0), ("stop", (v_start > 2.0) & (v_end < 0.5))):
+        out[f"long/{name}_n"] = int(sel.sum())
+        if sel.any():
+            out[f"long/{name}_fwd_err_mean"] = float(err[sel].mean())
+            out[f"long/{name}_fwd_err_abs"] = float(np.abs(err[sel]).mean())
+    return out
+
+
 def gate_diagnostics(records: List[dict]) -> dict:
     """Collapse / attention metrics of the visual gate over the eval set (current frame).
 
