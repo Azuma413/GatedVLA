@@ -449,7 +449,7 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
         target_point_distances_m = policy.policy_config.required_target_point_distances_m
         if route is not None and len(route) > 0:
             if float(np.linalg.norm(route[0])) > self._py123d_garage_config.route_resolution_m:
-                route = np.vstack([np.zeros((1, 2)), route])
+                route = np.vstack([_bridge_to_route(route), route])
             if target_point_distances_m:
                 route = _extend_route(route, max(target_point_distances_m) + 2.0)
         route_metadata = _resample_route(
@@ -553,6 +553,34 @@ def _resample_route(
         cache_source_info=provided_route_source_info("alpasim submit_route"),
         source="provided",
     )
+
+
+def _bridge_to_route(
+    polyline_xy: npt.NDArray[np.float64],
+    spacing_m: float = 0.5,
+) -> npt.NDArray[np.float64]:
+    """
+    The stretch from the ego to a route that starts ahead of it (the challenge presets drop the first 40 m):
+    a cubic Hermite curve leaving the rig origin along +x and joining the route along its first segment, sampled
+    every spacing_m without the route's first point. A straight chord instead cuts across the inside of every
+    turn the gap holds, and target points placed on it leave the road.
+
+    Args:
+        polyline_xy: the route in the rig frame, its first point ahead of the ego.
+        spacing_m: approximate spacing of the returned points.
+
+    Returns:
+        the bridge points, starting at the origin.
+    """
+    end = polyline_xy[0]
+    chord_m = float(np.linalg.norm(end))
+    if len(polyline_xy) >= 2 and float(np.linalg.norm(polyline_xy[1] - end)) > 0.0:
+        end_direction = (polyline_xy[1] - end) / float(np.linalg.norm(polyline_xy[1] - end))
+    else:
+        end_direction = end / chord_m
+    s = np.linspace(0.0, 1.0, max(2, int(np.ceil(chord_m / spacing_m)) + 1))[:-1, None]
+    h00, h10, h01, h11 = 2 * s**3 - 3 * s**2 + 1, s**3 - 2 * s**2 + s, -2 * s**3 + 3 * s**2, s**3 - s**2
+    return h00 * 0.0 + h10 * chord_m * np.array([1.0, 0.0]) + h01 * end + h11 * chord_m * end_direction
 
 
 def _extend_route(

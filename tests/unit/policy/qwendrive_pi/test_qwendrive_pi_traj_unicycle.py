@@ -301,3 +301,20 @@ def test_verify_refuses_target_columns_the_run_does_not_have(tmp_path: Path) -> 
     config.datasets.vla_data.state_target_point = False
     with pytest.raises(ValueError, match="state"):
         _policy()._verify_run(config, norm_stats, tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_route_bridge_follows_the_turn_instead_of_the_chord() -> None:
+    from py123d_garage.evaluation.alpasim.help.driver_service import _bridge_to_route
+
+    # A right turn: the route starts 30 m to the right of a crossing 13 m ahead and runs on to the right.
+    route = np.array([[13.4, -30.1], [12.4, -34.2], [11.4, -38.2]])
+    bridge = _bridge_to_route(route)
+    np.testing.assert_allclose(bridge[0], [0.0, 0.0])
+    # Leaves along +x and ends next to the route's first point, without it.
+    assert bridge[1, 0] > 0.0
+    assert abs(bridge[1, 1]) < 0.05
+    assert 0.0 < np.linalg.norm(bridge[-1] - route[0]) < 1.0
+    # Away from the chord towards the outside of the turn (the road goes straight first, then turns).
+    chord_y_at = lambda x: -30.1 / 13.4 * x  # noqa: E731
+    middle = bridge[len(bridge) // 2]
+    assert middle[1] > chord_y_at(middle[0]) + 2.0
