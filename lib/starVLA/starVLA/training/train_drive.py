@@ -97,7 +97,7 @@ def main():
     from starVLA.dataloader.pai_av_drive import DriveSampler, Normalizer, PAIAVDriveDataset, collate_examples
     from starVLA.model.framework.base_framework import build_framework
     from starVLA.training.drive_openloop import (
-        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, plot_bev,
+        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, plot_bev, turn_metrics,
     )
 
     is_main = rank == 0
@@ -154,6 +154,13 @@ def main():
     with open(dcfg.eval_index_path) as f:
         eval_samples = json.load(f)[: int(dcfg.get("num_eval_samples", 240))]
     eval_ds = PAIAVDriveDataset(dcfg.data_root, normalizer, samples=eval_samples, sampler=sampler_cfg, **image_kwargs)
+    # Intersection scenes (one per maneuver, see prepare_scene_index.py): plotted with the eval figures of their
+    # maneuver (eval_bev/<maneuver>, in place of one regular figure each), not part of the metrics.
+    scene_ds = None
+    if dcfg.get("scene_index_path"):
+        with open(dcfg.scene_index_path) as f:
+            scene_ds = PAIAVDriveDataset(dcfg.data_root, normalizer, samples=json.load(f), sampler=sampler_cfg,
+                                         **image_kwargs)
     log(f"train clips {len(train_ds)}, eval samples {len(eval_ds)}, world {world}, device {device}")
 
     bs = int(dcfg.per_device_batch_size)
@@ -230,19 +237,30 @@ def main():
     log(f"{steps_per_epoch} optimizer steps per epoch, max_steps {max_steps} ({max_steps / steps_per_epoch:.2f} epochs)")
     warmup = int(tcfg.get("num_warmup_steps", 0))
     min_lr = float(tcfg.get("scheduler_specific_kwargs", {}).get("min_lr", 0.0))
+    # LP-FT: the VLM (qwen_vl_interface, incl. the vision encoder) is frozen for the first backbone_freeze_epochs
+    # (its forward runs without gradient, its learning rate is 0), then warmed up and decayed over the rest; the other
+    # modules follow the normal schedule from step 0.
+    freeze_steps = int(float(tcfg.get("backbone_freeze_epochs", 0) or 0) * steps_per_epoch)
+    if freeze_steps:
+        log(f"LP-FT: VLM frozen for the first {freeze_steps} steps")
 
-    def lr_lambda_for(base_lr):
+    def lr_lambda_for(base_lr, start=0):
         min_ratio = min_lr / base_lr if base_lr > 0 else 0.0
 
         def f(step):
+            if step < start:
+                return 0.0
+            step = step - start
             if step < warmup:
                 return (step + 1) / max(1, warmup)
-            progress = min(1.0, (step - warmup) / max(1, max_steps - warmup))
+            progress = min(1.0, (step - warmup) / max(1, max_steps - start - warmup))
             return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
         return f
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda_for(g["lr"]) for g in param_groups])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [
+        lr_lambda_for(g["lr"], freeze_steps if g["name"] == "qwen_vl_interface" else 0) for g in param_groups
+    ])
     params = [p for g in param_groups for p in g["params"]]
     dit_params = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith("action_model.")]
 
@@ -288,16 +306,19 @@ def main():
         bright = {k: v for part in parts for k, v in part.items()}
     median = float(np.median(list(bright.values())))
     plot_ids = set()
+    scenes_per_class = {m: sum(s.get("maneuver") == m for s in (scene_ds.samples if scene_ds is not None else []))
+                        for m in MANEUVERS}
     for m in MANEUVERS:
+        n_plots = max(plots_per_class - scenes_per_class[m], 0)
         seen, cands = set(), []
         for i, s in enumerate(eval_samples[: len(eval_ds)]):
             if s.get("maneuver") == m and s["clip_id"] not in seen:
                 seen.add(s["clip_id"])
                 cands.append(i)
         pool = [i for i in cands if bright[i] >= median]
-        pool = pool if len(pool) >= plots_per_class else cands
-        if pool:
-            picks = np.linspace(0, len(pool) - 1, min(plots_per_class, len(pool))).round().astype(int)
+        pool = pool if len(pool) >= n_plots else cands
+        if pool and n_plots > 0:
+            picks = np.linspace(0, len(pool) - 1, min(n_plots, len(pool))).round().astype(int)
             plot_ids.update(pool[k] for k in picks)
     eval_bs = int(dcfg.get("eval_batch_size", bs))
     anchors_np = None
@@ -339,6 +360,12 @@ def main():
                         rec[key] = float(pred_out[key][j])
                 if "normalized_actions_textdrop" in pred_out:
                     rec["pred_xy_textdrop"] = eval_ds.action_to_xy(pred_out["normalized_actions_textdrop"][j], meta)
+                for name, acts in pred_out.get("control_actions", {}).items():
+                    rec.setdefault("pred_xy_controls", {})[name] = eval_ds.action_to_xy(acts[j], meta)
+                for name, preds in pred_out.get("probe_preds", {}).items():
+                    rec.setdefault("probe", {})[name] = preds[j].astype(np.float32)
+                for name, vals in pred_out.get("diag_scalars", {}).items():
+                    rec.setdefault("diag", {})[name] = float(vals[j])
                 if "anchor_ids" in pred_out:
                     rec.update(
                         anchor_ids=pred_out["anchor_ids"][j],
@@ -353,10 +380,35 @@ def main():
                     thumb.thumbnail((640, 360))
                     rec.update(meta=meta, image=thumb, keep_map=None if kmaps is None else kmaps[-1])
                 records.append(rec)
+        scene_records = []
+        if scene_ds is not None:
+            s_shard = list(range(len(scene_ds)))[rank::world]
+            for b in range(math.ceil(math.ceil(len(scene_ds) / world) / eval_bs)):
+                ids = s_shard[b * eval_bs : (b + 1) * eval_bs]
+                real = len(ids)
+                if real == 0:  # keep collectives in lockstep across ranks
+                    ids = [s_shard[0] if s_shard else 0]
+                items = [scene_ds[i] for i in ids]
+                with autocast():
+                    pred_out = model(items, predict=True)
+                for j, (i, item) in enumerate(zip(ids[:real], items)):
+                    thumb = item["image"][-1].copy()
+                    thumb.thumbnail((640, 360))
+                    rec = {"idx": i, "meta": item["meta"], "image": thumb,
+                           "pred_xy": eval_ds.action_to_xy(pred_out["normalized_actions"][j], item["meta"]),
+                           "keep_map": pred_out["keep_maps"][j][-1] if "keep_maps" in pred_out else None}
+                    for key in ("score_maps", "attn_maps"):
+                        if key in pred_out:
+                            rec[key[:-5] + "_cur"] = pred_out[key][j][-1].astype(np.float32)
+                    scene_records.append(rec)
         if distributed:
             gathered = [None] * world
             dist.all_gather_object(gathered, records)
             records = [r for part in gathered for r in part]
+            if scene_ds is not None:
+                gathered = [None] * world
+                dist.all_gather_object(gathered, scene_records)
+                scene_records = [r for part in gathered for r in part]
         model.train()
         if not is_main:
             return
@@ -388,6 +440,24 @@ def main():
                 [r["maneuver"] for r in records], dt=sampler_cfg.dt,
             )
             metrics.update({f"textdrop/{k}": v for k, v in td.items() if "/" not in k})
+        metrics.update(turn_metrics(np.stack([r["pred_xy"] for r in records]), np.stack([r["gt_xy"] for r in records]),
+                                    [r["maneuver"] for r in records]))
+        for name in records[0].get("pred_xy_controls", {}):
+            ctl_xy, gt_xy = np.stack([r["pred_xy_controls"][name] for r in records]), np.stack([r["gt_xy"] for r in records])
+            mans = [r["maneuver"] for r in records]
+            metrics.update({f"{name}/{k}": v for k, v in displacement_metrics(ctl_xy, gt_xy, mans, dt=sampler_cfg.dt).items()})
+            metrics.update({f"{name}/{k}": v for k, v in turn_metrics(ctl_xy, gt_xy, mans).items()})
+        if "probe" in records[0]:  # detached probes on the DiT inputs: correlation with the ground truth
+            gt = np.stack([r["gt_xy"] for r in records])
+            heading = np.arctan2(gt[:, -1, 1] - gt[:, -2, 1], gt[:, -1, 0] - gt[:, -2, 0])
+            truth = {"final_y": gt[:, -1, 1] / 10.0, "y_1p5s": gt[:, min(15, gt.shape[1] - 1), 1] / 10.0, "heading": heading}
+            for name in records[0]["probe"]:
+                pr = np.stack([r["probe"][name] for r in records])
+                for k, (tname, tv) in enumerate(truth.items()):
+                    metrics[f"probe_{name}/corr_{tname}"] = float(np.corrcoef(pr[:, k], tv)[0, 1])
+        if "diag" in records[0]:
+            for name in records[0]["diag"]:
+                metrics[f"diag/{name}"] = float(np.mean([r["diag"][name] for r in records]))
         metrics["eval_time_s"] = time.time() - t_start
         log("eval step {}: ADE {:.3f} FDE {:.3f} (left {:.3f} / right {:.3f} / straight {:.3f})".format(
             step, metrics["ADE"], metrics["FDE"], metrics.get("left/ADE", float("nan")),
@@ -395,6 +465,16 @@ def main():
         payload = {"step": step, **{f"eval/{k}": v for k, v in metrics.items()}}
         fig_dir = out_dir / "eval" / f"step_{step:07d}"
         fig_dir.mkdir(parents=True, exist_ok=True)
+        # every eval sample's predicted / ground-truth positions (for offline analysis)
+        np.savez(
+            fig_dir / "predictions.npz",
+            idx=np.array([r["idx"] for r in records]), maneuver=np.array([r["maneuver"] for r in records]),
+            pred_xy=np.stack([r["pred_xy"] for r in records]), gt_xy=np.stack([r["gt_xy"] for r in records]),
+            **{f"pred_xy_{name}": np.stack([r["pred_xy_controls"][name] for r in records])
+               for name in records[0].get("pred_xy_controls", {})},
+            **{f"probe_{name}": np.stack([r["probe"][name] for r in records]) for name in records[0].get("probe", {})},
+            **{f"diag_{name}": np.array([r["diag"][name] for r in records]) for name in records[0].get("diag", {})},
+        )
         import matplotlib.pyplot as plt
 
         images = {m: [] for m in MANEUVERS}
@@ -422,6 +502,20 @@ def main():
             image.save(fig_dir / f"{r['maneuver']}_{r['idx']:04d}.png")
             if wandb is not None:
                 images[r["maneuver"]].append(wandb.Image(image, caption=title))
+        for r in sorted(scene_records, key=lambda x: x["idx"]):
+            sample = scene_ds.samples[r["idx"]]
+            m = sample["maneuver"]
+            title = (f"{m} (intersection: {sample['caption'][:70]}) | {r['meta']['clip_id'][:8]} "
+                     f"t0={r['meta']['t0'] * 1e-6:.1f}s | step {step}")
+            extra_maps = [(name, r[key]) for name, key in (("gate score z", "score_cur"),
+                                                           ("DiT attention (gated, all tokens)", "attn_cur")) if key in r]
+            fig = plot_bev(r["meta"], r["pred_xy"], image=r["image"], title=title, keep_map=r["keep_map"],
+                           extra_maps=extra_maps)
+            image = fig_to_image(fig)
+            plt.close(fig)
+            image.save(fig_dir / f"{m}_intersection_{r['idx']:02d}.png")
+            if wandb is not None:
+                images[m].append(wandb.Image(image, caption=title))
         if wandb is not None:
             payload.update({f"eval_bev/{m}": imgs for m, imgs in images.items() if imgs})
             wandb.log(payload)
@@ -505,7 +599,9 @@ def main():
     data_iter = iter(train_loader)
     window = {"loss": 0.0, "n": 0, "data_time": 0.0, "step_time": 0.0, "samples": 0, "extra": {}}
     t_last = time.time()
-    while step < max_steps:
+    # trainer.stop_after_steps: end the run early (no final save) while keeping the schedule of max_steps (short probes)
+    stop_after = int(tcfg.get("stop_after_steps", 0) or 0) or max_steps
+    while step < min(max_steps, stop_after):
         t_step = time.time()
         loss_sum = 0.0
         for micro in range(accum):
@@ -520,6 +616,7 @@ def main():
             window["data_time"] += time.time() - t_data
             if distributed:
                 model.set_requires_gradient_sync(micro == accum - 1)
+            model.backbone_frozen = step < freeze_steps  # LP-FT (see the schedule)
             with autocast():
                 out = model(batch)
             loss = out["action_loss"]
@@ -538,6 +635,20 @@ def main():
                 if key != "action_loss" and torch.is_tensor(value) and value.numel() == 1:
                     window["extra"][key] = window["extra"].get(key, 0.0) + value.float().item() / accum
             window["samples"] += len(batch)
+        if getattr(model, "diagnostics", False):  # gradient norm per top-level module (before clipping)
+            sq = {}
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                g = p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
+                key = "vision" if ".visual." in name else name.split(".")[0]
+                sq[key] = sq.get(key, 0.0) + g.float().pow(2).sum()
+            keys = sorted(sq)
+            vec = torch.stack([torch.as_tensor(sq[k], device=device, dtype=torch.float32) for k in keys])
+            if distributed:
+                dist.all_reduce(vec)
+            for k, v in zip(keys, vec.sqrt().tolist()):
+                window["extra"][f"gradnorm_{k}"] = window["extra"].get(f"gradnorm_{k}", 0.0) + v
         grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor()

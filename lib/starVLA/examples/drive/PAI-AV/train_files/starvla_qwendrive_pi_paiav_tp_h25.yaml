@@ -1,0 +1,79 @@
+run_id: starvla_qwendrive_pi_paiav_tp_h25
+run_root_dir: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi
+seed: 42
+use_wandb: true
+wandb_entity: your_wandb_entity   # placeholder -> default entity of the API key
+wandb_project: starVLA_drive
+
+# Qwen-Drive-1.0-4B (Qwen3.5-4B) VLM + pi-style layer-wise flow-matching action expert, trained from Qwen-Drive.
+# "tp" layout: navigation and proprio go to the DiT, not to the VLM.
+#   prompt : "predict trajectory" (no target point, no speed)
+#   state  (5, 7): ego history t-4..t @10Hz, per step [x, y, heading_rel, speed, acc_lon, target_x, target_y]
+#                  (target point in the t0 ego frame, repeated per step)
+#   action (25, 2): [acceleration, curvature] per 0.1 s step over 2.5 s (Alpamayo 1.5 unicycle model).
+# norm_stats / eval index: prepare_paiav.py --state_mode traj --action_mode unicycle --action_horizon 25
+#                          --out_dir outputs/qwendrive_pi/meta_h25_v2tp
+framework:
+  name: QwenDrivePI
+  qwenvl:
+    base_vlm: Qwen/Qwen-Drive-1.0-4B
+    attn_implementation: sdpa
+  drive:
+    prompt: predict trajectory
+    current_image_pixels: 921600   # 1280x720 budget for the current front frame
+    history_image_pixels: 174080   # 544x320 budget for the history front frame (t-0.1 s)
+  action_model:
+    action_dim: 2
+    action_horizon: 25             # controls for t0 -> t0 + 2.5 s @10 Hz
+    state_dim: 7
+    state_horizon: 5
+    num_inference_timesteps: 10
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      interleave_self_attention: true
+
+datasets:
+  vla_data:
+    data_root: /lus/flare/projects/RobustViT/hiratsuka/datasets/PhysicalAI-Autonomous-Vehicles
+    stats_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2tp/norm_stats.json
+    eval_index_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2tp/eval_samples_val.json
+    scene_index_path: /lus/flare/projects/RobustViT/hiratsuka/VLA4AD_Research/outputs/qwendrive_pi/meta_h25_v2tp/scene_samples_val.json   # figure-only scenes (prepare_scene_index.py)
+    num_eval_samples: 240          # 80 left / 80 right / 80 straight (val split)
+    target_distance: 25.0          # target point = first future ego position >= 25 m away
+    state_mode: traj
+    action_mode: unicycle
+    state_target_point: true
+    target_point_in_prompt: false
+    speed_in_prompt: false
+    per_device_batch_size: 4
+    eval_batch_size: 4
+    num_workers: 8
+    prefetch_factor: 4
+    worker_start_method: spawn
+
+trainer:
+  repeated_diffusion_steps: 4
+  max_train_steps: 30000
+  num_warmup_steps: 200
+  logging_frequency: 10
+  eval_interval: 1000
+  eval_at_start: true
+  num_eval_plots_per_class: 4
+  save_interval: 5000
+  keep_last_checkpoints: 2
+  save_dtype: bfloat16
+  learning_rate:          # DriveMoE: 5e-5 for both VLM and action expert
+    base: 5.0e-05
+    qwen_vl_interface: 5.0e-05
+    action_model: 5.0e-05
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-08
+  freeze_modules: ''
+  bf16: true
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
