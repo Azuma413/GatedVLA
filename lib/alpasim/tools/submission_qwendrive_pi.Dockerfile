@@ -38,7 +38,8 @@ COPY --from=run model.safetensors /opt/checkpoint/model.safetensors
 COPY --from=run config.yaml /opt/checkpoint/starvla_config.yaml
 COPY --from=run norm_stats.json /opt/checkpoint/norm_stats.json
 COPY --from=bundle base_vlm /opt/checkpoint/base_vlm
-COPY --from=bundle config.yaml /opt/checkpoint/config.yaml
+# config.yaml always, anchors.npz only for AnchorVLA bundles (the glob may match nothing).
+COPY --from=bundle config.yaml anchors.np[z] /opt/checkpoint/
 COPY --from=bundle sensor_rig_0.yaml /opt/checkpoint/sensor_rig.yaml
 
 COPY --from=starvla pyproject.toml README.md LICENSE /opt/starvla/

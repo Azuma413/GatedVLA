@@ -66,6 +66,12 @@ class VideoWriter:
                 "-",
                 "-c:v",
                 "libx264",
+                # One encoder thread per view: a driver records one view per concurrent rollout, and x264's
+                # default of 1.5 threads per core exhausts a sandbox's process limit (the challenge's 1024).
+                "-threads",
+                "1",
+                "-filter_threads",
+                "1",
                 "-preset",
                 "fast",
                 "-tune",

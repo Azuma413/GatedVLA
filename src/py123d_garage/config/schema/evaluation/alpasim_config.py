@@ -47,7 +47,8 @@ class AlpasimBenchmarkConfig(AbstractBenchmarkConfig):
     port: int = 6789
     # gRPC server worker threads.
     max_workers: int = 8
-    # Writes a drive video every n-th plan of every session into <run dir>/views; 0 disables the recording.
+    # Writes a drive video every n-th plan of every session into <run dir>/views, played in real time; 0 disables
+    # the recording.
     visualization_interval: int = 0
     # Spacing the route polyline is resampled at.
     route_resolution_m: float = 0.1

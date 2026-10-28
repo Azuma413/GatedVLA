@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import pytest
 import torch
 from py123d.api import SceneAPI
 
@@ -68,12 +69,12 @@ def test_ego_dynamics_are_oldest_first_and_pad_a_young_rollout() -> None:
     assert dynamics[-1, 7] == 0.0
 
 
-def test_config_mirrors_the_h25_run_and_replans_every_other_tick() -> None:
+def test_config_mirrors_the_h25_run_and_replans_every_half_second() -> None:
     config = QwenDrivePIConfig()
     assert config.trajectory_num_steps == 25
     assert config.required_history_duration_us == 400_000
     assert config.required_past_camera_interval_us == 100_000
-    assert config.replan_interval_us == 200_000
+    assert config.replan_interval_us == 500_000
 
 
 def test_graphed_sampler_runs_eager_off_cuda() -> None:
@@ -87,3 +88,31 @@ def test_graphed_sampler_runs_eager_off_cuda() -> None:
     out = sampler([torch.zeros(1, 3, 4)], torch.zeros(1, 5, 10), encoder_attention_mask=torch.ones(1, 3))
     assert torch.equal(out, torch.ones(1, 5, 10))
     assert len(calls) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
+def test_graphed_sampler_replays_fresh_inputs_with_and_without_query_bias() -> None:
+    def sample(
+        vl_embs_list: list[torch.Tensor],
+        state: torch.Tensor,
+        encoder_attention_mask: torch.Tensor,
+        query_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out = state * 2 + vl_embs_list[0].sum() + encoder_attention_mask.sum()
+        return out + query_bias.sum() if query_bias is not None else out
+
+    sampler = _GraphedFlowSampler(sample)
+    device = torch.device("cuda")
+    embs, mask = torch.ones(1, 3, 4, device=device), torch.ones(1, 3, device=device)
+    for value in (1.0, 2.0):
+        state = torch.full((1, 5, 5), value, device=device)
+        bias = torch.full((1, 25, 2), value, device=device)
+        torch.testing.assert_close(
+            sampler([embs, embs], state, encoder_attention_mask=mask), sample([embs], state, mask)
+        )
+        torch.testing.assert_close(
+            sampler([embs, embs], state, encoder_attention_mask=mask, query_bias=bias),
+            sample([embs], state, mask, bias),
+        )
+    # One graph per input layout, reused across values.
+    assert sampler.num_graphs == 2

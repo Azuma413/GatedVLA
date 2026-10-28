@@ -17,6 +17,20 @@ ln -sfn "${_step_dir}/model.safetensors" "${_out_dir}/model.safetensors"
 ln -sfn "${_step_dir}/config.yaml" "${_out_dir}/starvla_config.yaml"
 ln -sfn "${_step_dir}/norm_stats.json" "${_out_dir}/norm_stats.json"
 
+# AnchorVLA runs read their anchor codebook from framework.anchor.path at build time, not from the checkpoint;
+# copy the local copy of that file (ANCHORS, or <meta dir of anchor.path> next to the run directory) as a
+# plain file, since the image build copies the bundle without following links out of it.
+_anchor_path="$(uv run --project lib/alpasim/alpasim python -c 'import sys; from omegaconf import OmegaConf; a = OmegaConf.load(sys.argv[1]).framework.get("anchor", {}); print(a.get("path") or "" if a.get("enabled", False) else "")' "${_step_dir}/config.yaml")"
+rm -f "${_out_dir}/anchors.npz"
+if [[ -n "${_anchor_path}" ]]; then
+	_anchors="${ANCHORS:-$(dirname "${_run_dir}")/$(basename "$(dirname "${_anchor_path}")")/$(basename "${_anchor_path}")}"
+	[[ -f "${_anchors}" ]] || {
+		echo "the anchor codebook ${_anchors} of ${_anchor_path} is missing; set ANCHORS" >&2
+		exit 1
+	}
+	cp "${_anchors}" "${_out_dir}/anchors.npz"
+fi
+
 # Download the config, tokenizer and processor files of the base VLM; the checkpoint holds its weights
 _base_vlm="$(uv run --project lib/alpasim/alpasim python -c 'import sys; from omegaconf import OmegaConf; print(OmegaConf.load(sys.argv[1]).framework.qwenvl.base_vlm)' "${_step_dir}/config.yaml")"
 uvx --from "huggingface_hub>=0.34" hf download "${_base_vlm}" \

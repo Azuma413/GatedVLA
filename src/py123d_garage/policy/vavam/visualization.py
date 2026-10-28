@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import cv2
 import jaxtyping as jt
@@ -38,6 +39,40 @@ def render_view(
     Returns:
         the composed RGB image.
     """
+    bev = render_bev(prediction_xy, ground_truth_xy, target_points_xy, ego_box, visualization_config)
+    bev_height, bev_width = bev.shape[:2]
+    width = camera_rgb.shape[1]
+    scaled_bev = cv2.resize(bev, (width, round(width * bev_height / bev_width)))
+    height = camera_rgb.shape[0] + scaled_bev.shape[0] + 3 * _BORDER_PIXEL
+    canvas = np.full((height, width + 2 * _BORDER_PIXEL, 3), 255, dtype=np.uint8)
+    canvas[_BORDER_PIXEL : _BORDER_PIXEL + camera_rgb.shape[0], _BORDER_PIXEL : _BORDER_PIXEL + width] = camera_rgb
+    bev_row = 2 * _BORDER_PIXEL + camera_rgb.shape[0]
+    canvas[bev_row : bev_row + scaled_bev.shape[0], _BORDER_PIXEL : _BORDER_PIXEL + width] = scaled_bev
+    return canvas
+
+
+def render_bev(
+    prediction_xy: jt.Float32[npt.NDArray[np.float32], "num_poses 2"],
+    ground_truth_xy: jt.Float32[npt.NDArray[np.float32], "num_poses 2"] | None,
+    target_points_xy: jt.Float32[npt.NDArray[np.float32], "num_points 2"],
+    ego_box: jt.Float32[npt.NDArray[np.float32], " 5"],
+    visualization_config: VavamVisualizationConfig,
+    extra_trajectories: Sequence[tuple[str, npt.NDArray[np.float32], TrajectoryStyleConfig]] = (),
+) -> jt.UInt8[npt.NDArray[np.uint8], "bev_height bev_width 3"]:
+    """
+    The BEV sheet of render_view on its own: the ego box, the trajectories, the target points and a legend.
+
+    Args:
+        prediction_xy: the predicted waypoints in the ego rear-axle frame.
+        ground_truth_xy: the logged future on the same grid; None when the scene has no future.
+        target_points_xy: the navigation target points in the ego frame.
+        ego_box: the ego box (x, y, yaw, length, width) in the ego frame.
+        visualization_config: the sheet geometry and the overlay styles.
+        extra_trajectories: (legend label, ego-frame xy, style) drawn under the prediction.
+
+    Returns:
+        the BEV sheet, x (forward) up.
+    """
     config = visualization_config
     bev_height = round((config.bev_max_x_m - config.bev_min_x_m) * config.bev_pixels_per_meter)
     bev_width = round(2 * config.bev_half_width_m * config.bev_pixels_per_meter)
@@ -48,6 +83,9 @@ def render_view(
     if ground_truth_xy is not None:
         _draw_trajectory(bev, ground_truth_xy, config.ground_truth_trajectory_style, config)
         legend.append(("ground truth", config.ground_truth_trajectory_style.color_rgb))
+    for label, poses_xy, style in extra_trajectories:
+        _draw_trajectory(bev, poses_xy, style, config)
+        legend.append((label, style.color_rgb))
     _draw_trajectory(bev, prediction_xy, config.prediction_trajectory_style, config)
     for x, y in target_points_xy:
         if np.isnan(x) or np.isnan(y):
@@ -72,15 +110,7 @@ def render_view(
             1,
             lineType=cv2.LINE_AA,
         )
-
-    width = camera_rgb.shape[1]
-    scaled_bev = cv2.resize(bev, (width, round(width * bev_height / bev_width)))
-    height = camera_rgb.shape[0] + scaled_bev.shape[0] + 3 * _BORDER_PIXEL
-    canvas = np.full((height, width + 2 * _BORDER_PIXEL, 3), 255, dtype=np.uint8)
-    canvas[_BORDER_PIXEL : _BORDER_PIXEL + camera_rgb.shape[0], _BORDER_PIXEL : _BORDER_PIXEL + width] = camera_rgb
-    bev_row = 2 * _BORDER_PIXEL + camera_rgb.shape[0]
-    canvas[bev_row : bev_row + scaled_bev.shape[0], _BORDER_PIXEL : _BORDER_PIXEL + width] = scaled_bev
-    return canvas
+    return bev
 
 
 def _to_pixel(x: float, y: float, config: VavamVisualizationConfig) -> tuple[int, int]:

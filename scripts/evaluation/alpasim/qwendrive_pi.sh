@@ -14,12 +14,23 @@ _out_dir="$(realpath -m "${OUTPUT_DIR:-outputs/evaluation/alpasim/qwendrive_pi/$
 # Declare the port for the driver to listen on, defaulting to 6789 if not set.
 export ALPASIM_DRIVER_PORT="${ALPASIM_DRIVER_PORT:-6789}"
 
-# Start the driver in the background, offline like the image.
+# Drive videos (DRIVER_ARGS="visualization_interval=1") need ffmpeg; without one on PATH, use the static
+# build the AlpaSim venv ships with imageio-ffmpeg.
+if ! command -v ffmpeg >/dev/null; then
+	_ffmpeg="$(find lib/alpasim/alpasim/.venv -path '*imageio_ffmpeg/binaries/ffmpeg-*' -type f 2>/dev/null | head -1 || true)"
+	if [[ -n "${_ffmpeg}" ]]; then
+		mkdir -p "${_out_dir}/bin" && ln -sfn "$(realpath "${_ffmpeg}")" "${_out_dir}/bin/ffmpeg"
+		export PATH="${_out_dir}/bin:${PATH}"
+	fi
+fi
+
+# Start the driver in the background, offline like the image; DRIVER_ARGS are extra driver overrides.
+read -r -a _driver_args <<<"${DRIVER_ARGS:-}"
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 lib/alpasim/qwendrive_pi_venv/bin/python -m py123d_garage.evaluation.alpasim.evaluate \
 	hydra.run.dir="${_out_dir}/driver" \
 	policy_config.evaluation_checkpoint_file="${_bundle_dir}/model.safetensors" \
 	policy_config.evaluation_sensor_rig_file="${_bundle_dir}/sensor_rig_0.yaml" \
-	port="${ALPASIM_DRIVER_PORT}" &
+	port="${ALPASIM_DRIVER_PORT}" "${_driver_args[@]}" &
 
 # Stop the driver when the wizard is done.
 _driver_pid=$!

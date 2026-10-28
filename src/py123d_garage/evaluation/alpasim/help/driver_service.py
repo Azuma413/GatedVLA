@@ -54,7 +54,6 @@ LOG = logging.getLogger(__name__)
 _MIN_FALLBACK_SPEED_MPS = 2.0
 _SERVE_INTERVAL_US = 100_000
 _SERVE_HORIZON_US = 5_000_000
-_VISUALIZATION_FPS = 2.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,15 +107,8 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
             set(self._camera_id_by_alpasim_id.values()),
         )
         self._ego_metadata = build_ego_metadata(self._py123d_garage_config.ego_vehicle_config)
-        self._py123d_garage_video_writer = (
-            VideoWriter(
-                run_dir() / "views",
-                self._py123d_garage_config.visualization_interval,
-                fps=_VISUALIZATION_FPS / self._py123d_garage_config.visualization_interval,
-            )
-            if self._py123d_garage_config.visualization_interval
-            else None
-        )
+        # Built with the policy, whose replan interval sets the video's real-time frame rate.
+        self._py123d_garage_video_writer: VideoWriter | None = None
         self._sessions: dict[str, _Session] = {}
         self._lock = threading.RLock()
         self._inference_lock = threading.Lock()
@@ -132,6 +124,18 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
                 self._py123d_garage_config,
                 torch.device(self._py123d_garage_config.device),
             )
+            visualization_interval = self._py123d_garage_config.visualization_interval
+            if visualization_interval:
+                try:
+                    # One frame per recorded plan, so the video plays in real time.
+                    self._py123d_garage_video_writer = VideoWriter(
+                        run_dir() / "views",
+                        visualization_interval,
+                        fps=1e6 / (policy.policy_config.replan_interval_us * visualization_interval),
+                    )
+                except Exception:
+                    # The videos are a by-product; the loaded policy drives without them.
+                    LOG.exception("drive videos are off: the video writer failed to start")
             with self._lock:
                 self._py123d_garage_policy = policy
         except BaseException as error:
