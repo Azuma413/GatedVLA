@@ -174,7 +174,9 @@ def test_prompt_matches_the_training_loader() -> None:
     policy._target_point_in_prompt = True  # pyright: ignore[reportPrivateUsage]
     policy._speed_in_prompt = True  # pyright: ignore[reportPrivateUsage]
     inputs = policy._prompt_inputs(np.array([24.63, -1.25], np.float32), 8.26)  # pyright: ignore[reportPrivateUsage]
-    assert inputs == {"v0": 8.26, "lang": "predict trajectory. speed: 8.3 m/s. target point: x 24.6 m, y -1.2 m"}
+    assert inputs["lang"] == "predict trajectory. speed: 8.3 m/s. target point: x 24.6 m, y -1.2 m"
+    assert inputs["v0"] == 8.26
+    np.testing.assert_allclose(inputs["target_xy"], [24.63, -1.25])
 
 
 def test_prompt_copy_matches_starvla() -> None:
@@ -202,8 +204,8 @@ def test_prompt_copy_matches_starvla() -> None:
         )
 
 
-def test_waypoint_runs_get_no_prompt() -> None:
-    assert _policy()._prompt_inputs(np.zeros(2, np.float32), 3.0) == {"v0": 3.0}  # pyright: ignore[reportPrivateUsage]
+def test_runs_without_prompt_numbers_get_no_prompt() -> None:
+    assert "lang" not in _policy()._prompt_inputs(np.zeros(2, np.float32), 3.0)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_verify_accepts_the_v2_run(tmp_path: Path) -> None:
@@ -274,3 +276,28 @@ def test_straight_line_target_point_follows_training_on_a_curve() -> None:
     assert abs(float(np.linalg.norm(target)) - 25.0) < 0.15
     arc_point = xy[np.searchsorted(arc_m, 25.0)]
     assert target[1] > arc_point[1] + 3.0
+
+
+def _tp_run(eye_gate: dict[str, Any]) -> tuple[DictConfig, dict[str, Any]]:
+    """The tp layout (target point in the DiT state, no numbers in the prompt) with a target presence flag."""
+    config = _run_config()
+    config.datasets.vla_data.state_target_point = True
+    config.datasets.vla_data.target_point_in_prompt = False
+    config.datasets.vla_data.speed_in_prompt = False
+    config.framework.eye_gate = eye_gate
+    norm_stats = _norm_stats()
+    norm_stats["state"]["names"] = [*_TRAJ_NAMES, "target_x", "target_y"]
+    return config, norm_stats
+
+
+def test_verify_accepts_the_tp_layout_with_and_without_the_eye_gate(tmp_path: Path) -> None:
+    for eye_gate in ({"enabled": False}, {"enabled": True, "scheme": "three_path"}):
+        config, norm_stats = _tp_run(eye_gate)
+        _policy()._verify_run(config, norm_stats, tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_verify_refuses_target_columns_the_run_does_not_have(tmp_path: Path) -> None:
+    config, norm_stats = _tp_run({"enabled": False})
+    config.datasets.vla_data.state_target_point = False
+    with pytest.raises(ValueError, match="state"):
+        _policy()._verify_run(config, norm_stats, tmp_path)  # pyright: ignore[reportPrivateUsage]

@@ -13,7 +13,7 @@ import jaxtyping as jt
 import numpy as np
 import numpy.typing as npt
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from PIL import Image
 from py123d.api import SceneAPI
 from py123d.datatypes import EgoStateSE3
@@ -46,6 +46,7 @@ _STATE_NAMES = [*_DYNAMICS_NAMES, "target_x", "target_y"]
 # The starVLA "traj" state without the target point (pai_av_drive.TRAJ_STATE_NAMES) and the unicycle controls.
 _TRAJ_STATE_NAMES = ["x", "y", "heading_rel", "speed", "acc_lon"]
 _UNICYCLE_ACTION_NAMES = ["accel", "curvature"]
+_TARGET_STATE_NAMES = ["target_x", "target_y"]
 _SPEED_COLUMN = {"drivemoe": _STATE_NAMES.index("speed"), "traj": _TRAJ_STATE_NAMES.index("speed")}
 
 _PAST_TRAJECTORY_STYLE = TrajectoryStyleConfig(color_rgb=[127, 127, 127])
@@ -59,7 +60,8 @@ class QwenDrivePIFeatures(AbstractFeatures):
     # The current frame at the training size.
     current_frame: jt.UInt8[torch.Tensor, "*batch current_height current_width 3"]
     # Un-normalized per-step ego state, oldest first, the anchor last: _DYNAMICS_NAMES for drivemoe runs (the
-    # target point is appended in forward), _TRAJ_STATE_NAMES for traj runs.
+    # target point is appended in forward), _TRAJ_STATE_NAMES for traj runs (the target point appended in forward
+    # when the run's state carries it).
     ego_state: jt.Float[torch.Tensor, "*batch state_horizon state_dim"]
     # The target point as training placed it (see _straight_line_target_point), in the anchor's rear-axle frame.
     target_point: jt.Float[torch.Tensor, "*batch 2"]
@@ -103,8 +105,10 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
         )
         self._config: QwenDrivePIConfig = config.qwendrive_pi_config
         self._checkpoint_file: Path | None = None
-        # The run's state_mode ("drivemoe" or "traj"), read from its config when the model is built.
+        # The run's state_mode ("drivemoe" or "traj"), read from its config when the model is built, and whether
+        # its state ends with the target point (always for drivemoe; datasets.vla_data.state_target_point for traj).
         self._state_mode = "drivemoe"
+        self._state_target_point = True
         self._state_q01 = np.zeros(len(_STATE_NAMES), dtype=np.float32)
         self._state_q99 = np.ones(len(_STATE_NAMES), dtype=np.float32)
         # Waypoint actions are q01 / q99 normalized, unicycle controls mean / std (starVLA's Normalizer).
@@ -156,6 +160,7 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
 
         vla_data = starvla_config.datasets.vla_data
         self._state_mode = str(vla_data.get("state_mode", "drivemoe"))
+        self._state_target_point = self._state_mode == "drivemoe" or bool(vla_data.get("state_target_point", True))
         state_stats, action_stats = norm_stats["state"], norm_stats["action"]
         self._state_q01 = np.asarray(state_stats["q01"], dtype=np.float32)
         self._state_q99 = np.asarray(state_stats["q99"], dtype=np.float32)
@@ -202,6 +207,7 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
             _use_torch_linear_attention()
         _load_safetensors_in_place(model, self._checkpoint_file)
         model.eval()
+        _disable_evaluation_extras(model)
         if self._config.cuda_graph_expert:
             model.action_model.predict_action = _GraphedFlowSampler(model.action_model.predict_action)
         self.model = model
@@ -215,8 +221,9 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
         problems: list[str] = []
         if framework.name != "QwenDrivePI":
             problems.append(f"framework {framework.name} is not QwenDrivePI")
-        if framework.get("eye_gate", {}).get("enabled", False):
-            problems.append("eye-gated runs are not verified in closed loop")
+        eye_gate = framework.get("eye_gate", {})
+        if eye_gate.get("enabled", False) and str(eye_gate.get("scheme", "standard")) == "vlm_keep":
+            problems.append("eye gate scheme vlm_keep (its own predict path) is not served")
         layout = (vla_data.get("state_mode", "drivemoe"), vla_data.get("action_mode", "waypoints"))
         action_mean_std = norm_stats["action"].get("norm", "q01_q99") == "mean_std"
         if layout == ("drivemoe", "waypoints"):
@@ -226,9 +233,8 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
             if action_mean_std:
                 problems.append("mean / std waypoint normalization")
         elif layout == ("traj", "unicycle"):
-            if vla_data.get("state_target_point", True):
-                problems.append("traj states with the target point")
-            expected_names = (_TRAJ_STATE_NAMES, _UNICYCLE_ACTION_NAMES)
+            with_target = bool(vla_data.get("state_target_point", True))
+            expected_names = (_TRAJ_STATE_NAMES + (_TARGET_STATE_NAMES if with_target else []), _UNICYCLE_ACTION_NAMES)
             if not action_mean_std:
                 problems.append("q01 / q99 unicycle normalization")
         else:
@@ -272,6 +278,8 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
         """
         (current_width, current_height), (history_width, history_height) = self._current_size, self._history_size
         state_names = _STATE_NAMES if self._state_mode == "drivemoe" else _TRAJ_STATE_NAMES
+        if self._state_mode == "traj" and self._state_target_point:
+            state_names = state_names + _TARGET_STATE_NAMES
         images = [Image.new("RGB", (history_width, history_height))] * self._config.num_history_frames + [
             Image.new("RGB", (current_width, current_height)),
         ]
@@ -399,7 +407,7 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
         examples: list[dict[str, Any]] = []
         for index in range(current_frames.shape[0]):
             state = ego_states[index]
-            if self._state_mode == "drivemoe":
+            if self._state_target_point:
                 state = np.concatenate([state, np.repeat(target_xy[index][None], state.shape[0], axis=0)], axis=1)
             examples.append(
                 {
@@ -438,7 +446,8 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
         The example keys beyond image and state: the prompt with the target point and the speed when the run
         put them there (starVLA's drive_prompt, byte for byte), and v0, which control-space anchors integrate from.
         """
-        inputs: dict[str, Any] = {"v0": v0}
+        # target_xy: the eye gate's query (eye_gate.query target / target_speed / target_state) reads it raw.
+        inputs: dict[str, Any] = {"v0": v0, "target_xy": np.asarray(target_xy, dtype=np.float32)}
         if self._target_point_in_prompt or self._speed_in_prompt:
             inputs["lang"] = _drive_prompt(
                 self._prompt,
@@ -554,6 +563,40 @@ def _use_torch_linear_attention() -> None:
         setattr(modeling_qwen3_5, name, inspect.unwrap(getattr(modeling_qwen3_5, name)))
 
 
+class _NoAttentionProbe:
+    """
+    Stands in for starVLA's CrossAttentionProbe: its hooks record the DiT's attention for eval figures only,
+    cost a q·k product per block and record nothing under a replayed CUDA graph.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    def __enter__(self) -> _NoAttentionProbe:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        del exc
+
+    def mean(self) -> None:
+        return None
+
+
+def _disable_evaluation_extras(model: Any) -> None:
+    """
+    Turns off what a run's eval settings add to every prediction (drive.diagnostics: probes and a black-image
+    re-run; eye_gate.eval_controls: soft-mask control predictions; the eye gate's attention maps), none of which
+    the served plan uses. The modules stay built, so the checkpoint still loads strictly.
+    """
+    from starVLA.model.framework.VLM4A import QwenDrivePI as qwendrive_pi_module  # pyright: ignore[reportMissingImports]
+
+    model.diagnostics = False
+    with open_dict(model.config):
+        model.config.framework.eye_gate.eval_controls = False
+    qwendrive_pi_module.CrossAttentionProbe = _NoAttentionProbe
+    model._add_attention_outputs = lambda *args, **kwargs: None
+
+
 def _load_safetensors_in_place(model: torch.nn.Module, checkpoint_file: Path) -> None:
     """
     Copies the checkpoint tensor by tensor into the built model, strictly; the tied LM head the
@@ -599,7 +642,17 @@ class _GraphedFlowSampler:
         state: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         query_bias: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # A given noise (paired eval controls, regression heads) runs eagerly; the graph draws its own.
+        if noise is not None:
+            return self._sample(
+                vl_embs_list,
+                state,
+                encoder_attention_mask=encoder_attention_mask,
+                query_bias=query_bias,
+                noise=noise,
+            )
         if state is None or encoder_attention_mask is None:
             return self._sample(
                 vl_embs_list, state, encoder_attention_mask=encoder_attention_mask, query_bias=query_bias
