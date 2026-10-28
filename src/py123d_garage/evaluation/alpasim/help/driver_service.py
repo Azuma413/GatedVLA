@@ -33,6 +33,7 @@ from typing_extensions import override
 from py123d_garage.api.abstract_policy import AnyPolicy
 from py123d_garage.api.abstract_policy_tensors import NavigationConditioning
 from py123d_garage.common.config_help import run_dir
+from py123d_garage.common.logging_setup import setup_logging
 from py123d_garage.common.video_writer import VideoWriter
 from py123d_garage.config.schema.evaluation.alpasim_config import AlpasimBenchmarkConfig
 from py123d_garage.datatypes.numerics import NonNegativeInt, PositiveInt
@@ -124,6 +125,8 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
                 self._py123d_garage_config,
                 torch.device(self._py123d_garage_config.device),
             )
+            # Policy imports may reconfigure logging (starVLA's overwatch disables the existing loggers).
+            setup_logging()
             visualization_interval = self._py123d_garage_config.visualization_interval
             if visualization_interval:
                 try:
