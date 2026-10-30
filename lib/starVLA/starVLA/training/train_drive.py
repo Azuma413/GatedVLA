@@ -97,7 +97,7 @@ def main():
     from starVLA.dataloader.pai_av_drive import DriveSampler, Normalizer, PAIAVDriveDataset, collate_examples
     from starVLA.model.framework.base_framework import build_framework
     from starVLA.training.drive_openloop import (
-        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, plot_bev, turn_metrics,
+        MANEUVERS, anchor_metrics, displacement_metrics, fig_to_image, gate_diagnostics, longitudinal_metrics, plot_bev, turn_metrics,
     )
 
     is_main = rank == 0
@@ -241,8 +241,12 @@ def main():
     # (its forward runs without gradient, its learning rate is 0), then warmed up and decayed over the rest; the other
     # modules follow the normal schedule from step 0.
     freeze_steps = int(float(tcfg.get("backbone_freeze_epochs", 0) or 0) * steps_per_epoch)
+    # trainer.gate_only_steps: only the eye gate learns at first (every other group at learning rate 0, VLM forward
+    # without gradient), e.g. a gate added to a trained policy.
+    gate_only = int(tcfg.get("gate_only_steps", 0) or 0)
+    freeze_steps = max(freeze_steps, gate_only)
     if freeze_steps:
-        log(f"LP-FT: VLM frozen for the first {freeze_steps} steps")
+        log(f"LP-FT: VLM frozen for the first {freeze_steps} steps" + (f"; gate only for {gate_only}" if gate_only else ""))
 
     def lr_lambda_for(base_lr, start=0):
         min_ratio = min_lr / base_lr if base_lr > 0 else 0.0
@@ -259,7 +263,8 @@ def main():
         return f
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [
-        lr_lambda_for(g["lr"], freeze_steps if g["name"] == "qwen_vl_interface" else 0) for g in param_groups
+        lr_lambda_for(g["lr"], freeze_steps if g["name"] == "qwen_vl_interface" else (0 if g["name"] == "eye_gate" else gate_only))
+        for g in param_groups
     ])
     params = [p for g in param_groups for p in g["params"]]
     dit_params = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith("action_model.")]
@@ -442,11 +447,14 @@ def main():
             metrics.update({f"textdrop/{k}": v for k, v in td.items() if "/" not in k})
         metrics.update(turn_metrics(np.stack([r["pred_xy"] for r in records]), np.stack([r["gt_xy"] for r in records]),
                                     [r["maneuver"] for r in records]))
+        metrics.update(longitudinal_metrics(np.stack([r["pred_xy"] for r in records]), np.stack([r["gt_xy"] for r in records]),
+                                            dt=sampler_cfg.dt))
         for name in records[0].get("pred_xy_controls", {}):
             ctl_xy, gt_xy = np.stack([r["pred_xy_controls"][name] for r in records]), np.stack([r["gt_xy"] for r in records])
             mans = [r["maneuver"] for r in records]
             metrics.update({f"{name}/{k}": v for k, v in displacement_metrics(ctl_xy, gt_xy, mans, dt=sampler_cfg.dt).items()})
             metrics.update({f"{name}/{k}": v for k, v in turn_metrics(ctl_xy, gt_xy, mans).items()})
+            metrics.update({f"{name}/{k}": v for k, v in longitudinal_metrics(ctl_xy, gt_xy, dt=sampler_cfg.dt).items()})
         if "probe" in records[0]:  # detached probes on the DiT inputs: correlation with the ground truth
             gt = np.stack([r["gt_xy"] for r in records])
             heading = np.arctan2(gt[:, -1, 1] - gt[:, -2, 1], gt[:, -1, 0] - gt[:, -2, 0])
@@ -714,10 +722,17 @@ def main():
 
 def load_weights(model, path, log=print):
     """Load a checkpoint saved by this script (directory or model.safetensors) into an unsharded model."""
+    import torch
     from safetensors.torch import load_file
 
     path = Path(path)
     state = load_file(str(path / "model.safetensors" if path.is_dir() else path))
+    own = model.state_dict()
+    for k, v in list(state.items()):  # added input channels (e.g. a new state flag): zero columns, same output
+        if k in own and v.dim() == 2 and own[k].dim() == 2 and own[k].shape[0] == v.shape[0] and own[k].shape[1] > v.shape[1]:
+            pad = torch.zeros(v.shape[0], own[k].shape[1] - v.shape[1], dtype=v.dtype)
+            state[k] = torch.cat([v, pad], dim=1)
+            log(f"  {k}: {tuple(v.shape)} -> {tuple(state[k].shape)} (new input columns zero)")
     missing, unexpected = model.load_state_dict(state, strict=False)
     missing = [k for k in missing if not k.endswith("lm_head.weight")]
     log(f"loaded {path}: missing {len(missing)} unexpected {len(unexpected)}")
