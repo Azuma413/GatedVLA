@@ -208,6 +208,10 @@ class QwenDrivePIPolicy(AbstractPolicy[QwenDrivePIFeatures, QwenDrivePILabels, Q
         _load_safetensors_in_place(model, self._checkpoint_file)
         model.eval()
         _disable_evaluation_extras(model)
+        if self._config.num_action_samples > 1:
+            model.action_model.predict_action = _AveragedFlowSampler(
+                model.action_model.predict_action, self._config.num_action_samples
+            )
         if self._config.cuda_graph_expert:
             model.action_model.predict_action = _GraphedFlowSampler(model.action_model.predict_action)
         self.model = model
@@ -617,6 +621,50 @@ def _load_safetensors_in_place(model: torch.nn.Module, checkpoint_file: Path) ->
         with torch.no_grad():
             for key in keys:
                 targets[key].copy_(checkpoint.get_tensor(key))  # pyright: ignore[reportUnknownMemberType]
+
+
+class _AveragedFlowSampler:
+    """
+    The mean of n flow-matching samples per plan: every input is repeated n times along the batch, so the
+    n denoising loops run as one batched pass (and one CUDA graph), and the samples average per example.
+    A given noise (paired eval controls) already fixes the sample and runs once.
+    """
+
+    def __init__(self, sample: Any, num_samples: int) -> None:
+        self._sample = sample
+        self._num_samples = num_samples
+
+    def __call__(
+        self,
+        vl_embs_list: list[torch.Tensor],
+        state: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        query_bias: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if noise is not None:
+            return self._sample(
+                vl_embs_list,
+                state,
+                encoder_attention_mask=encoder_attention_mask,
+                query_bias=query_bias,
+                noise=noise,
+            )
+        batch_size = vl_embs_list[0].shape[0]
+        # The list repeats one tensor for the blocks that share a VLM layer; each is repeated once.
+        repeated: dict[int, torch.Tensor] = {}
+        for tensor in vl_embs_list:
+            repeated.setdefault(id(tensor), self._repeat(tensor))
+        actions = self._sample(
+            [repeated[id(tensor)] for tensor in vl_embs_list],
+            self._repeat(state),
+            encoder_attention_mask=self._repeat(encoder_attention_mask),
+            query_bias=self._repeat(query_bias),
+        )
+        return actions.unflatten(0, (batch_size, self._num_samples)).mean(dim=1)
+
+    def _repeat(self, tensor: torch.Tensor | None) -> Any:
+        return tensor.repeat_interleave(self._num_samples, dim=0) if tensor is not None else None
 
 
 class _GraphedFlowSampler:

@@ -55,6 +55,10 @@ class QwenDrivePIConfig(AbstractPolicyConfig):
     # Flow-matching integration steps; None keeps the trained framework.action_model.num_inference_timesteps.
     num_inference_timesteps: int | None = None
 
+    # Flow-matching samples drawn per plan (one batched expert pass) and averaged in the normalized action
+    # space; 1 serves a single sample, as training's evaluation does.
+    num_action_samples: PositiveInt = 1
+
     # Closed-loop drivers query the model every n-th trajectory interval and serve the cached plan in
     # between: one inference takes longer than the 100 ms AlpaSim tick (see the challenge's 0.1 s target).
     # Every 0.5 s keeps the mean Drive call under 0.1 s for inferences up to 0.25 s with two rollouts

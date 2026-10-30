@@ -13,6 +13,7 @@ from py123d.api import SceneAPI
 
 from py123d_garage.config.schema.policy.qwendrive_pi_config import QwenDrivePIConfig
 from py123d_garage.policy.qwendrive_pi.qwendrive_pi_policy import (
+    _AveragedFlowSampler,  # pyright: ignore[reportPrivateUsage]
     _ego_dynamics,  # pyright: ignore[reportPrivateUsage]
     _GraphedFlowSampler,  # pyright: ignore[reportPrivateUsage]
     _normalize,  # pyright: ignore[reportPrivateUsage]
@@ -75,6 +76,24 @@ def test_config_mirrors_the_h25_run_and_replans_every_half_second() -> None:
     assert config.required_history_duration_us == 400_000
     assert config.required_past_camera_interval_us == 100_000
     assert config.replan_interval_us == 500_000
+
+
+def test_averaged_sampler_batches_the_samples_and_averages_per_example() -> None:
+    seen: list[tuple[int, ...]] = []
+
+    def sample(vl_embs_list: list[torch.Tensor], state: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        seen.append(
+            (len({id(tensor) for tensor in vl_embs_list}), vl_embs_list[0].shape[0], kwargs["query_bias"].shape[0])
+        )
+        # Sample k of example b: state + k, so the mean over k = 0..3 is state + 1.5.
+        return state + torch.arange(4.0).repeat(state.shape[0] // 4)[:, None, None]
+
+    sampler = _AveragedFlowSampler(sample, num_samples=4)
+    embs, state = torch.zeros(2, 3, 4), torch.stack([torch.zeros(5, 2), torch.ones(5, 2)])
+    out = sampler([embs, embs], state, encoder_attention_mask=torch.ones(2, 3), query_bias=torch.zeros(2, 25, 2))
+    torch.testing.assert_close(out, state + 1.5)
+    # One batched pass of 2 x 4 samples, the shared VLM layer still shared.
+    assert seen == [(1, 8, 8)]
 
 
 def test_graphed_sampler_runs_eager_off_cuda() -> None:
