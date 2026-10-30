@@ -84,6 +84,8 @@ class _Session:
         self.angular_velocity_radps = Vector3D(x=0.0, y=0.0, z=0.0)
         self.route_polyline_rig_xy: npt.NDArray[np.float64] | None = None
         self.cached_plan: _CachedPlan | None = None
+        # The newest predictions as the policy made them, oldest first, for the temporal ensemble.
+        self.recent_plans: list[_CachedPlan] = []
         self.num_plans: int = 0
 
 
@@ -355,9 +357,11 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
         if plan is None or time_now_us - plan.created_time_us >= policy.policy_config.replan_interval_us:
             fresh = self._replan(policy, session, request.session_uuid, ego_pose_local, time_now_us, interval_us)
             if fresh is not None:
-                plan = fresh
+                num_ensembled = self._py123d_garage_config.temporal_ensemble_plans
                 with self._lock:
-                    session.cached_plan = fresh
+                    session.recent_plans = [*session.recent_plans, fresh][-num_ensembled:]
+                    plan = _ensemble_plans(session.recent_plans, self._py123d_garage_config.temporal_ensemble_decay)
+                    session.cached_plan = plan
         trajectory = (
             _trajectory_from_plan(plan, ego_pose_local, time_now_us, fallback_speed_mps)
             if plan is not None and ego_pose_local is not None
@@ -665,6 +669,43 @@ def _make_plan(
         times_s=times_s,
         positions_xy=positions_xy,
         yaws=yaws,
+    )
+
+
+def _ensemble_plans(plans: list[_CachedPlan], decay: float) -> _CachedPlan:
+    """
+    The newest plan averaged with the older ones (oldest first) on its own time grid, where they still cover it.
+    Each older plan is re-anchored first: moved rigidly so that its pose at the newest plan's creation time is the
+    newest plan's first pose, the current one. Weights: exp(-decay * age in plans), the newest at age 0.
+    """
+    newest = plans[-1]
+    if len(plans) == 1:
+        return newest
+    weight_sum = np.ones(len(newest.times_s), dtype=np.float64)
+    position_sum = newest.positions_xy.copy()
+    heading_sum = np.exp(1j * newest.yaws)
+    for age, plan in enumerate(reversed(plans[:-1]), start=1):
+        times_s = newest.times_s + (newest.created_time_us - plan.created_time_us) / 1e6
+        covered = times_s <= plan.times_s[-1] + 1e-9
+        if not covered[0]:
+            continue
+        yaws = np.interp(times_s[covered], plan.times_s, np.unwrap(plan.yaws))
+        positions_xy = np.stack(
+            [np.interp(times_s[covered], plan.times_s, plan.positions_xy[:, axis]) for axis in (0, 1)],
+            axis=-1,
+        )
+        # Rotate about the plan's own pose now onto the current pose.
+        turn = newest.yaws[0] - yaws[0]
+        rotation = np.array([[math.cos(turn), -math.sin(turn)], [math.sin(turn), math.cos(turn)]])
+        positions_xy = (positions_xy - positions_xy[0]) @ rotation.T + newest.positions_xy[0]
+        weight = math.exp(-decay * age)
+        weight_sum[covered] += weight
+        position_sum[covered] += weight * positions_xy
+        heading_sum[covered] += weight * np.exp(1j * (yaws + turn))
+    return dataclasses.replace(
+        newest,
+        positions_xy=position_sum / weight_sum[:, None],
+        yaws=np.angle(heading_sum),
     )
 
 

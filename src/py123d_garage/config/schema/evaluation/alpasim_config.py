@@ -52,6 +52,11 @@ class AlpasimBenchmarkConfig(AbstractBenchmarkConfig):
     visualization_interval: int = 0
     # Spacing the route polyline is resampled at.
     route_resolution_m: float = 0.1
+    # ACT's temporal ensembling on the served plans: each new plan is averaged with the previous
+    # temporal_ensemble_plans - 1 predictions where they overlap in time, each re-anchored at the current pose and
+    # weighted exp(-temporal_ensemble_decay * its age in plans); 1 serves every plan as predicted.
+    temporal_ensemble_plans: PositiveInt = 1
+    temporal_ensemble_decay: NonNegativeFloat = 0.0
 
     # -- The AlpaSim protocol, hard-coded --
 

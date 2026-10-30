@@ -318,3 +318,31 @@ def test_route_bridge_follows_the_turn_instead_of_the_chord() -> None:
     chord_y_at = lambda x: -30.1 / 13.4 * x  # noqa: E731
     middle = bridge[len(bridge) // 2]
     assert middle[1] > chord_y_at(middle[0]) + 2.0
+
+
+def test_temporal_ensemble_reanchors_older_plans_at_the_current_pose() -> None:
+    from py123d_garage.evaluation.alpasim.help.driver_service import _ensemble_plans, _make_plan
+
+    straight = np.stack([np.arange(1, 26) * 1.0, np.zeros(25)], axis=-1)  # 10 m/s along the rig's x
+    left = straight + np.stack([np.zeros(25), 0.02 * np.arange(1, 26) ** 2], axis=-1)
+    # The previous plan was made 0.5 s ago 1 m to the side with another heading; the same motion relative to its
+    # pose now (5 m on) cancels out, so the ensemble serves the newest plan unchanged.
+    older = _make_plan(straight, np.array([0.0, 1.0, 0.0, 0.3]), 0, 100_000)
+    newest = _make_plan(straight, np.array([10.0, -2.0, 0.0, -0.4]), 500_000, 100_000)
+    same = _ensemble_plans([older, newest], decay=0.0)
+    np.testing.assert_allclose(same.positions_xy[:21], newest.positions_xy[:21], atol=1e-9)
+    np.testing.assert_allclose(same.yaws[:21], newest.yaws[:21], atol=1e-9)
+    assert same.created_time_us == newest.created_time_us
+
+    # A plan that bends left: halfway between, from the current pose; beyond its horizon the newest plan alone.
+    bent = _ensemble_plans(
+        [_make_plan(left, np.zeros(4), 0, 100_000), _make_plan(straight, np.zeros(4), 0, 100_000)], 0.0
+    )
+    np.testing.assert_allclose(bent.positions_xy[0], [0.0, 0.0])
+    np.testing.assert_allclose(bent.positions_xy[10], (left[9] + straight[9]) / 2.0)
+    decayed = _ensemble_plans(
+        [_make_plan(left, np.zeros(4), 0, 100_000), _make_plan(straight, np.zeros(4), 0, 100_000)], math.log(3.0)
+    )
+    np.testing.assert_allclose(decayed.positions_xy[10], 0.25 * left[9] + 0.75 * straight[9])
+    stale = _make_plan(left, np.zeros(4), -3_000_000, 100_000)
+    np.testing.assert_allclose(_ensemble_plans([stale, newest], 0.0).positions_xy, newest.positions_xy)
