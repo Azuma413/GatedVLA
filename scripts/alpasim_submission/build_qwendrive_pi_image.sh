@@ -23,6 +23,7 @@ docker buildx build \
 	--build-context bundle="${_bundle_dir}" \
 	--build-context wheels="${_wheels}" \
 	--build-arg GIT_HASH="$(git rev-parse --short HEAD)" \
+	--build-arg DRIVER_OVERRIDES="${DRIVER_OVERRIDES:-}" \
 	--load \
 	-t "py123d-garage-alpasim:${_tag}" \
 	.

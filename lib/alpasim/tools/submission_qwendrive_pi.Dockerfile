@@ -51,11 +51,14 @@ COPY . /opt/py123d-garage
 RUN uv pip install --python /opt/venv/bin/python --no-deps /opt/py123d-garage
 
 ARG GIT_HASH=unknown
+# Driver overrides baked into the submission (the challenge starts the image without arguments), e.g.
+# "temporal_ensemble_plans=4 +policy_config.qwendrive_pi_config.num_action_samples=8".
+ARG DRIVER_OVERRIDES=""
 ENV PY123D_GARAGE_CONFIG="\
 hydra.run.dir=/tmp/alpasim_driver \
 policy_config.evaluation_checkpoint_file=/opt/checkpoint/model.safetensors \
 policy_config.evaluation_sensor_rig_file=/opt/checkpoint/sensor_rig.yaml \
-git_hash=${GIT_HASH}"
+git_hash=${GIT_HASH} ${DRIVER_OVERRIDES}"
 
 ENV HOME=/tmp MPLCONFIGDIR=/tmp/matplotlib TRITON_CACHE_DIR=/tmp/triton OMP_NUM_THREADS=8
 ENTRYPOINT ["sh", "-c", "exec python -m py123d_garage.evaluation.alpasim.evaluate ${PY123D_GARAGE_CONFIG} host=\"${ALPASIM_DRIVER_HOST:-0.0.0.0}\" port=\"${ALPASIM_DRIVER_PORT:-6789}\" \"$@\"", "sh"]
