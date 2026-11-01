@@ -26,6 +26,42 @@ class EgoVehicleConfig:
 
 
 @dataclass
+class AebConfig:
+    """Camera-based emergency braking on top of the served plans."""
+
+    # Directory of a transformers RT-DETR checkpoint; None serves the plans as predicted.
+    detector_dir: str | None = None
+    # Detection confidence a road user needs.
+    score_threshold: float = 0.5
+    # Square side the front frame is resized to for the detector.
+    input_size: int = 640
+    # Least time between two detections of a session; 0 looks at every front frame.
+    detection_interval_s: float = 0.0
+    # Fraction cut off each end of a box's bottom edge: the corners of an obliquely seen road user lie beside it.
+    edge_shrink: float = 0.3
+    # Half width of the ego plus the lateral margin of its corridor around the planned path.
+    corridor_half_width_m: float = 1.3
+    # Rear axle to front bumper.
+    front_overhang_m: float = 4.05
+    # Standstill gap to the obstacle.
+    stop_gap_m: float = 2.5
+    # Reaction delay of the controller, during which the closing speed still eats the gap.
+    latency_s: float = 0.4
+    # Brake once stopping in time needs more than this deceleration.
+    trigger_decel_mps2: float = 3.0
+    # Hardest braking the re-timed plan asks for.
+    max_decel_mps2: float = 8.0
+    # No acceleration while the time to collision is below this.
+    no_accel_ttc_s: float = 3.0
+    # Distance samples of the lead obstacle the closing speed is fit over.
+    track_window_s: float = 1.0
+    # Samples the closing speed needs before the rule acts.
+    min_track_samples: int = 6
+    # A jump larger than this in the lead distance restarts its track.
+    track_jump_m: float = 4.0
+
+
+@dataclass
 class AlpasimBenchmarkConfig(AbstractBenchmarkConfig):
     # -- Config objects --
 
@@ -33,6 +69,8 @@ class AlpasimBenchmarkConfig(AbstractBenchmarkConfig):
     policy_config: EvaluationPolicyConfig = field(default_factory=EvaluationPolicyConfig)
     # Ego geometry the driver builds its metadata from.
     ego_vehicle_config: EgoVehicleConfig = field(default_factory=EgoVehicleConfig)
+    # Emergency braking for road users ahead that the policy misses.
+    aeb_config: AebConfig = field(default_factory=AebConfig)
 
     # -- Atomic settings --
 

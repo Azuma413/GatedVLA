@@ -9,10 +9,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 _bundle_dir="$(realpath -s "${BUNDLE_DIR:-outputs/checkpoints/qwendrive_pi/qdpi_paiav_12ep_h25}")"
 _run_dir="$(dirname "$(realpath "${_bundle_dir}/model.safetensors")")"
 _tag="${TAG:-qwendrive-pi}"
+# The emergency-braking detector to bake in (empty by default; enable it with aeb_config.detector_dir=/opt/aeb)
+_empty="$(mktemp -d)"
+_aeb_dir="$(realpath -s "${AEB_DETECTOR_DIR:-${_empty}}")"
 
 # Build the alpasim gRPC wheel the image installs
 _wheels="$(mktemp -d)"
-trap 'rm -rf "${_wheels}"' EXIT
+trap 'rm -rf "${_wheels}" "${_empty}"' EXIT
 (cd lib/alpasim/alpasim/src/grpc && uv build --wheel --out-dir "${_wheels}")
 
 # Build the image py123d-garage-alpasim:TAG from this checkout, starVLA, the starVLA run files and the bundle
@@ -22,6 +25,7 @@ docker buildx build \
 	--build-context run="${_run_dir}" \
 	--build-context bundle="${_bundle_dir}" \
 	--build-context wheels="${_wheels}" \
+	--build-context aeb="${_aeb_dir}" \
 	--build-arg GIT_HASH="$(git rev-parse --short HEAD)" \
 	--build-arg DRIVER_OVERRIDES="${DRIVER_OVERRIDES:-}" \
 	--load \

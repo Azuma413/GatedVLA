@@ -20,6 +20,7 @@ from py123d.datatypes import (
     CameraID,
     DynamicStateSE3,
     EgoStateSE3,
+    FThetaCameraMetadata,
     LogMetadata,
     ModalityType,
     Timestamp,
@@ -38,6 +39,7 @@ from py123d_garage.common.video_writer import VideoWriter
 from py123d_garage.config.schema.evaluation.alpasim_config import AlpasimBenchmarkConfig
 from py123d_garage.datatypes.numerics import NonNegativeInt, PositiveInt
 from py123d_garage.datatypes.trajectory import TrajectoryXY
+from py123d_garage.evaluation.alpasim.help import aeb
 from py123d_garage.evaluation.alpasim.help.config_help import build_policy
 from py123d_garage.evaluation.alpasim.help.sensor_rig_help import (
     build_camera_metadatas,
@@ -87,6 +89,12 @@ class _Session:
         # The newest predictions as the policy made them, oldest first, for the temporal ensemble.
         self.recent_plans: list[_CachedPlan] = []
         self.num_plans: int = 0
+        # Emergency braking: the newest front frame, the last one it looked at, its verdict and the lead's track.
+        self.front_frame: tuple[int, npt.NDArray[np.uint8], BaseCameraMetadata] | None = None
+        self.braking_frame_us: int | None = None
+        self.speed_cap: tuple[float, float] | None = None
+        self.braking: bool = False
+        self.lead_track = aeb.LeadTrack()
 
 
 class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
@@ -110,6 +118,13 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
             set(self._camera_id_by_alpasim_id.values()),
         )
         self._ego_metadata = build_ego_metadata(self._py123d_garage_config.ego_vehicle_config)
+        # The forward-facing camera emergency braking watches.
+        self._braking_camera_id = next(
+            (camera_id for camera_id in self._camera_id_by_alpasim_id.values() if camera_id.name.endswith("_F0")),
+            None,
+        )
+        self._detector: aeb.ObstacleDetector | None = None
+        self._detector_lock = threading.Lock()
         # Built with the policy, whose replan interval sets the video's real-time frame rate.
         self._py123d_garage_video_writer: VideoWriter | None = None
         self._sessions: dict[str, _Session] = {}
@@ -129,6 +144,11 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
             )
             # Policy imports may reconfigure logging (starVLA's overwatch disables the existing loggers).
             setup_logging()
+            if self._py123d_garage_config.aeb_config.detector_dir is not None:
+                self._detector = aeb.ObstacleDetector(
+                    self._py123d_garage_config.aeb_config,
+                    torch.device(self._py123d_garage_config.device),
+                )
             visualization_interval = self._py123d_garage_config.visualization_interval
             if visualization_interval:
                 try:
@@ -251,6 +271,9 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
             timestamp_us,
             {get_modality_key(ModalityType.CAMERA, camera_id): camera},
         )
+        if camera_id == self._braking_camera_id and isinstance(metadata, FThetaCameraMetadata):
+            with self._lock:
+                session.front_frame = (timestamp_us, image, metadata)
         return common_pb2.Empty()
 
     def _camera_metadata(
@@ -362,12 +385,70 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
                     session.recent_plans = [*session.recent_plans, fresh][-num_ensembled:]
                     plan = _ensemble_plans(session.recent_plans, self._py123d_garage_config.temporal_ensemble_decay)
                     session.cached_plan = plan
+        if plan is not None and ego_pose_local is not None and self._detector is not None:
+            plan = self._emergency_brake(session, plan, ego_pose_local, time_now_us)
         trajectory = (
             _trajectory_from_plan(plan, ego_pose_local, time_now_us, fallback_speed_mps)
             if plan is not None and ego_pose_local is not None
             else _straight_line_trajectory(ego_pose_local, time_now_us, fallback_speed_mps)
         )
         return egodriver_pb2.DriveResponse(trajectory=trajectory)
+
+    def _emergency_brake(
+        self,
+        session: _Session,
+        plan: _CachedPlan,
+        ego_pose_local: npt.NDArray[np.float64],
+        time_now_us: int,
+    ) -> _CachedPlan:
+        """The plan slowed along its own path while a road user ahead closes in too fast; otherwise as it is."""
+        assert self._detector is not None, "drive brakes only with a detector"
+        config = self._py123d_garage_config.aeb_config
+        with self._lock:
+            frame = session.front_frame
+            speed_mps = session.speed_mps
+        elapsed_s = (time_now_us - plan.created_time_us) / 1e6
+        due = session.braking_frame_us is None or (
+            frame is not None
+            and (frame[0] - session.braking_frame_us >= config.detection_interval_s * 1e6 - _SERVE_INTERVAL_US / 2)
+        )
+        if frame is not None and frame[0] != session.braking_frame_us and due:
+            frame_us, image, metadata = frame
+            with self._detector_lock:
+                boxes = self._detector.detect(image)
+            ahead = plan.times_s > elapsed_s
+            distance_m = aeb.lead_distance_m(
+                aeb.ground_points_rig(boxes, metadata, config.edge_shrink),
+                _local_to_rig_xy(plan.positions_xy[ahead], ego_pose_local),
+                config,
+            )
+            session.lead_track.update(frame_us / 1e6, distance_m, config)
+            session.speed_cap = aeb.speed_cap(
+                distance_m, session.lead_track.closing_speed_mps(config), speed_mps, config
+            )
+            session.braking_frame_us = frame_us
+        cap = session.speed_cap
+        if cap is None:
+            if not session.braking:
+                return plan
+            # The plan ran ahead of the braked ego: hold the speed for a tick and replan from where the ego stands,
+            # instead of catching up towards what it braked for.
+            session.braking = False
+            cap = (0.0, speed_mps)
+            with self._lock:
+                session.cached_plan = None
+        else:
+            session.braking = True
+        times_s, positions_xy, yaws = aeb.retime_plan(
+            plan.times_s,
+            plan.positions_xy,
+            plan.yaws,
+            elapsed_s,
+            ego_pose_local[:2],
+            speed_mps,
+            *cap,
+        )
+        return _CachedPlan(created_time_us=time_now_us, times_s=times_s, positions_xy=positions_xy, yaws=yaws)
 
     def _replan(
         self,
@@ -513,6 +594,16 @@ def _rig_to_local_xy(
     cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
     rotation = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]], dtype=np.float64)
     return polyline_rig_xy @ rotation.T + [x, y]
+
+
+def _local_to_rig_xy(
+    polyline_local_xy: npt.NDArray[np.float64],
+    ego_pose_local: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    x, y, _, yaw = ego_pose_local
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+    rotation = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]], dtype=np.float64)
+    return (polyline_local_xy - [x, y]) @ rotation
 
 
 def _ego_se3(ego_pose_local: npt.NDArray[np.float64]) -> PoseSE3:

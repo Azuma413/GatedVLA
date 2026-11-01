@@ -5,6 +5,7 @@
 #   starvla  lib/starVLA
 #   run      the starVLA step directory: model.safetensors, config.yaml, norm_stats.json
 #   bundle   the garage bundle of scripts/pretrained/qwendrive_pi.sh: config.yaml, sensor_rig_0.yaml, base_vlm/
+#   aeb      the emergency-braking detector, a transformers RT-DETR checkpoint; empty to bake none
 #
 # Challenge constraints this image follows: no network at run time (every file is baked in, HF offline),
 # read-only root filesystem (caches and HOME in /tmp), at most 16 GiB VRAM (about 11 GiB in bf16).
@@ -41,6 +42,8 @@ COPY --from=bundle base_vlm /opt/checkpoint/base_vlm
 # config.yaml always, anchors.npz only for AnchorVLA bundles (the glob may match nothing).
 COPY --from=bundle config.yaml anchors.np[z] /opt/checkpoint/
 COPY --from=bundle sensor_rig_0.yaml /opt/checkpoint/sensor_rig.yaml
+# Enabled by the override aeb_config.detector_dir=/opt/aeb.
+COPY --from=aeb . /opt/aeb
 
 COPY --from=starvla pyproject.toml README.md LICENSE /opt/starvla/
 COPY --from=starvla starVLA /opt/starvla/starVLA

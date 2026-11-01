@@ -592,7 +592,9 @@ def _disable_evaluation_extras(model: Any) -> None:
     re-run; eye_gate.eval_controls: soft-mask control predictions; the eye gate's attention maps), none of which
     the served plan uses. The modules stay built, so the checkpoint still loads strictly.
     """
-    from starVLA.model.framework.VLM4A import QwenDrivePI as qwendrive_pi_module  # pyright: ignore[reportMissingImports]
+    from starVLA.model.framework.VLM4A import (
+        QwenDrivePI as qwendrive_pi_module,  # pyright: ignore[reportMissingImports]
+    )
 
     model.diagnostics = False
     with open_dict(model.config):
