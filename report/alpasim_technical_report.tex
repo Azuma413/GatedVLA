@@ -21,7 +21,7 @@
 % Numbers regenerated from the evaluation logs.
 \input{generated/macros}
 
-\title{Gated Qwen-Drive with Camera-Based Emergency Braking: AlpaSim E2E Closed Loop Challenge Technical Report}
+\title{GatedVLA with Camera-Based Emergency Braking: AlpaSim E2E Closed Loop Challenge Technical Report}
 
 \author{
   Kaneyoshi Hiratsuka\\
@@ -38,7 +38,7 @@
 \maketitle
 
 \begin{abstract}
-This report describes our Physical AI AV (PAI-AV) track entry. The learned policy pairs the driving-pretrained Qwen-Drive-1.0-4B vision-language model~\cite{qwendrive} with a layer-wise flow-matching expert that outputs 2.5\,s of acceleration and curvature controls, plus a soft visual mask on the expert's cross-attention. Against an identically trained baseline, open-loop error is about equal overall and lower on left turns. In local closed-loop evaluation on the same \RNScenes{} scenes, two rollouts each, the mask raises the mean scene score from \RMaskRef{} to \RMaskRun{} (paired difference $\RMaskDiff$, 95\% bootstrap CI $\RMaskCI$, wins/losses \RMaskWL, sign test $p=\RMaskP$). A rule-based emergency brake (AEB) added at deployment raises it further to \RAebRun{} ($\RAebDiff$, CI $\RAebCI$), and mean at-fault collisions fall from \RMaskColl{} to \RAebColl{} scenes.
+This report describes GatedVLA, our Physical AI AV (PAI-AV) track entry. The learned policy pairs the driving-pretrained Qwen-Drive-1.0-4B vision-language model~\cite{qwendrive} with a layer-wise flow-matching expert that outputs 2.5\,s of acceleration and curvature controls, plus a soft visual mask on the expert's cross-attention. Against an identically trained baseline, open-loop error is about equal overall and lower on left turns. In local closed-loop evaluation on the same \RNScenes{} scenes, two rollouts each, the mask raises the mean scene score from \RMaskRef{} to \RMaskRun{} (paired difference $\RMaskDiff$, 95\% bootstrap CI $\RMaskCI$, wins/losses \RMaskWL, sign test $p=\RMaskP$). A rule-based emergency brake (AEB) added at deployment raises it further to \RAebRun{} ($\RAebDiff$, CI $\RAebCI$), and mean at-fault collisions fall from \RMaskColl{} to \RAebColl{} scenes.
 \end{abstract}
 
 \section{Introduction}
@@ -174,7 +174,7 @@ Configuration & Host & Score & At-fault coll. & Offroad & Corridor exit & Rear-e
 
 \textbf{Latency and memory.} Drive times in Table~\ref{tab:closedloop} are local means with video recording and up to 12 rollouts per driver on shared hosts, so they are only indicative. With one rollout per replica and no recording (RTX 6000 Ada, shared GPU), the mean Drive call was 0.10--0.11\,s for both AEB variants (Appendix~\ref{app:runtime}). The detector allocates about 0.2\,GiB on top of the policy's roughly 11.6\,GiB.
 
-\textbf{Reproducibility.} The deployed configuration matches the W\&B runs. Code: \url{https://github.com/Azuma413/VLA4AD_Research}, branch \texttt{dev/alpasim}, commit \texttt{80ab247}.
+\textbf{Reproducibility.} The deployed configuration matches the W\&B runs. Code: \url{https://github.com/Azuma413/GatedVLA}, branch \texttt{main}, commit \texttt{80ab247}.
 
 \section{Limitations and safety considerations}
 \textbf{The AEB's evidence is limited.} Its thresholds were tuned by replaying detections offline on the same 150 scenes used in Table~\ref{tab:closedloop}, so the gain may be optimistic for the private set.
