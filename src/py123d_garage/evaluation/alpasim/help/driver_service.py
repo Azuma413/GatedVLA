@@ -85,6 +85,8 @@ class _Session:
         self.acceleration_mps2 = Vector3D(x=0.0, y=0.0, z=0.0)
         self.angular_velocity_radps = Vector3D(x=0.0, y=0.0, z=0.0)
         self.route_polyline_rig_xy: npt.NDArray[np.float64] | None = None
+        # Every route served so far in the local frame: the newest one starts ahead of the ego, past what it now drives.
+        self.route_history_local_xy: npt.NDArray[np.float64] | None = None
         self.cached_plan: _CachedPlan | None = None
         # The newest predictions as the policy made them, oldest first, for the temporal ensemble.
         self.recent_plans: list[_CachedPlan] = []
@@ -350,6 +352,11 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
         polyline = polyline[~np.isnan(polyline).any(axis=1)]
         with self._lock:
             session.route_polyline_rig_xy = polyline
+            if session.ego_pose_local is not None and len(polyline) > 0:
+                session.route_history_local_xy = _merge_route(
+                    session.route_history_local_xy,
+                    _rig_to_local_xy(polyline, session.ego_pose_local),
+                )
         return common_pb2.Empty()
 
     @override
@@ -384,6 +391,14 @@ class GarageDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
                 with self._lock:
                     session.recent_plans = [*session.recent_plans, fresh][-num_ensembled:]
                     plan = _ensemble_plans(session.recent_plans, self._py123d_garage_config.temporal_ensemble_decay)
+                    if self._py123d_garage_config.route_pull_gain > 0.0:
+                        plan = _pull_to_route(
+                            plan,
+                            session.route_history_local_xy,
+                            self._py123d_garage_config.route_pull_gain,
+                            self._py123d_garage_config.route_pull_ramp_m,
+                            self._py123d_garage_config.route_pull_max_offset_m,
+                        )
                     session.cached_plan = plan
         if plan is not None and ego_pose_local is not None and self._detector is not None:
             plan = self._emergency_brake(session, plan, ego_pose_local, time_now_us)
@@ -798,6 +813,64 @@ def _ensemble_plans(plans: list[_CachedPlan], decay: float) -> _CachedPlan:
         positions_xy=position_sum / weight_sum[:, None],
         yaws=np.angle(heading_sum),
     )
+
+
+def _merge_route(
+    history_local_xy: npt.NDArray[np.float64] | None,
+    route_local_xy: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """The route so far up to where the new one starts, followed by the new one."""
+    if history_local_xy is None or len(history_local_xy) == 0:
+        return route_local_xy
+    start = int(np.linalg.norm(history_local_xy - route_local_xy[0], axis=1).argmin())
+    return np.vstack([history_local_xy[:start], route_local_xy])
+
+
+def _pull_to_route(
+    plan: _CachedPlan,
+    route_local_xy: npt.NDArray[np.float64] | None,
+    gain: float,
+    ramp_m: float,
+    max_offset_m: float,
+) -> _CachedPlan:
+    """
+    The plan moved towards the route by gain of its offset, growing from nothing at the current pose to the full gain
+    ramp_m along the plan, so a plan barely moving stays put instead of creeping sideways and forwards. Points past
+    either end of the route stay; so do points over max_offset_m away, which leave the route on purpose (fading out
+    over the last 0.5 m so the plan keeps no kink).
+    """
+    if route_local_xy is None or len(route_local_xy) < 2:
+        return plan
+    segments = np.diff(route_local_xy, axis=0)
+    relative = plan.positions_xy[:, None] - route_local_xy[:-1]
+    fractions = (relative * segments).sum(-1) / np.maximum((segments**2).sum(-1), 1e-9)
+    feet = route_local_xy[:-1] + np.clip(fractions, 0.0, 1.0)[..., None] * segments
+    nearest = np.linalg.norm(plan.positions_xy[:, None] - feet, axis=-1).argmin(axis=1)
+    points = np.arange(len(plan.positions_xy))
+    offsets = feet[points, nearest] - plan.positions_xy
+    distances_m = np.linalg.norm(offsets, axis=1)
+    past_end = ((nearest == 0) & (fractions[points, nearest] <= 0.0)) | (
+        (nearest == len(segments) - 1) & (fractions[points, nearest] >= 1.0)
+    )
+    along_plan_m = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(plan.positions_xy, axis=0), axis=1))])
+    weights = gain * np.clip(along_plan_m / ramp_m, 0.0, 1.0) * np.clip((max_offset_m - distances_m) / 0.5, 0.0, 1.0)
+    positions_xy = plan.positions_xy + np.where(past_end, 0.0, weights)[:, None] * offsets
+    return dataclasses.replace(
+        plan,
+        positions_xy=positions_xy,
+        yaws=plan.yaws + _heading_change(plan.positions_xy, positions_xy),
+    )
+
+
+def _heading_change(
+    before_xy: npt.NDArray[np.float64],
+    after_xy: npt.NDArray[np.float64],
+    min_step_m: float = 0.05,
+) -> npt.NDArray[np.float64]:
+    """How much the path's heading turned at each point; none where it barely moves and has no heading."""
+    before, after = np.gradient(before_xy, axis=0), np.gradient(after_xy, axis=0)
+    change = np.angle(np.exp(1j * (np.arctan2(after[:, 1], after[:, 0]) - np.arctan2(before[:, 1], before[:, 0]))))
+    return np.where(np.linalg.norm(before, axis=1) >= min_step_m, change, 0.0)
 
 
 def _trajectory_from_plan(

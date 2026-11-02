@@ -95,6 +95,11 @@ class AlpasimBenchmarkConfig(AbstractBenchmarkConfig):
     # weighted exp(-temporal_ensemble_decay * its age in plans); 1 serves every plan as predicted.
     temporal_ensemble_plans: PositiveInt = 1
     temporal_ensemble_decay: NonNegativeFloat = 0.0
+    # Moves each new plan towards the route by this share of its offset, reached route_pull_ramp_m along the plan and
+    # only within route_pull_max_offset_m of the route; 0 serves the plans as predicted.
+    route_pull_gain: NonNegativeFloat = 0.0
+    route_pull_ramp_m: PositiveFloat = 20.0
+    route_pull_max_offset_m: PositiveFloat = 2.5
 
     # -- The AlpaSim protocol, hard-coded --
 

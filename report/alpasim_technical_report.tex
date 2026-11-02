@@ -15,24 +15,19 @@
 \usepackage{graphicx}
 \usepackage{xcolor}
 \usepackage{amsmath}
-\usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,fit}
+\usepackage{wrapfig}
+\usepackage{caption}
+\usepackage{placeins}
 
 % Numbers regenerated from the evaluation logs.
 \input{generated/macros}
 
 \title{GatedVLA with Camera-Based Emergency Braking: AlpaSim E2E Closed Loop Challenge Technical Report}
 
-\author{
-  Kaneyoshi Hiratsuka\\
-  Kyoto University \\
-  \And
-  Naoki Takada \\
-  Tokyo University of Agriculture and Technology \\
-  \AND
-  Makoto Kawano \\
-  The University of Tokyo \\
-}
+\author{\small\begin{tabular}[t]{@{}c@{\hspace{10pt}}c@{\hspace{10pt}}c@{}}
+  Kaneyoshi Hiratsuka & Naoki Takada & Makoto Kawano \\
+  \mdseries Kyoto University & \mdseries Tokyo University of Agriculture and Technology & \mdseries The University of Tokyo
+\end{tabular}}
 
 \begin{document}
 \maketitle
@@ -42,81 +37,59 @@ This report presents GatedVLA, our entry for the Physical AI AV (PAI-AV) track. 
 \end{abstract}
 
 \section{Introduction}
-Even minor planning errors alter the subsequent observations encountered by a driving policy---a compounding effect that only closed-loop evaluation can reveal. The AlpaSim challenge evaluates policies in closed loop on held-out scenes~\cite{alpasim}, where a scene receives a score of zero if the ego vehicle causes an at-fault collision, drives off-road, or exits the recorded driving corridor. In our preliminary experiments, at-fault collisions were the primary source of score loss, predominantly involving the ego vehicle colliding with slower or stationary lead vehicles when the planned trajectory failed to initiate braking. To address this failure mode, we introduce two complementary components: (1) a learned visual mask trained to selectively retain image evidence relevant to navigation intent for the action expert, and (2) a detector-based emergency braking module that intervenes when the learned policy fails to decelerate.
+Even minor planning errors alter the subsequent observations encountered by a driving policy---a compounding effect that only closed-loop evaluation can reveal. The AlpaSim challenge evaluates policies in closed loop on held-out scenes~\cite{alpasim}, where a scene receives a score of zero if the ego vehicle causes an at-fault collision, drives off-road, or exits the recorded driving corridor. In our preliminary experiments, at-fault collisions were the primary source of score loss, predominantly involving slower or stationary lead vehicles when the planned trajectory failed to initiate braking. We therefore introduce (1) a learned visual mask trained to selectively retain image evidence relevant to navigation intent for the action expert, and (2) a detector-based emergency braking module that intervenes when the learned policy fails to decelerate.
 
 \section{Related work}
-\textbf{Vision-language-action driving.} Qwen-Drive-1.0~\cite{qwendrive} establishes a vision-language foundation model for autonomous driving paired with a planning expert. Alpamayo-R1~\cite{alpamayo} couples a reasoning model with a diffusion-based trajectory decoder, while DriveMoE~\cite{drivemoe} introduces expert routing to Drive-$\pi_0$, an adaptation of $\pi_0$~\cite{pi0}. Following this paradigm, we train a $\pi_0$-style flow-matching expert on top of the Qwen-Drive backbone.
-\textbf{Limiting visual evidence.} S2~\cite{seeless} learns per-token soft masks under a visual evidence budget alongside an ungated pathway. While we adopt a similar gating head and budget formulation, we apply the mask directly to the action expert's cross-attention logits, enforce an exact budget by construction, and train the mask via self-distillation (Section~\ref{sec:policy}).
-\textbf{Copycat behavior.} Imitation learning policies often suffer from causal confusion by over-relying on their own past motion~\cite{causal}; for instance, ChauffeurNet~\cite{chauffeurnet} mitigates this by applying history dropout during training. We explored both history dropout and temporal ensembling~\cite{act}, but observed no clear performance gains (Appendix~\ref{app:others}).
+\textbf{Vision-language-action driving.} Qwen-Drive-1.0~\cite{qwendrive} establishes a vision-language foundation model for autonomous driving paired with a planning expert. Alpamayo-R1~\cite{alpamayo} couples a reasoning model with a diffusion-based trajectory decoder, while DriveMoE~\cite{drivemoe} introduces expert routing to Drive-$\pi_0$, an adaptation of $\pi_0$~\cite{pi0}. We train a $\pi_0$-style flow-matching expert on top of the Qwen-Drive backbone.
+\textbf{Limiting visual evidence.} S2~\cite{seeless} learns per-token soft masks under a visual evidence budget alongside an ungated pathway. We adopt a similar gating head and budget formulation, but apply the mask directly to the action expert's cross-attention logits, enforce an exact budget by construction, and train the mask via self-distillation (Section~\ref{sec:policy}).
+\textbf{Copycat behavior.} Imitation learning policies can suffer from causal confusion by over-relying on their own past motion~\cite{causal}; ChauffeurNet~\cite{chauffeurnet} mitigates this with history dropout during training. We explored both history dropout and temporal ensembling~\cite{act}, but observed no clear gains (Appendix~\ref{app:others}).
 
 \section{Method summary}
-Our driving system (Fig.~\ref{fig:system}) comprises an end-to-end learned policy that replans every 0.5\,s and a detector-based AEB module that exclusively decelerates the planned trajectory along its predicted path. We evaluated and submitted three deployment variants derived from a single trained checkpoint: AEB at 10\,Hz, AEB at 5\,Hz, and the policy without AEB. Our implementation builds upon starVLA~\cite{starvla} and py123d\_garage~\cite{garage}, and all evaluations are conducted in AlpaSim~\cite{alpasim}.
+Our driving system (Fig.~\ref{fig:system}) comprises an end-to-end learned policy that replans every 0.5\,s and a detector-based AEB module that exclusively decelerates the planned trajectory along its predicted path. We evaluated and submitted three deployment variants derived from a single trained checkpoint: AEB at 10\,Hz, AEB at 5\,Hz, and the policy without AEB. Our implementation builds upon starVLA~\cite{starvla} and py123d\_garage~\cite{garage,py123d}, and all evaluations are conducted in AlpaSim~\cite{alpasim}.
 
 \begin{figure}[h]
 \centering
-\begin{tikzpicture}[font=\scriptsize, >={Stealth[length=1.6mm]},
-  box/.style={draw, rounded corners=1pt, align=center, minimum height=6.5mm, inner sep=2pt},
-  rule/.style={box, fill=orange!15}, net/.style={box, fill=blue!10}]
-\node[box] (cam) {Front camera\\$t_0{-}0.1$\,s, $t_0$};
-\node[net, right=5mm of cam] (vlm) {Qwen-Drive VLM\\(32 layers)};
-\node[net, right=7mm of vlm] (dit) {Flow-matching DiT\\(32 blocks, 10 Euler steps)};
-\node[net, above=3mm of dit] (gate) {Visual mask $m$\\$\log m$ on cross-attention};
-\node[box, below=3mm of vlm] (state) {Ego history $t_0{-}0.4..t_0$\\+ route target point};
-\node[box, right=7mm of dit] (uni) {Unicycle rollout\\25 poses, 2.5\,s};
-\node[rule, below=10mm of uni] (aeb) {AEB re-timing\\along plan path};
-\node[box, right=5mm of aeb] (mpc) {AlpaSim\\MPC};
-\node[rule, left=7mm of aeb] (det) {RT-DETRv2 + ground\\projection + tracking};
-\draw[->] (cam) -- (vlm);
-\draw[->] (vlm) -- (dit);
-\draw[->] (vlm.north) |- (gate.west);
-\draw[->] (gate) -- (dit);
-\draw[->] (state.east) -| ([xshift=-5mm]dit.south);
-\draw[->] (dit) -- (uni);
-\draw[->] (uni) -- (aeb);
-\draw[->] (det) -- (aeb);
-\draw[->] (aeb) -- (mpc);
-\end{tikzpicture}
-\caption{System overview. Blue blocks denote neural network modules trained end-to-end. Orange blocks denote the pretrained object detector and rule-based AEB module integrated exclusively at deployment.}
+\includegraphics[width=0.72\linewidth,trim=7.5 10 164 148,clip]{figures/fig_system.pdf}
+\caption{System overview. (a) GatedVLA policy, trained end-to-end: the visual mask $m_p$ biases the expert's cross-attention to the VLM's image tokens. (b) Pretrained detector and rule-based AEB, integrated only at deployment: they re-time the planned waypoints along their path.}
 \label{fig:system}
 \end{figure}
 
 \section{Policy description}
 \label{sec:policy}
-\textbf{Inputs.} Two front wide-angle camera frames (the current frame at $t_0$ with a pixel budget of 921{,}600, and the preceding frame at $t_0{-}0.1$\,s with a budget of 174{,}080) along with the fixed text prompt ``predict trajectory'' are fed into the VLM. Ego-state history and navigation conditioning are provided exclusively to the action expert: five 10\,Hz historical steps of $[x, y, \mathrm{heading}, \mathrm{speed}, a_\mathrm{lon}]$ concatenated at each step with a target point $(x_\mathrm{tp}, y_\mathrm{tp})$ and a binary target-presence flag (yielding an 8-dimensional state vector). During training, the target point is defined as the first future ego position at a Euclidean distance of at least 25\,m. At deployment, it is selected as the first point along AlpaSim's map route located at least 25\,m away in Euclidean distance; because the provided map route starts approximately 40\,m ahead of the ego vehicle, we bridge the intermediate gap using cubic Hermite interpolation.
+\textbf{Inputs.} Two front wide-angle camera frames (at $t_0$ and $t_0{-}0.1$\,s) along with the fixed text prompt ``predict trajectory'' are fed into the VLM. Ego-state history and navigation conditioning are provided exclusively to the action expert: five 10\,Hz historical steps of $[x, y, \mathrm{heading}, \mathrm{speed}, a_\mathrm{lon}]$ concatenated at each step with a target point $(x_\mathrm{tp}, y_\mathrm{tp})$ and a binary target-presence flag. During training, the target point is the first future ego position at a Euclidean distance of at least 25\,m; at deployment, it is the first such point along AlpaSim's map route (Appendix~\ref{app:driver}).
 
-\textbf{Expert and outputs.} The action expert follows a $\pi_0$-style layer-wise architecture~\cite{pi0,drivemoe}: a 32-block Diffusion Transformer (DiT)~\cite{dit} alternates self-attention and cross-attention layers, where each cross-attention block attends to a corresponding VLM layer via a learned linear projection. The expert is trained via conditional flow matching~\cite{flowmatching} with a velocity mean squared error (MSE) objective, sampling flow steps from a shifted $\mathrm{Beta}(1.5,\,1)$ distribution ($s=0.999$), and generates trajectories using 10 Euler integration steps at inference. It predicts 25 steps of $[a_\mathrm{lon}, \mathrm{curvature}]$ controls at 10\,Hz, z-score normalized per dimension, utilizing the kinematic unicycle action space adapted from NVIDIA Alpamayo~1.5~\cite{alpamayocode,alpamayo}. Integrating these predicted controls from the current ego speed yields the output trajectory poses passed to the controller.
+\textbf{Expert and outputs.} The action expert follows a $\pi_0$-style layer-wise architecture~\cite{pi0,drivemoe}: a 32-block Diffusion Transformer (DiT)~\cite{dit} alternates self-attention and cross-attention layers, where each cross-attention block attends to a corresponding VLM layer via a learned linear projection. The expert is trained via conditional flow matching~\cite{flowmatching} with a velocity MSE objective and generates trajectories using 10 Euler integration steps at inference. It predicts 25 steps of $[a_\mathrm{lon}, \mathrm{curvature}]$ controls at 10\,Hz, utilizing the kinematic unicycle action space adapted from NVIDIA Alpamayo~1.5~\cite{alpamayocode,alpamayo}. Integrating these controls from the current ego speed yields the output poses.
 
-\textbf{Baseline.} The baseline model shares the exact same architecture and training protocol, except that the visual mask is omitted and the target point is randomly dropped with probability $p=0.5$ per training sample.
+\textbf{Baseline.} The baseline shares the same architecture and training protocol but omits the visual mask and Paths B and C (below); as in Path A, the target point is dropped with probability $p=0.5$ per sample.
 
-\textbf{Visual mask.} A gating module takes each visual token's detached final-layer VLM hidden state $h_p$ alongside a conditioning query $q$ (which embeds the scaled target point and ego state) and computes a logit score $\ell_p$ from the concatenated features $[h_p, q, h_p\odot q]$. This parameterization follows the visual evidence budget formulation of S2~\cite{seeless}. The scores $\ell_p$ are standardized across tokens within each frame to obtain $z_p$, yielding soft mask values $m_p=\sigma(b+2z_p)$, where the scalar bias $b$ is solved via bisection such that the per-frame mean of $m_p$ equals the target budget $\rho=0.2$ by construction, eliminating the need for an auxiliary budget loss. Unlike S2, which multiplies token embeddings by a floored mask inside the action executor, we add $\log m_p$ directly to the expert's cross-attention logits while leaving text tokens and internal VLM representations unmasked. Each training step executes three expert passes sharing a single VLM forward pass, sampled noise, and flow time step:
-\begin{itemize}\setlength\itemsep{0pt}
+\textbf{Visual mask.} A gating module takes each visual token's detached final-layer VLM hidden state $h_p$ alongside a conditioning query $q$ (which embeds the scaled target point and ego state) and computes a logit score from $[h_p, q, h_p\odot q]$, following the visual evidence budget formulation of S2~\cite{seeless}. The scores are standardized across tokens within each frame to obtain $z_p$, yielding soft mask values $m_p=\sigma(b+2z_p)$, where the scalar bias $b$ is solved via bisection such that the per-frame mean of $m_p$ equals the target budget $\rho=0.2$ by construction, eliminating the need for an auxiliary budget loss. We add $\log m_p$ directly to the expert's cross-attention logits while leaving text tokens and internal VLM representations unmasked. Each training step executes three expert passes sharing a single VLM forward pass, sampled noise, and flow time step:
+\vspace{-5pt}
+\begin{itemize}\setlength\itemsep{0pt}\setlength\parskip{0pt}\setlength\parsep{0pt}
 \item \textbf{Path A} (ungated, target point dropped with $p=0.5$): minimizes the standard flow-matching loss and updates both the VLM and DiT.
 \item \textbf{Path B} (stop-gradient mask, target point provided): minimizes $\lVert v_B-\mathrm{sg}(v_A)\rVert^2$ to update the DiT; this serves as the inference pathway.
 \item \textbf{Path C} (active mask, target point omitted from the DiT state but provided to the gate): minimizes $\lVert v_C-\mathrm{sg}(v_A)\rVert^2$ and updates only the gating module.
 \end{itemize}
-Paths B and C are distilled exclusively on training samples where the target point is retained in Path A; consequently, Path C forces the gating module to preserve visual tokens that encode the navigation intent.
+\vspace{-5pt}
+Paths B and C are distilled only on samples where the target point is retained in Path A; consequently, Path C forces the gating module to preserve visual tokens that encode the navigation intent.
 
-\textbf{Emergency brake.} An RT-DETRv2-R18 detector~\cite{rtdetrv2,rtdetr} pretrained on COCO~\cite{coco} processes the current front-camera frame at $640\times640$ resolution and retains bounding boxes for the \emph{person, bicycle, car, motorcycle, bus, train,} and \emph{truck} classes with confidence scores exceeding 0.5. The central 40\% of each bounding box's bottom edge is projected onto the ego rig's flat ground plane using the nominal $f$-$\theta$ camera calibration. Among detected obstacles within a 1.3\,m lateral corridor of the planned path (linearly extrapolated up to 80\,m), the closest obstacle defines the longitudinal arc-length gap $d$ measured from the front bumper along the path. The closing speed $c$ is estimated via linear regression over the last 1\,s of distance measurements $d$, requiring at least 6 valid samples (or 3 samples for the 5\,Hz variant); any step discontinuity exceeding 4\,m resets the obstacle track. Defining the effective braking margin $g$ and required deceleration $a_\mathrm{req}$ as
+\textbf{Emergency brake.} An RT-DETRv2-R18 detector~\cite{rtdetrv2,rtdetr} pretrained on COCO~\cite{coco} processes the current front-camera frame and retains boxes of seven traffic classes with confidence scores exceeding 0.5. The central 40\% of each bounding box's bottom edge is projected onto the ego rig's flat ground plane using the nominal $f$-$\theta$ camera calibration. Among detected obstacles within a 1.3\,m lateral corridor of the planned path, the closest obstacle defines the arc-length gap $d$ measured from the front bumper along the path; the closing speed $c$ is estimated via linear regression over the last 1\,s of $d$ (Table~\ref{tab:app_deploy}). With braking margin $g$ and required deceleration $a_\mathrm{req}$,
 \begin{equation}
 g = d - 2.5\,\mathrm{m} - 0.4\,\mathrm{s}\cdot c, \qquad a_\mathrm{req} = \frac{c^2}{2\max(g,\,0.1\,\mathrm{m})},
 \end{equation}
-the planned speed profile is capped by a linear deceleration ramp from the current speed $v$ down to the estimated lead speed $\max(v-c,0)$ at a deceleration rate of $\mathrm{clip}(1.2\,a_\mathrm{req},3,8)$\,m/s$^2$ whenever $g\le 0$ or $a_\mathrm{req}>3$\,m/s$^2$. Under a milder time-to-collision condition ($d/c<3$\,s), the planned speed is simply constrained not to exceed the current ego speed. Because the trajectory is re-timed along its existing geometric path starting from the ego vehicle's current projection, a braked ego vehicle will not aggressively accelerate to catch up with a stale timestamped plan. Upon AEB release, the target speed is held constant for one control tick before triggering an immediate policy replan.
+the planned speed profile is capped by a linear deceleration ramp from the current speed $v$ down to the estimated lead speed $\max(v-c,0)$ at a rate of $\mathrm{clip}(1.2\,a_\mathrm{req},3,8)$\,m/s$^2$ whenever $g\le 0$ or $a_\mathrm{req}>3$\,m/s$^2$. Under a milder time-to-collision condition ($d/c<3$\,s), the planned speed is constrained not to exceed the current ego speed. Because the trajectory is re-timed along its own path from the ego vehicle's projection, a braked ego will not accelerate to catch up with a stale plan. Upon AEB release, the speed is held for one control tick before an immediate policy replan.
 
 \section{Resources and training}
-\textbf{Data.} Models are trained on the NVIDIA PhysicalAI-Autonomous-Vehicles dataset~\cite{paiav} (under the NVIDIA Autonomous Vehicle Dataset License Agreement), using only the front wide-angle camera streams and egomotion trajectories from the training split. No LiDAR, radar, or machine-generated perception labels were used.
+\textbf{Data.} Models are trained on the NVIDIA PhysicalAI-Autonomous-Vehicles dataset~\cite{paiav} (NVIDIA Autonomous Vehicle Dataset License Agreement), using only the front wide-angle camera streams and egomotion trajectories from the training split. No LiDAR, radar, or machine-generated perception labels were used.
 
-\textbf{Pretrained weights.} We initialize the VLM from Qwen-Drive-1.0-4B~\cite{qwendrive} (Apache-2.0 license) and use off-the-shelf RT-DETRv2-R18 weights (\texttt{PekingU/rtdetr\_v2\_r18vd}, Apache-2.0 license) for object detection. \textbf{Private resources:} None.
+\textbf{Pretrained weights.} We initialize the VLM from Qwen-Drive-1.0-4B~\cite{qwendrive} (Apache-2.0) and use off-the-shelf RT-DETRv2-R18 weights (\texttt{PekingU/rtdetr\_v2\_r18vd}, Apache-2.0) for detection. \textbf{Private resources:} None.
 
-\textbf{Training.} Both the baseline (W\&B run \texttt{ccb412c9}) and masked policy (\texttt{03bdfc50}) were trained from the exact same code commit with random seed 42 for 12 epochs (38{,}400 steps) across 12 Intel Aurora XPU tiles. Following the linear-probing then fine-tuning (LP-FT) strategy~\cite{lpft}, the VLM backbone remained frozen during the first epoch. Full hyperparameter settings and training curves are provided in the appendix.
+\textbf{Training.} Both the baseline (W\&B run \texttt{ccb412c9}) and masked policy (\texttt{03bdfc50}) were trained from the same code commit with random seed 42 for 12 epochs (38{,}400 steps) across 12 Intel Aurora XPU tiles. In the spirit of linear probing then fine-tuning (LP-FT)~\cite{lpft}, the VLM backbone remained frozen during the first epoch. Full hyperparameter settings and training curves are provided in the appendix.
 
-\textbf{Open-loop results.} Table~\ref{tab:openloop} reports open-loop trajectory prediction performance on a fixed validation subset of 240 samples (stratified into 80 left turns, 80 right turns, and 80 straight segments). Overall open-loop error is comparable between the two models: the visual mask improves performance on left turns (FDE of 1.100 vs.\ 1.213; miss rate of 0.150 vs.\ 0.200) and yields a slightly lower FDE on right turns, at the cost of higher error on straight segments. Table~\ref{tab:controls} presents ablation and control evaluations for the masked policy. Ablating visual inputs degrades FDE substantially more than omitting the navigation target point, confirming that visual evidence strongly informs planning in both models (baseline with black frames: ADE 0.441, FDE 1.408). By the end of training, Path C achieved a distillation loss of 0.0122, compared to 0.0160 when permuting mask values and 0.0156 when removing the mask entirely.
-
-\begin{table}[h]
+\begin{wraptable}{r}{0.56\linewidth}
 \centering\footnotesize
-\begin{minipage}{0.56\linewidth}\centering
-\caption{Open-loop prediction error at step 38{,}400 (baseline / mask). ADE and FDE are reported in meters over a 2.5\,s horizon; miss rate denotes the fraction of trajectories with any waypoint error $>2$\,m.}
+\caption{Open-loop prediction error at step 38{,}400 (baseline / mask). ADE and FDE in meters over 2.5\,s; miss: any waypoint error $>2$\,m.}
 \label{tab:openloop}
-\begin{tabular}{lccc}
+\begin{tabular}{@{}lccc@{}}
 \toprule
  & ADE & FDE & Miss rate \\
 \midrule
@@ -126,88 +99,45 @@ Right & 0.367 / 0.360 & 1.136 / 1.089 & 0.087 / 0.100 \\
 Straight & 0.239 / 0.287 & 0.737 / 0.879 & 0.087 / 0.125 \\
 \bottomrule
 \end{tabular}
-\end{minipage}\hfill
-\begin{minipage}{0.41\linewidth}\centering
-\caption{Diagnostic controls on the masked policy across all 240 validation samples.}
-\label{tab:controls}
-\begin{tabular}{lcc}
-\toprule
-Control & ADE & FDE \\
-\midrule
-No mask & 0.339 & 1.016 \\
-Shuffled mask & 0.344 & 1.031 \\
-Mirrored target in gate & 0.348 & 1.049 \\
-No target in DiT, no mask & 0.367 & 1.135 \\
-No target in DiT, mask & 0.359 & 1.094 \\
-All image tokens removed & 0.456 & 1.418 \\
-Black input frames & 0.486 & 1.564 \\
-\bottomrule
-\end{tabular}
-\end{minipage}
-\end{table}
+\end{wraptable}
+\textbf{Open-loop results.} Table~\ref{tab:openloop} reports open-loop trajectory prediction performance on a fixed validation subset of 240 samples (80 left turns, 80 right turns, and 80 straight segments). Overall open-loop error is comparable between the two models: the visual mask improves performance on left turns (FDE of 1.100 vs.\ 1.213; miss rate of 0.150 vs.\ 0.200) and yields a slightly lower FDE on right turns, at the cost of higher error on straight segments. Ablating visual inputs degrades FDE substantially more than omitting the navigation target point (masked policy: 1.564 with black frames vs.\ 1.135 with no target and no mask), confirming that visual evidence strongly informs planning in both models (baseline with black frames: FDE 1.408). Appendix~\ref{app:open} gives all controls.
 
-\textbf{Closed-loop results.} Table~\ref{tab:closedloop} summarizes local closed-loop evaluation across the same \RNScenes{} scenes sampled from the 441-scene curated validation split using the \texttt{dev} challenge preset (40\,m route offset). A rollout receives a score of 0 if it incurs an at-fault collision, off-road violation, or lateral corridor exit, and $\min(\mathrm{progress}/0.8,1)$ otherwise. Because the first and second rollouts were executed on different GPU architectures (NVIDIA Blackwell and Ada hosts, respectively), discrepancies between rollouts reflect both hardware and stochastic run-to-run variance. Averaging scores across the two rollouts per scene yields the following paired comparisons: mask vs.\ baseline achieves a mean difference of $\RMaskDiff$ (95\% bootstrap CI $\RMaskCI$, wins/losses \RMaskWL, sign test $p=\RMaskP$); AEB at 10\,Hz vs.\ mask alone yields $\RAebDiff$ (CI $\RAebCI$, \RAebWL, $p=\RAebP$); and AEB at 5\,Hz vs.\ 10\,Hz yields $\RAebFiveDiff$ (CI $\RAebFiveCI$, \RAebFiveWL, $p=\RAebFiveP$). Detailed pairwise comparisons are provided in the appendix.
+\textbf{Closed-loop results.} Table~\ref{tab:closedloop} summarizes local closed-loop evaluation across the same \RNScenes{} scenes sampled from the 441-scene curated validation split using the \texttt{dev} challenge preset (40\,m route offset). A rollout without such a failure scores $\min(\mathrm{progress}/0.8,1)$. The first and second rollouts ran on different hosts (NVIDIA Blackwell and Ada), so differences between them reflect both hardware and run-to-run variance. Averaging scores across the two rollouts per scene: mask vs.\ baseline achieves a mean difference of $\RMaskDiff$ (95\% bootstrap CI $\RMaskCI$, wins/losses \RMaskWL, sign test $p=\RMaskP$); AEB at 10\,Hz vs.\ mask alone yields $\RAebDiff$ (CI $\RAebCI$, \RAebWL, $p=\RAebP$); and AEB at 5\,Hz vs.\ 10\,Hz yields $\RAebFiveDiff$ (CI $\RAebFiveCI$, \RAebFiveWL, $p=\RAebFiveP$). Appendix~\ref{app:closed} gives all pairwise comparisons.
 
 \begin{table}[h]
 \centering\footnotesize
-\caption{Local closed-loop results across the same \RNScenes{} scenes. Failure counts indicate the number of affected scenes; rear-end collisions caused by other agents are not penalized as at-fault and merely halt progress accrual. Mean Drive latency includes video rendering overhead.}
+\caption{Local closed-loop results across the same \RNScenes{} scenes. Failure counts are numbers of affected scenes; rear-end collisions by other agents are not at-fault and merely halt progress accrual. Mean Drive latency includes driver video recording.}
 \label{tab:closedloop}
 \begin{tabular}{llcccccc}
 \toprule
-Configuration & Host & Score & At-fault coll. & Offroad & Corridor exit & Rear-ended & Mean Drive (s) \\
+Configuration & Host & Score & At-fault & Offroad & Corridor exit & Rear-ended & Drive (s) \\
 \midrule
 \input{generated/closedloop_table}
 \bottomrule
 \end{tabular}
 \end{table}
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.68\linewidth]{figures/main_mask.jpg}\\[1pt]
-\includegraphics[width=0.68\linewidth]{figures/main_aeb.pdf}
-\caption{Top: Visualization of a left-turn validation sample from the masked policy (showing the current camera frame, mask retention weight, raw gate score, DiT cross-attention map, and bird's-eye-view trajectory). Bottom: Ego speed profiles across three representative scenes with and without AEB (dashed vertical lines indicate collisions occurring without AEB).}
-\label{fig:main_aeb}
-\end{figure}
-
 \section{Runtime and reproducibility}
-\textbf{Serving.} The submission container image is fully self-contained, operates within the challenge sandbox without external network access, and launches without command-line arguments. The policy computes a fresh plan every 0.5\,s and serves interpolated poses from the cached plan at intermediate 10\,Hz control ticks.
+\textbf{Serving.} The submission container image is self-contained, operates within the challenge sandbox without external network access, and launches without arguments. Between 0.5\,s replans, it serves poses from the cached plan at 10\,Hz.
 
-\textbf{Latency and memory.} The mean \texttt{Drive} latencies reported in Table~\ref{tab:closedloop} were recorded locally with video rendering enabled and up to 12 concurrent rollouts sharing a single driver instance on multi-tenant hosts, and should therefore be treated as upper bounds. In isolated benchmarks with a single rollout per replica and video recording disabled (on a shared NVIDIA RTX 6000 Ada GPU), the mean \texttt{Drive} RPC latency was 0.10--0.11\,s for both AEB variants (Appendix~\ref{app:runtime}). The RT-DETRv2 detector requires approximately 0.2\,GiB of VRAM in addition to the policy's 11.6\,GiB footprint.
+\textbf{Latency and memory.} The mean \texttt{Drive} latencies reported in Table~\ref{tab:closedloop} were recorded locally with driver video recording enabled and up to 12 concurrent rollouts sharing a single driver on multi-tenant hosts, so they are only indicative. In a standalone run with a single rollout per replica and video recording disabled (on a shared NVIDIA RTX 6000 Ada GPU), the mean \texttt{Drive} RPC latency was 0.10--0.11\,s for both AEB variants (Appendix~\ref{app:runtime}). The RT-DETRv2 detector requires approximately 0.2\,GiB of VRAM in addition to the policy's 11.6\,GiB footprint.
 
-\textbf{Reproducibility.} The deployed inference configuration matches our logged W\&B training runs. Source code is publicly available at \url{https://github.com/Azuma413/GatedVLA} (branch \texttt{main}, commit \texttt{80ab247}).
+\textbf{Reproducibility.} The deployed inference configuration matches our logged W\&B training runs. Source code: \url{https://github.com/Azuma413/GatedVLA} (branch \texttt{main}, commit \texttt{80ab247}).
 
 \section{Limitations and safety considerations}
-\textbf{Limited generalization evidence for AEB.} The AEB decision thresholds were tuned offline by replaying cached detections on the same 150 scenes evaluated in Table~\ref{tab:closedloop}; consequently, the observed closed-loop gains may be optimistic with respect to held-out private test scenes.
+\label{sec:limits}
+\textbf{Limited generalization evidence for AEB.} The AEB decision thresholds were tuned offline by replaying cached detections on the same 150 scenes evaluated in Table~\ref{tab:closedloop}, so the observed gains may be optimistic for held-out private test scenes.
 
-\textbf{Remaining collisions.} Based on manual inspection of evaluation logs, trajectory replays, and videos from the first 10\,Hz AEB rollout (Appendix~\ref{app:closed}), the 12 remaining at-fault collisions break down into four categories: 6 involved obstacles offset by approximately 2\,m laterally that entered the 1.3\,m detection corridor too late or not at all (a trade-off resulting from narrowing the corridor to suppress false-positive braking); 2 involved agents approaching from the side or rear-left blind spots; 2 were low-speed close-range contacts where ground-projected distance estimates stagnated; and 2 occurred when emergency braking initiated too late or failed to bring the ego vehicle to a complete stop.
+\textbf{Remaining collisions.} Of the 12 remaining at-fault collisions in the first 10\,Hz AEB rollout (manual inspection, Appendix~\ref{app:closed}), 6 involved obstacles offset by approximately 2\,m laterally that entered the 1.3\,m detection corridor too late or not at all, a trade-off from narrowing the corridor to suppress false-positive braking; the rest involved agents from the side or rear-left (2), low-speed contacts where distance estimates stagnated (2), or braking too late or not to a complete stop (2).
 
-\textbf{Side effects of emergency braking.} In the first rollout set, introducing AEB increases the number of scenes where the ego vehicle is rear-ended from 15 to 25. While rear-end collisions by trailing agents are not penalized as at-fault in the simulator, abrupt braking poses a genuine safety hazard in real-world traffic; moreover, 3 scenes that were previously completed cleanly incurred new at-fault collisions under AEB.
+\textbf{Side effects of emergency braking.} In the first rollout set, AEB increases the number of rear-ended scenes from 15 to 25. While these are not at-fault in the simulator, abrupt braking poses a genuine safety hazard in real-world traffic; moreover, 3 previously full-score scenes incurred new at-fault collisions under AEB.
 
-\textbf{Dominance of lateral failures.} In the first AEB rollout, off-road departures and lateral corridor exits account for 0.253 out of the 0.393 total score loss---failure modes that longitudinal AEB cannot mitigate. Because off-road violations occurred at a median lateral deviation of only 0.67\,m from the reference route (comparable to normal deviations observed in successful rollouts), we opted against deploying a heuristic route-snapping rule.
+\textbf{Dominance of lateral failures.} In the first AEB rollout, off-road departures and lateral corridor exits account for 0.253 of the 0.393 total score loss---failure modes that longitudinal AEB cannot mitigate. Off-road violations occurred at a median deviation of only 0.67\,m from the map route (comparable to normal deviations in successful rollouts), so we opted against deploying a route-distance guard.
 
-\textbf{Over-reliance on ego motion history.} Without AEB, primary front-end collisions occur in \RMaskFrontRate\% of masked policy rollouts (\RMaskFrontN) compared to \RBaseFrontRate\% for the baseline (\RBaseFrontN). Among these collision rollouts, the ego vehicle accelerated by more than 2\,m/s over the preceding 3\,s in \RMaskAccel\% (mask) vs.\ \RBaseAccel\% (baseline) of cases, and the final planned trajectory failed to command deceleration in \RMaskNoSlow\% vs.\ \RBaseNoSlow\% of cases. Although the visual mask reduces the incidence of this copycat failure mode, the majority of remaining front-end collisions still stem from the policy failing to plan braking maneuvers.
+\textbf{Suspected reliance on ego motion.} Without AEB, first-incident front collisions occur in \RMaskFrontRate\% of masked policy rollouts (\RMaskFrontN) vs.\ \RBaseFrontRate\% for the baseline (\RBaseFrontN). The visual mask appears to reduce this failure mode, but the final plan commanded no deceleration in \RMaskNoSlow\% vs.\ \RBaseNoSlow\% of these collisions (Table~\ref{tab:app_kin}).
 
-\begin{thebibliography}{99}
-\bibitem{causal} P.~de Haan, D.~Jayaraman, and S.~Levine. Causal confusion in imitation learning. In \emph{NeurIPS}, 2019.
-\bibitem{chauffeurnet} M.~Bansal, A.~Krizhevsky, and A.~Ogale. ChauffeurNet: Learning to drive by imitating the best and synthesizing the worst. arXiv:1812.03079, 2018.
-\bibitem{act} T.~Z. Zhao, V.~Kumar, S.~Levine, and C.~Finn. Learning fine-grained bimanual manipulation with low-cost hardware. arXiv:2304.13705, 2023.
-\bibitem{qwendrive} X.~Zhou, Z.~Zhao, Z.~Yang, M.~Li, H.~Zhong, S.~Bai, D.~Chu, R.~Chen, Z.~Li, J.~Tang, Q.~Wang, M.~Yang, J.~Zhang, D.~Liu, D.~Liang, and X.~Bai. Qwen-Drive-1.0: An initial step towards a vision-language foundation model for autonomous driving. arXiv:2609.00111, 2026.
-\bibitem{seeless} Y.-H.~Wu, T.~Matsushima, and K.~Ota. See less, specify more: Visual evidence budgets for generalizable VLAs. arXiv:2606.02735, 2026.
-\bibitem{pi0} K.~Black, N.~Brown, D.~Driess, et al. $\pi_0$: A vision-language-action flow model for general robot control. arXiv:2410.24164, 2024.
-\bibitem{drivemoe} Z.~Yang, Y.~Chai, X.~Jia, Q.~Li, Y.~Shao, X.~Zhu, H.~Su, and J.~Yan. DriveMoE: Mixture-of-experts for vision-language-action model in end-to-end autonomous driving. In \emph{CVPR}, pages 10678--10688, 2026.
-\bibitem{dit} W.~Peebles and S.~Xie. Scalable diffusion models with transformers. In \emph{ICCV}, 2023.
-\bibitem{flowmatching} Y.~Lipman, R.~T.~Q. Chen, H.~Ben-Hamu, M.~Nickel, and M.~Le. Flow matching for generative modeling. In \emph{ICLR}, 2023.
-\bibitem{alpamayo} Y.~Wang, W.~Luo, J.~Bai, Y.~Cao, T.~Che, et al. Alpamayo-R1: Bridging reasoning and action prediction for generalizable autonomous driving in the long tail. arXiv:2511.00088, 2025.
-\bibitem{alpamayocode} NVIDIA. Alpamayo. \url{https://github.com/NVlabs/alpamayo}.
-\bibitem{rtdetrv2} W.~Lv, Y.~Zhao, Q.~Chang, K.~Huang, G.~Wang, and Y.~Liu. RT-DETRv2: Improved baseline with bag-of-freebies for real-time detection transformer. arXiv:2407.17140, 2024.
-\bibitem{rtdetr} Y.~Zhao, W.~Lv, S.~Xu, J.~Wei, G.~Wang, Q.~Dang, Y.~Liu, and J.~Chen. DETRs beat YOLOs on real-time object detection. In \emph{CVPR}, 2024.
-\bibitem{coco} T.-Y.~Lin, M.~Maire, S.~Belongie, et al. Microsoft COCO: Common objects in context. In \emph{ECCV}, 2014.
-\bibitem{lpft} A.~Kumar, A.~Raghunathan, R.~Jones, T.~Ma, and P.~Liang. Fine-tuning can distort pretrained features and underperform out-of-distribution. In \emph{ICLR}, 2022.
-\bibitem{paiav} NVIDIA. PhysicalAI-Autonomous-Vehicles. \url{https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles}.
-\bibitem{alpasim} NVIDIA, Y.~Cao, R.~de Lutio, S.~Fidler, et al. AlpaSim: A modular, lightweight, and data-driven research simulator for autonomous driving. \url{https://github.com/NVlabs/alpasim}, 2025.
-\bibitem{starvla} starVLA Community. StarVLA: A Lego-like codebase for vision-language-action model developing. \url{https://github.com/starVLA/starVLA}, 2026.
-\bibitem{garage} KE:SAI. py123d\_garage: End-to-end driving policies across datasets. \url{https://github.com/kesai-labs/py123d_garage}, 2026.
-\end{thebibliography}
+\bibliographystyle{abbrvnat}
+\bibliography{references}
 
 \appendix
 \input{appendix}

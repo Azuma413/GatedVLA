@@ -1,12 +1,18 @@
-% Generated from the W&B runs and the evaluation logs; numbers are not typed by hand.
+% Appendix text. Figures and tables come from the W&B runs and the evaluation logs.
+\captionsetup{font=footnotesize,skip=4pt}
+\setlength{\intextsep}{6pt}
+\setlength{\columnsep}{12pt}
+
+\FloatBarrier
 \section{Full configuration}
 \label{app:config}
+Table~\ref{tab:app_cfg} lists the training configuration and Table~\ref{tab:app_deploy} the deployed driver and AEB configuration.
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Training configuration (identical for both runs unless otherwise stated). Source: W\&B configurations of \texttt{ccb412c9} and \texttt{03bdfc50}; the model bundles deployed in the container images carry identical values.}
 \label{tab:app_cfg}
-\begin{tabular}{ll}
+\begin{tabular}{@{}lp{0.74\linewidth}@{}}
 \toprule
 Item & Value \\
 \midrule
@@ -34,11 +40,11 @@ Gate input & Final-layer VLM hidden states of visual tokens, detached, standardi
 \end{tabular}
 \end{table}
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Deployment configuration. Replanning, CUDA graph, and detector settings correspond to default parameters or pre-configured overrides baked into the submitted container images.}
 \label{tab:app_deploy}
-\begin{tabular}{ll}
+\begin{tabular}{@{}lp{0.70\linewidth}@{}}
 \toprule
 Item & Value \\
 \midrule
@@ -64,6 +70,7 @@ Detection rate & Every front frame (10\,Hz variant); at least 0.2\,s apart (5\,H
 \end{tabular}
 \end{table}
 
+\FloatBarrier
 \section{Data and action representation}
 \label{app:data}
 \textbf{Sampling.} We use all clips containing valid egomotion and front-camera streams from the dataset's training split. Each dataset item corresponds to a single clip with the anchor timestamp $t_0$ sampled uniformly from its valid range, ensuring that each epoch visits every clip once at a random timestamp. Only the densely sampled portion of the egomotion trajectory (spanning approximately 20\,s around the camera window) is loaded. The two visual inputs are the front wide-angle frames closest to $t_0$ and $t_0-0.1$\,s.
@@ -76,21 +83,18 @@ Detection rate & Every front frame (10\,Hz variant); at least 0.2\,s apart (5\,H
 
 \textbf{Statistics and validation.} Feature normalization statistics are computed from 6{,}000 training clips $\times$ 8 time steps. The fixed validation set comprises 240 samples stratified into 80 samples per maneuver category, classified by the cumulative heading change over the subsequent 3\,s using a $\pm15^\circ$ threshold.
 
+\FloatBarrier
 \section{Mask details and diagnostics}
 \label{app:mask}
 \textbf{Budgeted mask.} Given raw token scores $\ell_p$ within a single frame, we standardize them as $z_p=(\ell_p-\bar\ell)/(\mathrm{std}(\ell)+10^{-6})$ and compute soft mask values $m_p=\sigma(b+\alpha z_p)$ with $\alpha=2$, where 40 bisection iterations over $b\in[-30,30]$ enforce $\mathrm{mean}_p\,m_p=\rho$. The bisection solver itself is not differentiated directly. Instead, because the constraint $\sum_p\sigma(b+\alpha z_p)=N\rho$ defines $b(z)$ implicitly with $\partial b/\partial z_q=-\alpha w_q$ and $w=\sigma'/\sum\sigma'$, we add a zero-valued surrogate term $-\alpha\sum_q w_q(z_q-\mathrm{sg}[z_q])$ to supply this exact analytical gradient during backpropagation. By construction, a uniform mask is precluded and the dispersion of $m$ is fixed by $\alpha$, preventing the mask from collapsing to an all-keep state or degenerating into a binary mask.
 
-\textbf{Where it acts.} In every cross-attention block of the action expert, the attention logits are biased by adding $\log m_p$ to visual tokens, $0$ to text tokens, and $-\infty$ to padding tokens. The VLM itself remains unmasked. A single shared gating head predicts masks for both input frames, enforcing the budget constraint independently per frame.
+\textbf{Where it acts.} In every cross-attention block of the action expert, the attention logits are biased by adding $\log m_p$ to visual tokens, $0$ to text tokens, and $-\infty$ to padding tokens. The VLM itself remains unmasked. A single shared gating head predicts masks for both input frames, enforcing the budget constraint independently per frame. Unlike S2~\cite{seeless}, which multiplies token embeddings by a floored mask inside the action executor, the mask here acts only through these attention logits.
 
-\textbf{Gradients.} Path A updates both the VLM and the DiT. Path B uses a detached mask and detached VLM features to update only the DiT. Path C uses detached VLM features, and the trainer applies its gradients exclusively to the gating module. The combined action loss is $L_A+L_B$, whereas $L_C$ is backpropagated in a separate pass. All three pathways share the same sampled noise and flow time step, and losses $L_B$ and $L_C$ are weighted by whether the sample retained the target point in Path A.
-
-\textbf{Controls.} \emph{No mask}: identical inputs, omitting the $\log m$ bias. \emph{Shuffled}: randomly permuting the predicted retention weights $m_p$ across spatial positions within each frame. \emph{Mirrored}: evaluating the gating module with a laterally mirrored target point ($y\to-y$). \emph{No image tokens}: setting retention weights to $0$ on every visual token. \emph{Black frames}: replacing all camera inputs with black images and re-running the VLM without masking. \emph{No target}: setting the target-presence flag to $0$ and zeroing the target columns in the DiT state; when combined with the mask, target information reaches the policy solely through the gating module.
-
-\begin{table}[h!]
+\begin{wraptable}{r}{0.5\linewidth}
 \centering\scriptsize
 \caption{Mask diagnostics across the validation set (current frame) at step 38{,}400.}
 \label{tab:app_diag}
-\begin{tabular}{lc}
+\begin{tabular}{@{}p{0.8\linewidth}c@{}}
 \toprule
 Diagnostic & Value \\
 \midrule
@@ -106,157 +110,75 @@ Same, right turns & 0.025 \\
 Same, straight & 0.011 \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{wraptable}
+\textbf{Mask diagnostics.} At step 38{,}400 the mask depends on the sample: the Spearman rank correlation between the masks of two samples is 0.055, and the mean row and column patterns explain 2.4\% and 0.3\% of its variance. The DiT's cross-attention largely follows the mask (rank correlation 0.827), and 26.1\% of the attention mass falls on text tokens. The mask shows no clear lateral preference by maneuver: keep on the left minus the right image half is 0.002, 0.025, and 0.011 for left turns, right turns, and straight driving (Table~\ref{tab:app_diag}).
 
-\begin{table}[h!]
+\textbf{Gradients.} Path A updates both the VLM and the DiT. Path B uses a detached mask and detached VLM features to update only the DiT. Path C uses detached VLM features, and the trainer applies its gradients exclusively to the gating module. The combined action loss is $L_A+L_B$, whereas $L_C$ is backpropagated in a separate pass. All three pathways share the same sampled noise and flow time step, and losses $L_B$ and $L_C$ are weighted by whether the sample retained the target point in Path A.
+
+\textbf{Controls.} \emph{No mask}: identical inputs, omitting the $\log m$ bias. \emph{Shuffled}: randomly permuting the predicted retention weights $m_p$ across spatial positions within each frame. \emph{Mirrored}: evaluating the gating module with a laterally mirrored target point ($y\to-y$). \emph{No image tokens}: setting retention weights to $0$ on every visual token. \emph{Black frames}: replacing all camera inputs with black images and re-running the VLM without masking. \emph{No target}: setting the target-presence flag to $0$ and zeroing the target columns in the DiT state; when combined with the mask, target information reaches the policy solely through the gating module.
+
+\begin{wraptable}{r}{0.56\linewidth}
 \centering\scriptsize
-\caption{Mask-run training signals: mean of the first 50 and last 200 logged points (logged every 10 steps).}
+\caption{Training signals: mean of the first 50 and last 200 logged points (logged every 10 steps).}
 \label{tab:app_train}
-\begin{tabular}{lcc}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
-Signal & First 50 & Last 200 \\
+ & \multicolumn{2}{c}{Mask run} & \multicolumn{2}{c}{Baseline} \\
+Signal & First & Last & First & Last \\
 \midrule
-Path A (flow matching) & 0.9586 & 0.1790 \\
-Path B (distillation, DiT) & 0.0521 & 0.0071 \\
-Path C (distillation, gate) & 0.0674 & 0.0122 \\
-Path C, shuffled mask (no gradient) & 0.0688 & 0.0160 \\
-Path C, no mask (no gradient) & 0.0680 & 0.0156 \\
-Mean keep, current frame & 0.2000 & 0.2000 \\
-Mean keep, history frame & 0.2000 & 0.2000 \\
-Std of gate scores & 2.0426 & 3.4981 \\
-Fraction with target (Path A) & 0.4987 & 0.5026 \\
-Gradient norm & 24.5550 & 4.1008 \\
-Samples per second & 20.9434 & 6.6069 \\
-Step time (s) & 2.2586 & 7.1135 \\
+Flow-matching loss (Path A) & 0.9586 & 0.1790 & 0.9424 & 0.1796 \\
+Loss, acceleration & -- & -- & 0.9591 & 0.2635 \\
+Loss, curvature & -- & -- & 0.9256 & 0.0957 \\
+Path B (distillation, DiT) & 0.0521 & 0.0071 & -- & -- \\
+Path C (distillation, gate) & 0.0674 & 0.0122 & -- & -- \\
+Path C, shuffled mask & 0.0688 & 0.0160 & -- & -- \\
+Path C, no mask & 0.0680 & 0.0156 & -- & -- \\
+Mean keep, current frame & 0.2000 & 0.2000 & -- & -- \\
+Mean keep, history frame & 0.2000 & 0.2000 & -- & -- \\
+Std of gate scores & 2.0426 & 3.4981 & -- & -- \\
+Fraction with target (Path A) & 0.4987 & 0.5026 & 0.4944 & 0.4997 \\
+Gradient norm & 24.555 & 4.1008 & 24.700 & 3.7741 \\
+Samples per second & 20.943 & 6.6069 & 28.595 & 6.9585 \\
+Step time (s) & 2.2586 & 7.1135 & -- & -- \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{wraptable}
+\textbf{Training signals.} The flow-matching loss of Path A falls from 0.96 to 0.18 and ends level with the baseline's (Table~\ref{tab:app_train}). Mean keep stays at 0.200 by construction. Path C ends at 0.0122, below its shuffled-mask (0.0160) and no-mask (0.0156) controls, so the learned mask does make Path C closer to Path A when the DiT receives no target; these controls carry no gradient. The step time rises from 2.3\,s to 7.1\,s and throughput falls accordingly once the VLM is unfrozen after the first epoch. For the baseline, the curvature loss ends well below the acceleration loss (0.096 vs.\ 0.264). Fig.~\ref{fig:curve_losses} shows the same signals over training.
 
-\begin{table}[h!]
-\centering\scriptsize
-\caption{Baseline training signals, computed as in Table~\ref{tab:app_train}.}
-\label{tab:app_train_b}
-\begin{tabular}{lcc}
-\toprule
-Signal & First 50 & Last 200 \\
-\midrule
-Flow-matching loss & 0.9424 & 0.1796 \\
-Loss, acceleration & 0.9591 & 0.2635 \\
-Loss, curvature & 0.9256 & 0.0957 \\
-Fraction with target & 0.4944 & 0.4997 \\
-Gradient norm & 24.6998 & 3.7741 \\
-Samples per second & 28.5946 & 6.9585 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
 \includegraphics[width=\linewidth]{figures/evo_left.jpg}
-\caption{Evolution of the visual mask on a validation sample across training: steps 0, 1{,}000, 5{,}000, 20{,}000, and 38{,}400 (top to bottom). Panels from left to right: current front-camera frame; retention weight $m$; standardized gate score $z$; DiT cross-attention map on the frame; and bird's-eye view showing past trajectory, ground truth, prediction, and target point (lateral axis positive to the right).}
+\caption{Evolution of the visual mask on a left-turn validation sample across training: steps 0, 1{,}000, 5{,}000, 20{,}000, and 38{,}400 (top to bottom). Panels from left to right: current front-camera frame; retention weight $m$; standardized gate score $z$; DiT cross-attention map on the frame; and bird's-eye view showing past trajectory, ground truth, prediction, and target point (lateral axis positive to the right).}
 \label{fig:evo_left}
 \end{figure}
 
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=\linewidth]{figures/evo_straight.jpg}
-\caption{Same visualization as Fig.~\ref{fig:evo_left}, shown for a straight-driving sample behind a lead vehicle.}
-\label{fig:evo_straight}
+\includegraphics[width=\linewidth]{figures/final_samples.jpg}
+\caption{Mask-run validation samples at step 38{,}400: a left turn, a right turn, and straight driving (top to bottom), with panels arranged as in Fig.~\ref{fig:evo_left}.}
+\label{fig:final}
 \end{figure}
 
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=\linewidth]{figures/evo_right.jpg}
-\caption{Same visualization as Fig.~\ref{fig:evo_left}, shown for a right-turn sample.}
-\label{fig:evo_right}
-\end{figure}
-
-\clearpage
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/final_left.jpg}
-\caption{Mask-run left-turn validation samples at step 38{,}400. Panels from left to right: current front-camera frame; retention weight $m$; standardized gate score $z$; DiT cross-attention map on the frame; and bird's-eye view showing past trajectory, ground truth, prediction, and target point (lateral axis positive to the right).}
-\label{fig:final_left}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/final_right.jpg}
-\caption{Mask-run right-turn validation samples at step 38{,}400, with panels arranged as in Fig.~\ref{fig:final_left}.}
-\label{fig:final_right}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/final_straight.jpg}
-\caption{Mask-run straight-driving validation samples at step 38{,}400, with panels arranged as in Fig.~\ref{fig:final_left}.}
-\label{fig:final_straight}
-\end{figure}
-
-\clearpage
-\begin{figure}[h!]
-\centering
-\includegraphics[width=0.8\linewidth]{figures/final_base_left.jpg}
-\caption{Baseline predictions on the first two left-turn samples of Fig.~\ref{fig:final_left} at step 38{,}400 (showing the front-camera frame and bird's-eye view; the baseline has no visual mask).}
-\label{fig:base_left}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=0.8\linewidth]{figures/final_base_right.jpg}
-\caption{Baseline predictions on the first two right-turn samples of Fig.~\ref{fig:final_right}.}
-\label{fig:base_right}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=0.8\linewidth]{figures/final_base_straight.jpg}
-\caption{Baseline predictions on the first two straight-driving samples of Fig.~\ref{fig:final_straight}.}
-\label{fig:base_straight}
-\end{figure}
-
-\clearpage
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/curve_mask.pdf}
-\caption{Mask diagnostics across training. The rank correlation between the mask and DiT cross-attention decreases from near 1 to approximately 0.83, cross-attention mass on text tokens increases early in training, and mean row/column spatial patterns account for minimal mask variance.}
-\label{fig:curve_mask}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/curve_losses.pdf}
+\includegraphics[width=0.9\linewidth]{figures/curve_losses.pdf}
 \caption{Smoothed training losses (EMA factor 0.05). The baseline flow-matching loss closely tracks Path A of the masked run, while Path C with the learned mask remains consistently below its shuffled-mask and unmasked controls.}
 \label{fig:curve_losses}
 \end{figure}
 
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.9\linewidth]{figures/curve_mask.pdf}
+\caption{Mask diagnostics across training. The rank correlation between the mask and DiT cross-attention decreases from near 1 to approximately 0.83, cross-attention mass on text tokens increases early in training, and mean row/column spatial patterns account for minimal mask variance.}
+\label{fig:curve_mask}
+\end{figure}
+
+\FloatBarrier
 \section{Open-loop results in full}
 \label{app:open}
-Both deployed models use the final training checkpoint at step 38{,}400. On the fixed 240-sample validation set, the lowest validation error observed during training is slightly lower than that of the final checkpoint: the baseline achieved a minimum ADE of 0.302 at step 32{,}250 (vs.\ 0.337 final), and the masked policy achieved 0.324 at step 34{,}750 (vs.\ 0.341 final). We did not perform checkpoint selection on this validation set. Because each open-loop evaluation draws a single flow-matching trajectory sample per input, these metrics include stochastic sampling variance; no confidence intervals were computed.
+Both models use the final training checkpoint at step 38{,}400. On the fixed 240-sample validation set, the lowest validation error observed during training is slightly lower than that of the final checkpoint: the baseline achieved a minimum ADE of 0.302 at step 32{,}250 (vs.\ 0.337 final), and the masked policy achieved 0.324 at step 34{,}750 (vs.\ 0.341 final). We did not perform checkpoint selection on this validation set. Because each open-loop evaluation draws a single flow-matching trajectory sample per input, these metrics include stochastic sampling variance; no confidence intervals were computed.
 
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/curve_openloop.pdf}
-\caption{Open-loop validation metrics evaluated every 250 training steps. Vertical axes are clipped for readability, placing initial early-training evaluations off-scale.}
-\label{fig:curve_openloop}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/horizon_error.pdf}
-\caption{L2 position error across the 2.5\,s prediction horizon at step 38{,}400.}
-\label{fig:horizon}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/curve_controls.pdf}
-\caption{Mask-run diagnostic controls across training (validation FDE). Control definitions are provided in Appendix~\ref{app:mask}.}
-\label{fig:curve_controls}
-\end{figure}
-
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Open-loop metrics at step 38{,}400 on the 240 fixed validation samples (in meters; miss rate as a fraction). L2 denotes position error at the specified horizon (in seconds); Lat./Lon.\ denote absolute final lateral and longitudinal errors.}
 \label{tab:app_open}
@@ -279,7 +201,7 @@ Straight & Baseline & 0.239 & 0.737 & 0.017 & 0.083 & 0.215 & 0.404 & 0.672 & 0.
 \end{tabular}
 \end{table}
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\tiny
 \caption{Diagnostic controls for the masked policy at step 38{,}400, sharing the sampled noise of the main prediction. Each three-column group reports ADE, FDE, and miss rate.}
 \label{tab:app_ctrl}
@@ -303,7 +225,7 @@ Baseline, black frames & 0.441 & 1.408 & 0.246 & 0.528 & 1.602 & 0.300 & 0.476 &
 \end{tabular}
 \end{table}
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\tiny
 \caption{Turn response metrics at step 38{,}400. Direction accuracy and lateral displacement ratios are computed over left/right turn samples with $|y_\mathrm{GT}|>0.5$\,m.}
 \label{tab:app_turn}
@@ -321,42 +243,56 @@ Right: median pred./GT lateral & 1.031 & 1.020 & 1.018 & 1.025 & 0.973 & 0.986 &
 \end{tabular}
 \end{table}
 
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=\linewidth]{figures/curve_turn.pdf}
+\includegraphics[width=0.9\linewidth]{figures/curve_openloop.pdf}
+\caption{Open-loop validation metrics evaluated every 250 training steps. Vertical axes are clipped for readability, placing initial early-training evaluations off-scale.}
+\label{fig:curve_openloop}
+\end{figure}
+
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.8\linewidth]{figures/horizon_error.pdf}
+\caption{L2 position error across the 2.5\,s prediction horizon at step 38{,}400.}
+\label{fig:horizon}
+\end{figure}
+
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.85\linewidth]{figures/curve_controls.pdf}
+\caption{Mask-run diagnostic controls across training (validation FDE). Control definitions are provided in Appendix~\ref{app:mask}.}
+\label{fig:curve_controls}
+\end{figure}
+
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.85\linewidth]{figures/curve_turn.pdf}
 \caption{Turn response metrics across training.}
 \label{fig:curve_turn}
 \end{figure}
 
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=\linewidth]{figures/curve_turn_noimage.pdf}
-\caption{Turn response metrics when camera input frames are replaced by black images.}
-\label{fig:curve_turn_noimage}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/curve_features.pdf}
+\includegraphics[width=0.85\linewidth]{figures/curve_features.pdf}
 \caption{Cosine similarity among projected VLM tokens entering the DiT at three depth blocks. In the deepest block, token representations in the masked run exhibit lower pairwise similarity than in the baseline.}
 \label{fig:curve_features}
 \end{figure}
 
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=\linewidth]{figures/curve_baseline_diag.pdf}
-\caption{Baseline diagnostics: DiT cross-attention statistics (top), and correlations between detached linear probes on projected VLM features and future motion across three DiT blocks (bottom).}
+\includegraphics[width=0.85\linewidth]{figures/curve_baseline_diag.pdf}
+\caption{Baseline diagnostics: DiT cross-attention statistics (top), and correlations between detached probes (attention pooling and an MLP) on projected VLM features and future motion across three DiT blocks (bottom).}
 \label{fig:curve_baseline_diag}
 \end{figure}
 
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=\linewidth]{figures/curve_optim.pdf}
+\includegraphics[width=0.85\linewidth]{figures/curve_optim.pdf}
 \caption{Smoothed optimization signals across training. Throughput is substantially higher during the first epoch while the VLM backbone is frozen.}
 \label{fig:curve_optim}
 \end{figure}
 
-
+\FloatBarrier
 \section{Driver pipeline}
 \label{app:driver}
 \textbf{Observation handling.} The driver service implements AlpaSim's gRPC API. Incoming JPEG-compressed camera frames are decoded upon arrival, with only the front wide-angle camera feeding the policy and object detector. Camera calibration is derived from the session's nominal $f$-$\theta$ intrinsics (scaled to the decoded frame resolution), falling back to the static rig configuration file if unavailable. Egomotion states are recorded into the latest observation bundle at every \texttt{Drive} call, ensuring that the 0.5\,s replanning cycle always reads a complete 10\,Hz state history.
@@ -367,72 +303,51 @@ Right: median pred./GT lateral & 1.031 & 1.020 & 1.018 & 1.025 & 0.973 & 0.986 &
 
 \textbf{AEB at a tick.} At each control tick, the AEB module executes five steps: (1) If the newest front-camera frame has not yet been processed and a detection is scheduled, run the detector and project the bounding boxes onto the ground plane. (2) Transform the remainder of the cached plan into the current rig frame and identify the nearest lead obstacle along it. (3) Update the obstacle tracker and compute the longitudinal speed cap. (4) When a speed cap is active, let $w(\tau)$ denote the distance that the cached plan still intends to cover over $\tau$ seconds, and let $u(\tau)$ denote the maximum distance permitted by the deceleration ramp (or $v\tau$ under the no-acceleration condition). The served trajectory starts at the ego vehicle's orthogonal projection onto the planned path, advancing to arc-length positions $s_\mathrm{ego}+\min(w,u)$ on a 0.1\,s grid with yaw angles interpolated along the geometric path. (5) If the speed cap has just been released on the current tick, hold the current speed for one tick and invalidate the cached plan so that the policy replans on the next tick. Without Step~(5), reverting directly to the cached plan---whose timestamped waypoints now lie far ahead of the braked ego vehicle---would cause the tracking controller to accelerate aggressively toward the obstacle it had just braked for.
 
+\FloatBarrier
 \section{AEB development}
 \label{app:aeb}
-\textbf{Why it was added.} Without AEB, the single largest source of score loss is at-fault collisions---predominantly front-end collisions with lead vehicles traveling substantially slower than the ego vehicle. Across 178 first-incident front collisions pooled from five evaluation runs (mask, TE4, hist\_ft, and sig02), the median ego impact speed is 11.9\,m/s (interquartile range: 6.8--17.8\,m/s). Kinematic profiles over the 3\,s preceding impact differ only moderately from non-incident 3\,s windows prior to any incident (6{,}077 windows): a speed increase exceeding 2\,m/s occurs in 35\% vs.\ 25\% of windows; mean acceleration exceeding 0.3\,m/s$^2$ occurs in 48\% vs.\ 37\%; and peak acceleration exceeding 1.5\,m/s$^2$ occurs in 24\% vs.\ 21\%. Imposing a global acceleration cap would therefore severely penalize route progress without reliably preventing collisions, motivating an obstacle-aware braking rule. Because the driver receives no privileged state for other traffic agents and ground-truth perception labels are disabled in the challenge presets, obstacles must be detected directly from camera images.
+\textbf{Why it was added.} Without AEB, the single largest source of score loss is at-fault collisions---predominantly front-end collisions with lead vehicles traveling substantially slower than the ego vehicle. Across 178 first-incident front collisions pooled from five evaluation runs (mask, TE4, hist\_ft, and two sig02 rollouts), the median ego impact speed is 11.9\,m/s (interquartile range: 6.8--17.8\,m/s). Kinematic profiles over the 3\,s preceding impact differ only moderately from non-incident 3\,s windows prior to any incident (6{,}077 windows): a speed increase exceeding 2\,m/s occurs in 35\% vs.\ 25\% of windows; mean acceleration exceeding 0.3\,m/s$^2$ occurs in 48\% vs.\ 37\%; and peak acceleration exceeding 1.5\,m/s$^2$ occurs in 24\% vs.\ 21\%. Imposing a global acceleration cap would therefore mostly cost route progress, motivating an obstacle-aware braking rule. Because the driver receives no privileged state for other traffic agents and ground-truth perception labels are disabled in the challenge presets, obstacles must be detected directly from camera images.
 
 \textbf{Offline replay.} Each evaluation rollout log stores the front-camera JPEGs, ego states, and served trajectory plans. We executed the detector across these logged frames inside the driver container, cached the raw bounding boxes, and tuned the AEB decision rules via offline replay. An initial configuration (no bounding-box bottom-edge shrinkage, 1.6\,m corridor half-width, 2\,m/s$^2$ trigger threshold) triggered braking at least 1\,s prior to impact in 38 of 41 front collisions, but also triggered false-positive braking in 29 of 46 sampled clean rollouts. Visual inspection traced these false positives primarily to cars parked along the curb: when viewed obliquely, the bottom corners of a vehicle's 2D bounding box extend laterally beyond the physical wheels and intrude into the planned driving corridor. Table~\ref{tab:app_sweep} illustrates the resulting trade-off across hyperparameter settings. Note that this offline replay is open-loop and tuned on the local evaluation scenes.
 
-\begin{table}[h!]
-\centering\tiny
+\begin{table}[!htb]
+\centering\scriptsize
 \caption{Offline AEB hyperparameter sweep on replayed detections from the masked policy's 150 rollouts (comprising 41 front collisions and 62 incident-free rollouts). A braking event is counted only when the speed cap shortens the planned path at a 1\,s horizon by more than 0.3\,m. The selected deployment configuration is highlighted in bold. Evaluation is open-loop (ego motion does not react to simulated braking).}
 \label{tab:app_sweep}
 \begin{tabular}{cccccccc}
 \toprule
 Shrink & Half-width & Trigger & Gap & Samples & Hits, $\ge1$\,s & Hits, $\ge0.5$\,s & Clean: rollouts / frames \\
 \midrule
-0.0 & 1.6 & 3.0 & 2.5 & 4 & 36 & 38 & 38 / 38 \\
-0.3 & 1.3 & 4.0 & 1.5 & 6 & 24 & 28 & 28 / 15 \\
-\textbf{0.3} & \textbf{1.3} & \textbf{3.0} & \textbf{2.5} & \textbf{6} & \textbf{29} & \textbf{32} & \textbf{32} / \textbf{19} \\
-0.3 & 1.3 & 4.0 & 2.5 & 6 & 29 & 32 & 32 / 17 \\
-0.15 & 1.3 & 3.0 & 2.5 & 6 & 32 & 37 & 37 / 22 \\
-0.15 & 1.45 & 3.0 & 2.5 & 6 & 34 & 38 & 38 / 24 \\
-0.3 & 1.6 & 3.0 & 2.5 & 6 & 31 & 36 & 36 / 22 \\
-0.0 & 1.3 & 4.0 & 1.5 & 6 & 28 & 34 & 34 / 24 \\
-0.3 & 1.3 & 2.0 & 2.5 & 6 & 31 & 32 & 32 / 23 \\
+0.0 & 1.6 & 3.0 & 2.5 & 4 & 36 & 38 & 38 / 769 \\
+0.3 & 1.3 & 4.0 & 1.5 & 6 & 24 & 28 & 15 / 92 \\
+\textbf{0.3} & \textbf{1.3} & \textbf{3.0} & \textbf{2.5} & \textbf{6} & \textbf{29} & \textbf{32} & \textbf{19} / \textbf{164} \\
+0.3 & 1.3 & 4.0 & 2.5 & 6 & 29 & 32 & 17 / 127 \\
+0.15 & 1.3 & 3.0 & 2.5 & 6 & 32 & 37 & 22 / 227 \\
+0.15 & 1.45 & 3.0 & 2.5 & 6 & 34 & 38 & 24 / 268 \\
+0.3 & 1.6 & 3.0 & 2.5 & 6 & 31 & 36 & 22 / 214 \\
+0.0 & 1.3 & 4.0 & 1.5 & 6 & 28 & 34 & 24 / 234 \\
+0.3 & 1.3 & 2.0 & 2.5 & 6 & 31 & 32 & 23 / 239 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-
-\textbf{Chosen configuration.} Under the selected parameter setting, the 3\,s time-to-collision no-acceleration rule introduces 47 additional frames of intervention across clean rollouts. In the AlpaSim scoring metric, being rear-ended by a trailing agent does not zero the scene score (as only front and lateral impacts are penalized as at-fault) and route progress saturates at 80\% of the recorded reference distance; consequently, the challenge metric rewards this conservative braking trade-off. However, as noted in Section~7, inducing rear-end collisions would pose a severe safety hazard in real-world driving.
+\textbf{Chosen configuration.} Under the selected parameter setting, the 3\,s time-to-collision no-acceleration rule introduces 47 additional frames of intervention across clean rollouts. In the AlpaSim scoring metric, being rear-ended by a trailing agent does not zero the scene score (as only front and lateral impacts are penalized as at-fault) and route progress saturates at 80\% of the recorded reference distance; consequently, the challenge metric rewards this conservative braking trade-off. However, as noted in Section~\ref{sec:limits}, inducing rear-end collisions would pose a severe safety hazard in real-world driving.
 
 \textbf{Detector choice.} RT-DETRv2 is natively supported in our container image's \texttt{transformers} library with Apache-2.0 licensed weights, and its DETR-style set prediction architecture requires no post-processing non-maximum suppression (NMS). Profiling the R18 and R50 backbones inside the container on a heavily loaded NVIDIA RTX PRO 6000 Blackwell GPU yielded median per-frame latencies of approximately 38\,ms and 49\,ms, with peak VRAM allocations of 183\,MiB and 298\,MiB, respectively. Offloading image resizing to the CPU and enabling \texttt{fp16} autocast did not substantially alter R18 latency (approximately 35\,ms), and processing a batch of 4 frames required nearly the same wall-clock time as a batch of 1 (approximately 30\,ms), indicating that CPU-side kernel launch overhead dominated under multi-tenant host contention. Attempting to capture the detector within a CUDA graph failed because the upstream implementation performs CPU-to-GPU tensor writes during the \texttt{forward} pass.
 
+\FloatBarrier
 \section{Closed-loop results in full}
 \label{app:closed}
 \textbf{Protocol.} Evaluations were conducted on a fixed 150-scene subset of the 441-scene \texttt{nurec\_curated\_val} benchmark using the \texttt{+e2e\_challenge=dev} preset, configured with a multi-GPU topology and driver video recording enabled on shared multi-tenant hosts. The first rollout sets (baseline, mask, and 10\,Hz AEB), as well as the TE4, hist\_ft, and 8-sample variants, were executed on an NVIDIA RTX PRO 6000 Blackwell host (8 GPUs). The second rollout sets, along with the sig02 and 5\,Hz AEB variants, were executed on NVIDIA RTX 6000 Ada hosts (3 GPUs each). Because the first and second rollouts for each configuration ran on distinct hardware architectures, discrepancies between the two rollouts reflect both hardware differences and stochastic run-to-run variance. Any scenes that terminated prematurely due to renderer out-of-memory errors on shared GPUs were re-run with reduced concurrency per renderer instance. Scoring terminates at the first collision or off-road departure: a rollout receives a score of 0 if it incurs an at-fault collision (front or lateral impact), an off-road violation, or a lateral corridor exit (deviating by more than 4\,m from the recorded reference path), and $\min(\mathrm{progress}/0.8,1)$ otherwise.
 
-\begin{figure}[h!]
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=0.85\linewidth]{figures/outcomes.pdf}
+\includegraphics[width=0.8\linewidth]{figures/outcomes.pdf}
 \caption{Per-scene rollout outcomes across the same 150 evaluation scenes.}
 \label{fig:outcomes}
 \end{figure}
 
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/aeb_speed.pdf}
-\caption{Ego speed profiles across the 11 scenes that incurred an at-fault collision without AEB but achieved a full score with 10\,Hz AEB enabled (first rollouts). Dashed vertical lines mark the time of collision without AEB.}
-\label{fig:aeb_speed}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/aeb_pairs.jpg}
-\caption{Side-by-side comparison 0.3\,s prior to collision without AEB versus the exact same elapsed rollout time with AEB enabled (shown for 6 of the 11 rescued scenes).}
-\label{fig:aeb_pairs}
-\end{figure}
-
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/sheet_collisions.jpg}
-\caption{Camera views 1\,s prior to impact for all 12 remaining at-fault collisions under 10\,Hz AEB (first rollout).}
-\label{fig:sheet_collisions}
-\end{figure}
-
-
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\tiny
 \caption{Score-loss decomposition across the same 150 scenes in every column, formatted as: affected scenes / contribution to $(1-\text{mean score})$.}
 \label{tab:app_loss}
@@ -455,7 +370,7 @@ Host & Blackwell & Ada & Blackwell & Ada & Blackwell & Ada & Ada \\
 \end{tabular}
 \end{table}
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Paired per-scene comparisons across the same 150 scenes. CI denotes the 95\% bootstrap confidence interval (10{,}000 resamples); $p$ denotes the two-sided sign test $p$-value (ignoring ties, uncorrected for multiple comparisons); (2) indicates the per-scene mean across two rollouts.}
 \label{tab:app_pairs}
@@ -479,11 +394,12 @@ AEB 5\,Hz vs.\ AEB 10\,Hz (2) & 150 & 0.599 & 0.590 & -0.009 & [-0.065, +0.044] 
 \end{tabular}
 \end{table}
 
-\begin{table}[h!]
+\FloatBarrier
+\begin{wraptable}{r}{0.6\linewidth}
 \centering\scriptsize
 \caption{Scene outcome transition matrix when adding 10\,Hz AEB (first rollouts, same host, 150 scenes): rows denote outcomes without AEB, and columns denote outcomes with AEB.}
 \label{tab:app_flow}
-\begin{tabular}{lcccccc}
+\begin{tabular}{@{}lcccccc@{}}
 \toprule
 Without $\backslash$ with & Offroad & Coll. & Exit & Rear & Short & Full \\
 \midrule
@@ -495,11 +411,12 @@ Short progress &  &  &  &  & 1 &  \\
 Full score & 2 & 3 & 2 & 2 &  & 56 \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{wraptable}
+\textbf{Where the collisions go.} Table~\ref{tab:app_flow} follows each scene through the first rollouts on the same host. Of the 35 scenes with an at-fault collision without AEB, 9 remain at-fault collisions, 9 reach the full-score outcome, and 11 become rear-ended scenes, while 4 turn into lateral failures (2 off-road, 2 corridor exits) and 2 end with short progress. In the other direction, of the 65 full-score scenes without AEB, 56 stay at full score, 3 gain an at-fault collision, 4 gain a lateral failure, and 2 are rear-ended. Scenes that were already off-road without AEB mostly stay so (19 of 22).
 
+\textbf{Collision kinematics without AEB.} Table~\ref{tab:app_kin} compares pre-collision kinematic statistics across model variants. Among the first-incident front collisions without AEB, the ego vehicle accelerated by more than 2\,m/s over the preceding 3\,s in \RMaskAccel\% (mask) vs.\ \RBaseAccel\% (baseline) of cases, and the final planned trajectory failed to command deceleration in \RMaskNoSlow\% vs.\ \RBaseNoSlow\% of cases.
 
-\textbf{Collision kinematics without AEB.} Table~\ref{tab:app_kin} compares pre-collision kinematic statistics across model variants.
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Pre-impact kinematics for first-incident front collisions across the same 150 scenes: overall front-collision rate; fraction with a speed increase $>2$\,m/s over the preceding 3\,s; fraction whose final planned trajectory failed to command deceleration (planned speed 2\,s ahead $\ge v-0.3$\,m/s); fraction where the nearest lead actor was traveling below 1\,m/s (approximate); and median ego impact speed (m/s).}
 \label{tab:app_kin}
@@ -519,10 +436,23 @@ Baseline + TE4 & 34/148 & 23.0\% & 35\% & 62\% & 44\% & 9.9 \\
 \end{tabular}
 \end{table}
 
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=\linewidth]{figures/aeb_speed.pdf}
+\caption{Ego speed profiles across the 11 scenes that incurred an at-fault collision without AEB but achieved a full score with 10\,Hz AEB enabled (first rollouts). Dashed vertical lines mark the time of collision without AEB.}
+\label{fig:aeb_speed}
+\end{figure}
+
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=\linewidth]{figures/aeb_pairs.jpg}
+\caption{Side-by-side comparison 0.3\,s prior to collision without AEB versus the same elapsed rollout time with AEB enabled, for 2 of the 11 rescued scenes. Each tile shows the map view (left) and the camera view (right).}
+\label{fig:aeb_pairs}
+\end{figure}
 
 \textbf{Remaining collisions with AEB (first rollout).} Table~\ref{tab:app_hits} details all 12 remaining at-fault collisions under 10\,Hz AEB. \emph{Corridor}: the obstacle remained outside the 1.3\,m lateral detection corridor until shortly before impact (or throughout the approach); relaxing the geometry to zero edge shrinkage and a 2\,m half-width in offline replay detects most of these obstacles earlier, but at the cost of the false-positive braking events analyzed in Table~\ref{tab:app_sweep}. \emph{Side/behind}: the colliding agent approached from outside the forward corridor (e.g., a crossing bus or a vehicle overtaking from the rear-left). \emph{Close range}: the ground-projected distance estimate stagnated near 4.4\,m, preventing the linear regression tracker from observing a positive closing speed; we hypothesize (though have not formally verified) that the ego vehicle's hood occluded the lead vehicle's wheels at close range. \emph{Late brake}: in scene \texttt{1316f5fa}, a step discontinuity in estimated distance reset the obstacle track, delaying braking until approximately 0.5\,s before impact; in scene \texttt{382a7247}, AEB decelerated the ego vehicle from 9.2\,m/s down to 0.7\,m/s, but low-speed contact still occurred.
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\tiny
 \caption{Breakdown of the 12 remaining at-fault collisions under 10\,Hz AEB (first rollout). Columns report: elapsed time $t$ from rollout start (s); ego speeds 3\,s prior ($v_{-3}$) and at impact ($v$) in m/s; minimum acceleration $a_\mathrm{min}$ over the last 3\,s (m/s$^2$); kinematics of the nearest traffic agent at impact (speed $v_o$, longitudinal and lateral center offsets in the ego frame, and relative heading in degrees; approximate, as the nearest agent may not be the struck actor); and lead time (s) prior to impact at which the AEB trigger condition was first met in offline detector replay. Failure categories reflect manual inspection.}
 \label{tab:app_hits}
@@ -546,12 +476,36 @@ Scene & Class & Type & $t$ & $v_{-3}$ & $v$ & $a_\mathrm{min}$ & $v_o$ & Lon. & 
 \end{tabular}
 \end{table}
 
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=\linewidth]{figures/sheet_collisions.jpg}
+\caption{Views 1\,s prior to impact for all 12 remaining at-fault collisions under 10\,Hz AEB (first rollout); Map view (left) and camera view (right); Table~\ref{tab:app_hits} classifies them.}
+\label{fig:sheet_collisions}
+\end{figure}
 
 \textbf{Lateral failures with AEB (first rollout).} Among the 27 scenes resulting in off-road violations under AEB, 19 also went off-road in the first rollout without AEB, and only 3 experienced hard braking (deceleration below $-2$\,m/s$^2$) during the preceding 3\,s, indicating that AEB intervention is not the primary cause of off-road departures. Eighteen of the 27 scenes exhibited a cumulative heading change of less than $15^\circ$ over the final 3\,s, consistent with gradual lateral drift, and video inspection of 12 sampled scenes frequently shows the planned trajectory drifting toward the right shoulder. Among the 31 lateral failures (off-road or corridor exit) with a well-defined lateral offset direction, 17 occurred to the right of the route and 9 to the left, while 5 occurred within 0.3\,m of the route centerline.
 
-\textbf{Route as a lateral reference.} Because provided routes are generated from map lane centerlines, they represent a natural candidate reference for lateral safety guarding. When sampling route waypoints every 2\,m and placing the ego vehicle footprint along the route, only 114 of 36{,}843 sampled poses (0.3\%) trigger an off-road violation under the simulator's scoring logic (5{,}728 poses exceed a single lane's boundaries without intersecting a road edge). Thus, while the map route lies almost entirely within drivable road boundaries, Tables~\ref{tab:app_route} and~\ref{tab:app_guard} demonstrate that lateral distance to the route poorly discriminates impending lateral failures from normal driving variations; consequently, we did not deploy a route-distance guard.
+\begin{wraptable}{r}{0.48\linewidth}
+\centering\scriptsize
+\caption{Offline evaluation of a hypothetical route-distance guard (not deployed): number of lateral failure rollouts flagged at least 1\,s prior to failure versus number of full-score clean rollouts falsely flagged at any point.}
+\label{tab:app_guard}
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+ & \multicolumn{2}{c}{Ego} & \multicolumn{2}{c}{Plan at 2\,s} \\
+Thr.\ (m) & Fail. & Clean & Fail. & Clean \\
+\midrule
+0.5 & 27/38 & 50/70 & 29/38 & 49/70 \\
+0.75 & 21/38 & 37/70 & 26/38 & 39/70 \\
+1.0 & 19/38 & 30/70 & 23/38 & 33/70 \\
+1.5 & 15/38 & 17/70 & 17/38 & 20/70 \\
+2.0 & 13/38 & 15/70 & 15/38 & 16/70 \\
+3.0 & 8/38 & 7/70 & 12/38 & 9/70 \\
+\bottomrule
+\end{tabular}
+\end{wraptable}
+\textbf{Route as a lateral reference.} Because provided routes are generated from map lane centerlines, they represent a natural candidate reference for lateral safety guarding. When sampling route waypoints every 2\,m and placing the ego vehicle footprint along the route, only 114 of 36{,}843 sampled poses (0.3\%) trigger an off-road violation under the simulator's scoring logic (5{,}728 poses exceed a single lane's boundaries without intersecting a road edge). Thus, while the map route lies almost entirely within drivable road boundaries, Tables~\ref{tab:app_guard} and~\ref{tab:app_route} demonstrate that lateral distance to the route poorly discriminates impending lateral failures from normal driving variations; consequently, we did not deploy a route-distance guard.
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Lateral distance (m) from the ego vehicle to the served map route prior to lateral failures under 10\,Hz AEB. Scenes lacking a covering route segment at the queried timestamp are omitted. For reference, across all frames of the 70 full-score rollouts, the lateral distance distribution has a median of 0.29\,m, 90th percentile of 1.14\,m, and 99th percentile of 2.99\,m.}
 \label{tab:app_route}
@@ -572,39 +526,16 @@ Corridor exit & $-3$\,s & 5 & 0.81 & 0.70 & 0.87 & 1 & 1 \\
 \end{tabular}
 \end{table}
 
-\begin{table}[h!]
-\centering\scriptsize
-\caption{Offline evaluation of a hypothetical route-distance guard (not deployed): number of lateral failure rollouts flagged at least 1\,s prior to failure versus number of full-score clean rollouts falsely flagged at any point.}
-\label{tab:app_guard}
-\begin{tabular}{ccccc}
-\toprule
-Threshold (m) & Ego: failures & Ego: clean & Plan at 2\,s: failures & Plan at 2\,s: clean \\
-\midrule
-0.5 & 27/38 & 50/70 & 29/38 & 49/70 \\
-0.75 & 21/38 & 37/70 & 26/38 & 39/70 \\
-1.0 & 19/38 & 30/70 & 23/38 & 33/70 \\
-1.5 & 15/38 & 17/70 & 17/38 & 20/70 \\
-2.0 & 13/38 & 15/70 & 15/38 & 16/70 \\
-3.0 & 8/38 & 7/70 & 12/38 & 9/70 \\
-\bottomrule
-\end{tabular}
-\end{table}
 
-\begin{figure}[h!]
+
+\begin{figure}[!htb]
 \centering
-\includegraphics[width=\linewidth]{figures/sheet_offroad.jpg}
-\caption{Camera views 0.8\,s prior to the event for all off-road failures under 10\,Hz AEB (first rollout).}
-\label{fig:sheet_offroad}
+\includegraphics[width=\linewidth]{figures/sheet_lateral.jpg}
+\caption{Views 0.8\,s prior to the event under 10\,Hz AEB (first rollout), in scene-ID order: the first 3 of the 27 off-road failures (top) and the first 3 of the 11 lateral corridor exits (bottom). Map view (left) and camera view (right) of each scene.}
+\label{fig:sheet_lateral}
 \end{figure}
 
-\begin{figure}[h!]
-\centering
-\includegraphics[width=\linewidth]{figures/sheet_exit.jpg}
-\caption{Camera views 0.8\,s prior to the incident (or end of scoring) for all lateral corridor exits under 10\,Hz AEB (first rollout).}
-\label{fig:sheet_exit}
-\end{figure}
-
-
+\FloatBarrier
 \section{Variants evaluated and not submitted}
 \label{app:others}
 All additional variants were evaluated using the same local closed-loop protocol without AEB. We report these experiments as negative or inconclusive results:
@@ -612,11 +543,11 @@ All additional variants were evaluated using the same local closed-loop protocol
 \item \textbf{Temporal ensembling (TE4).} Following the temporal ensembling scheme of ACT~\cite{act}, each newly predicted trajectory plan is averaged with up to 3 preceding plans across their overlapping time horizons; each older plan is rigidly transformed so that its pose at the new plan's creation timestamp aligns with the current ego pose, using exponential decay weights $\exp(-0.5\cdot\mathrm{age})$.
 \item \textbf{8 samples.} Averaging 8 independent flow-matching trajectory samples per planning call within the normalized action space.
 \item \textbf{hist\_ft.} A 3-epoch masked fine-tuning run initialized from the baseline's final checkpoint, incorporating ego-history dropout ($p=0.5$) with a binary presence flag (zeroing historical $x, y$, heading, speed, and all $a_\mathrm{lon}$ inputs while retaining current speed), past-motion dropout inspired by ChauffeurNet~\cite{chauffeurnet}, removal of fallback clip-endpoint targets, and an initial 300-step gate-only warmup phase.
-\item \textbf{sig02.} Identical to \texttt{hist\_ft}, but replacing the bisection-budgeted mask with an unconstrained sigmoid mask (initialized to a mean retention rate of 0.2) regularized by an explicit $L_1$ budget penalty of weight 0.1.
+\item \textbf{sig02.} Identical to \texttt{hist\_ft}, but replacing the bisection-budgeted mask with an unconstrained sigmoid mask (initialized to a mean retention rate of 0.2) regularized by an explicit squared budget penalty $(\mathrm{mean}_p\,m_p-\rho)^2$ of weight 0.1.
 \end{itemize}
 Both fine-tuning variants (\texttt{hist\_ft} and \texttt{sig02}) were trained for only 3 epochs.
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Closed-loop evaluation of unsubmitted variants (without AEB), paired as in Table~\ref{tab:app_pairs} (comparing a single rollout of each variant against the two-rollout mean of the reference model).}
 \label{tab:app_others}
@@ -634,12 +565,12 @@ sig02, 2nd vs.\ mask (2) & 150 & 0.517 & 0.497 & -0.020 & [-0.084, +0.043] & 29/
 \end{tabular}
 \end{table}
 
-
+\FloatBarrier
 \section{Runtime measurements}
 \label{app:runtime}
-All local timing benchmarks were conducted on multi-tenant hosts shared with concurrent workloads and therefore differ from the official evaluation environment, which allocates 16 driver replicas across 4 GPUs with 2 concurrent rollouts per replica. Official runtime metrics are logged in the challenge submission portal. Table~\ref{tab:app_loss} reports the end-to-end driver telemetry recorded during our local closed-loop evaluation runs (with video recording enabled and up to 12 concurrent rollouts per driver instance).
+All local timing benchmarks were conducted on multi-tenant hosts shared with concurrent workloads and therefore differ from the official evaluation environment, which allocates 16 driver replicas across 4 GPUs with 2 concurrent rollouts per replica. Official runtime metrics are reported in the challenge submission status. Table~\ref{tab:app_loss} reports the end-to-end driver telemetry recorded during our local closed-loop evaluation runs (with video recording enabled and up to 12 concurrent rollouts per driver instance).
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Standalone runtime of the pre-configured submission container images launched without arguments in the challenge sandbox: 2 replicas with 1 active session each on a single shared GPU over an approximately 27\,s rollout. All latencies are reported in seconds.}
 \label{tab:app_sub}
@@ -653,7 +584,7 @@ AEB 5\,Hz & 0.104 & 0.230 & 0.072 & 0.015 & 82/143 \\
 \end{tabular}
 \end{table}
 
-\begin{table}[h!]
+\begin{table}[!htb]
 \centering\scriptsize
 \caption{Throughput saturation benchmark: logged rollout observations replayed continuously into 3 driver replicas (within the submission sandbox, video recording disabled) on a single shared NVIDIA RTX 6000 Ada GPU, with 2 concurrent sessions per replica and zero simulator rendering delay between consecutive RPC calls. Because eliminating simulator think-time exaggerates GPU contention, these values should be used only for relative comparisons across rows. All times are reported in seconds.}
 \label{tab:app_load}
@@ -668,9 +599,9 @@ AEB 5\,Hz & 6 & 1071 & 0.306 & 0.113 & 1.167 & 1.365 & 0.333 & 67 \\
 \end{tabular}
 \end{table}
 
-
 In the back-to-back saturation benchmark (Table~\ref{tab:app_load}), enabling AEB increases the mean \texttt{Drive} call duration by 8\% at 10\,Hz and by 4\% at 5\,Hz relative to the policy without AEB. Note that the absolute latencies in this stress test do not reflect isolated model inference latency, as 6 sessions continuously contend for a single GPU with zero idle time between calls---unlike closed-loop simulation, where physics stepping and sensor rendering interleave with driver RPCs.
 
+\FloatBarrier
 \section{Sources of the reported data}
 \label{app:sources}
-All open-loop metrics, training curves, and visualizations in Figs.~\ref{fig:evo_left}--\ref{fig:base_straight} are generated directly from W\&B runs \texttt{ccb412c9} and \texttt{03bdfc50} (project \texttt{starVLA\_drive}), both initialized from commit \texttt{b5c4446} with random seed 42. All closed-loop evaluation metrics are extracted from each run's \texttt{aggregate/results-summary.json}, per-step \texttt{metrics.parquet}, and \texttt{rollout.asl} logs. The inference code packaged in the deployed container images differs from the training commit solely by configuration flags that remain disabled for this checkpoint (specifically, ego-history dropout and fallback endpoint target filtering).
+All open-loop metrics, training curves, and visualizations in Figs.~\ref{fig:evo_left}--\ref{fig:final} are generated directly from W\&B runs \texttt{ccb412c9} and \texttt{03bdfc50} (project \texttt{starVLA\_drive}), both initialized from commit \texttt{b5c4446} with random seed 42. All closed-loop evaluation metrics are extracted from each run's \texttt{aggregate/results-summary.json}, per-step \texttt{metrics.parquet}, and \texttt{rollout.asl} logs. The model code packaged in the deployed container images differs from the training commit solely by configuration flags that remain disabled for this checkpoint (specifically, ego-history dropout and fallback endpoint target filtering).
